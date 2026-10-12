@@ -1,0 +1,435 @@
+import { useMutation, useQuery } from "@tanstack/react-query";
+
+import { listUserSkillsQuery, listLatexTemplatesQuery } from "../queries/settings";
+import { m } from "../paraglide/messages.js";
+import { ltr } from "../i18n";
+import { RefreshCw, Trash2, Upload } from "lucide-react";
+import { useCallback, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  deleteLatexTemplate,
+  deleteUserSkill,
+  fmtBytes,
+  fmtNumber,
+  timeAgo,
+  uploadLatexTemplate,
+  uploadUserSkill,
+  type LatexTemplate,
+  type UserSkill,
+} from "../api";
+import { Badge, Button, IconButton, Spinner } from "./ui";
+
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+const CARD_CLASS_NAME =
+  "bg-background border border-border rounded-lg py-4 px-4.5 mb-4 [&_h3]:mt-0 [&_h3]:mx-0 [&_h3]:mb-2.5 [&_h3]:text-base [&_h3]:font-semibold [&_h3]:text-text";
+const CARD_SUB_CLASS_NAME = "mt-0 mx-0 mb-3 text-sm leading-relaxed text-text";
+const SKILL_ROW_CLASS_NAME =
+  "flex items-start gap-3 py-2.5 border-t border-t-border first:border-t-0";
+const SKILL_NAME_CLASS_NAME = "text-sm font-normal text-text";
+const ROW_DETAIL_CLASS_NAME = "mt-1 mb-0 text-sm leading-relaxed text-text";
+
+/** Read a File into base64 (strips the `data:...;base64,` prefix). */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string") {
+        reject(new Error("could not read file"));
+        return;
+      }
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("could not read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function isAcceptedName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.endsWith(".md") || lower.endsWith(".markdown") || lower.endsWith(".zip");
+}
+
+function DropZone({
+  accept,
+  busy,
+  prompt,
+  onFile,
+}: {
+  accept: string;
+  busy: boolean;
+  prompt: ReactNode;
+  onFile: (file: File) => void;
+}) {
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  return (
+    <div
+      className={`flex flex-col items-center justify-center gap-2 py-6.5 px-4.5 border-[1.5px] border-dashed rounded-md text-center text-sm text-text transition-[border-color,background] duration-120 ${
+        busy ? "cursor-default" : "cursor-pointer"
+        } ${
+        dragging
+          ? "border-primary bg-surface text-text"
+          : "border-border-variant bg-surface [&:hover]:border-primary"
+        }`}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragging(false);
+        if (busy) return;
+        const file = e.dataTransfer.files?.[0];
+        if (file) onFile(file);
+      }}
+      onClick={() => {
+        if (!busy) inputRef.current?.click();
+      }}
+      role="button"
+      tabIndex={0}
+      aria-disabled={busy}
+      aria-busy={busy}
+      onKeyDown={(e) => {
+        if ((e.key === "Enter" || e.key === " ") && !busy) {
+          e.preventDefault();
+          inputRef.current?.click();
+        }
+      }}
+    >
+      <input
+        ref={inputRef}
+        type="file"
+        accept={accept}
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) onFile(file);
+          e.target.value = "";
+        }}
+      />
+      {busy ? (
+        <>
+          <Spinner />
+          <span>{m.skills_tab_uploading()}</span>
+        </>
+      ) : (
+        <>
+          <Upload size={20} strokeWidth={1.5} />
+          <span>{prompt}</span>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Size and last-changed, shared by the skill and template rows. */
+function RowMeta({ bytes, updatedAt }: { bytes: number; updatedAt: number }) {
+  return (
+    <div className="shrink-0 text-end whitespace-nowrap pt-0.5 text-xs text-subtext">
+      {fmtBytes(bytes)}
+      {updatedAt > 0 && <span className="text-muted"> · {timeAgo(updatedAt)}</span>}
+    </div>
+  );
+}
+
+/** Uploaded and discovered skills can both be removed from ORX. */
+function SkillRow({
+  skill,
+  onError,
+}: {
+  skill: UserSkill;
+  onError: (message: string) => void;
+}) {
+  const deleteUserSkillMutation = useMutation({ mutationFn: deleteUserSkill });
+
+  const busy = deleteUserSkillMutation.isPending;
+  return (
+    <div className="flex items-center gap-2 py-1 border-t border-t-border first:border-t-0">
+      <div className="flex-1 min-w-0 flex items-center gap-2">
+        <span className={SKILL_NAME_CLASS_NAME}>{skill.name}</span>
+        {skill.origin && <Badge size="small">{skill.origin}</Badge>}
+      </div>
+      <RowMeta bytes={skill.bytes} updatedAt={skill.updatedAt} />
+      <IconButton
+        size="small"
+        data-tip={skill.origin ? m.skills_remove_imported() : m.skills_tab_delete_skill()}
+        data-tip-align="end"
+        aria-label={skill.origin ? m.skills_remove_imported_label({ name: ltr(skill.name) }) : m.skills_delete_skill_label({ name: ltr(skill.name) })}
+        disabled={busy}
+        onClick={() => {
+          if (!window.confirm(skill.origin ? m.skills_remove_imported_confirm({ name: ltr(skill.name) }) : m.skills_delete_skill_confirm({ name: ltr(skill.name) }))) return;
+          deleteUserSkillMutation.mutateAsync(skill.name)
+            .catch((e) => {
+              onError(e instanceof Error ? e.message : String(e));
+            });
+        }}
+      >
+        <Trash2 size={13} />
+      </IconButton>
+    </div>
+  );
+}
+
+function LatexTemplateRow({
+  template,
+  onError,
+}: {
+  template: LatexTemplate;
+  onError: (message: string) => void;
+}) {
+  const deleteLatexTemplateMutation = useMutation({ mutationFn: deleteLatexTemplate });
+
+  const busy = deleteLatexTemplateMutation.isPending;
+  const support = template.supportFiles.length;
+  return (
+    <div className={SKILL_ROW_CLASS_NAME}>
+      <div className="flex-1 min-w-0">
+        <span className="text-base font-medium text-text">{template.name}</span>
+        <p className={ROW_DETAIL_CLASS_NAME}>
+          {template.entry}
+          {support > 0 &&
+            (support === 1
+              ? m.skills_one_support_file()
+              : m.skills_support_files({ count: fmtNumber(support) }))}
+        </p>
+      </div>
+      <RowMeta bytes={template.bytes} updatedAt={template.updatedAt} />
+      <IconButton
+        data-tip={m.skills_tab_delete_template()}
+        data-tip-align="end"
+        aria-label={m.skills_delete_template_label({ name: ltr(template.name) })}
+        disabled={busy}
+        onClick={() => {
+          if (!window.confirm(m.skills_delete_template_confirm({ name: ltr(template.name) }))) return;
+          deleteLatexTemplateMutation.mutateAsync(template.name)
+            .catch((e) => {
+              onError(e instanceof Error ? e.message : String(e));
+            });
+        }}
+      >
+        <Trash2 size={13} />
+      </IconButton>
+    </div>
+  );
+}
+
+/** Everything the agent can invoke with `/name`: skills uploaded here, and the
+ * ones already installed in the user's coding agents, mirrored automatically. */
+function SkillsCard() {
+  const uploadUserSkillMutation = useMutation({ mutationFn: uploadUserSkill });
+
+  const skillsQuery = useQuery(listUserSkillsQuery());
+  const skills = skillsQuery.data;
+  const listRef = useRef<HTMLDivElement>(null);
+  const [hasMoreAbove, setHasMoreAbove] = useState(false);
+  const [hasMoreBelow, setHasMoreBelow] = useState(false);
+  const updateScrollFade = useCallback(() => {
+    const list = listRef.current;
+    setHasMoreAbove(!!list && list.scrollTop > 1);
+    setHasMoreBelow(!!list && list.scrollHeight - list.scrollTop - list.clientHeight > 1);
+  }, []);
+
+  useLayoutEffect(() => {
+    updateScrollFade();
+    const list = listRef.current;
+    if (!list) return;
+    const observer = new ResizeObserver(updateScrollFade);
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [skills, updateScrollFade]);
+  const refreshing = skillsQuery.isFetching;
+  const loadError = skillsQuery.error?.message;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = () => { void skillsQuery.refetch(); };
+
+  const busyRef = useRef(false);
+  const upload = useCallback(
+    async (file: File) => {
+      if (busyRef.current) return; // ignore a second drop/pick mid-upload
+      setError(null);
+      if (!isAcceptedName(file.name)) {
+        setError(m.skills_upload_skill_error());
+        return;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError(m.skills_file_too_large());
+        return;
+      }
+      busyRef.current = true;
+      setBusy(true);
+      try {
+        await uploadUserSkillMutation.mutateAsync({
+          filename: file.name,
+          contentBase64: await fileToBase64(file),
+        });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        busyRef.current = false;
+        setBusy(false);
+      }
+    },
+    [],
+  );
+
+  return (
+    <section className={CARD_CLASS_NAME}>
+      {/* Baseline-aligned so the heading's own bottom margin still spaces the card. */}
+      <div className="flex items-baseline gap-2.5">
+        <h3>{m.skills_tab_skills()}</h3>
+        <Button className="ms-auto" size="small" onClick={refresh} disabled={refreshing}>
+          <RefreshCw
+            size={12}
+            className={refreshing ? "animate-[spin_0.9s_linear_infinite]" : ""}
+          />{" "}
+          {m.settings_page_refresh()}
+        </Button>
+      </div>
+      <p className={CARD_SUB_CLASS_NAME}>{m.skills_description()}</p>
+
+      <DropZone
+        accept=".md,.markdown,.zip"
+        busy={busy}
+        prompt={<><span>{m.skills_drop_skill()}</span><span className="block ps-4 mt-1 text-text">{m.skills_agent_alternative()}</span></>}
+        onFile={(file) => void upload(file)}
+      />
+
+      {error && (
+        <div role="alert" className="mt-2.5 text-base text-accent-red whitespace-pre-wrap">
+          {error}
+        </div>
+      )}
+
+      {loadError && (
+        <div role="alert" className="pt-3 text-base text-accent-red">
+          {m.skills_tab_could_not_load_skills()} {loadError}
+        </div>
+      )}
+      {skills === undefined ? (loadError ? null : (
+        <div className="flex items-center gap-2 pt-3 text-sm text-subtext">
+          <Spinner /> {m.skills_tab_loading_skills()}
+        </div>
+      )) : skills.length === 0 ? (
+        <div className="pt-3 text-sm text-subtext">{m.skills_tab_no_skills_yet()}</div>
+      ) : (
+        <div className="relative mt-1">
+          <div ref={listRef} onScroll={updateScrollFade} className="flex flex-col max-h-120 overflow-y-auto overscroll-contain">
+            {skills.map((s) => (
+              <SkillRow key={s.name} skill={s} onError={setError} />
+            ))}
+          </div>
+          {hasMoreAbove && (
+            <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-b from-background to-transparent" />
+          )}
+          {hasMoreBelow && (
+            <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-background to-transparent" />
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** LaTeX templates the `orx-paper` skill follows instead of its built-in
+ * preamble — a conference class, a lab style. */
+function LatexTemplatesCard() {
+  const uploadLatexTemplateMutation = useMutation({ mutationFn: uploadLatexTemplate });
+
+  const templatesQuery = useQuery(listLatexTemplatesQuery());
+  const templates = templatesQuery.data;
+  const loadError = templatesQuery.error?.message;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const busyRef = useRef(false);
+  const upload = useCallback(
+    async (file: File) => {
+      if (busyRef.current) return;
+      setError(null);
+      const lower = file.name.toLowerCase();
+      if (!lower.endsWith(".tex") && !lower.endsWith(".zip")) {
+        setError(m.skills_upload_template_error());
+        return;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError(m.skills_file_too_large());
+        return;
+      }
+      busyRef.current = true;
+      setBusy(true);
+      try {
+        await uploadLatexTemplateMutation.mutateAsync({
+          filename: file.name,
+          contentBase64: await fileToBase64(file),
+        });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        busyRef.current = false;
+        setBusy(false);
+      }
+    },
+    [],
+  );
+
+  return (
+    <section className={CARD_CLASS_NAME}>
+      <h3>{m.skills_tab_la_te_x_templates()}</h3>
+      <p className={CARD_SUB_CLASS_NAME}>{m.skills_templates_description()}</p>
+
+      <DropZone
+        accept=".tex,.zip"
+        busy={busy}
+        prompt={<><span>{m.skills_drop_template()}</span><span className="block ps-4 mt-1 text-text">{m.templates_agent_alternative()}</span></>}
+        onFile={(file) => void upload(file)}
+      />
+
+      {error && (
+        <div role="alert" className="mt-2.5 text-base text-accent-red whitespace-pre-wrap">
+          {error}
+        </div>
+      )}
+
+      {loadError && (
+        <div role="alert" className="pt-3 text-base text-accent-red">
+          {m.skills_tab_could_not_load_templates()} {loadError}
+        </div>
+      )}
+      {templates === undefined ? (loadError ? null : (
+        <div className="flex items-center gap-2 pt-3 text-sm text-subtext">
+          <Spinner /> {m.skills_tab_loading_templates()}
+        </div>
+      )) : templates.length === 0 ? (
+        <div className="pt-3 text-sm text-subtext">{m.skills_tab_no_templates_yet()}</div>
+      ) : (
+        <div className="flex flex-col mt-1">
+          {templates.map((t) => (
+            <LatexTemplateRow key={t.name} template={t} onError={setError} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** Middle-pane Customize tab — what the agent brings to every session: the
+ * skills it can invoke (uploaded here or mirrored from the user's coding
+ * agents) and the LaTeX templates it writes papers into. Everything applies to
+ * every project. */
+export function SkillsTab() {
+  return (
+    <div className="settings-view max-w-readable my-0 mx-auto pt-6 px-8 pb-15 [&_h1]:mt-0 [&_h1]:mx-0 [&_h1]:mb-1.5 [&_h1]:text-3xl">
+      <h1>{m.skills_tab_customize()}</h1>
+      <p className="mt-0 mx-0 mb-5 text-base leading-relaxed text-text">
+        {m.skills_overview_description()}
+      </p>
+
+      <SkillsCard />
+      <LatexTemplatesCard />
+    </div>
+  );
+}

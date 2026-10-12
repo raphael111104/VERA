@@ -1,0 +1,593 @@
+//! The `paper` command — fetch a paper from whichever source its id belongs to.
+//!
+//! Public endpoints, no token required. The source is auto-detected from the id
+//! (override with `--source`):
+//!   - **alphaXiv** (arXiv id / URL): a machine-readable report (default, ≈10 KB)
+//!     with automatic fallback to extracted text, or raw text directly (`--full`).
+//!     Markdown to stdout. If alphaXiv has a GitHub repo linked, a `GitHub: <url>`
+//!     line is printed before the body.
+//!   - **bioRxiv** (`10.1101/…` DOI): title/authors/date + abstract, with links
+//!     to the DOI and full-text PDF.
+//!   - **OpenAlex** (`W…` id or any other DOI): title/authors/date/citations +
+//!     abstract, with DOI and open-access PDF links.
+//!   - **PubMed** (PMID, `pmid:` id, or PubMed URL): title/authors/date/journal +
+//!     abstract, with PubMed, DOI, and PubMed Central links.
+//!
+//! OpenAlex/bioRxiv/PubMed have no *extracted* full text, so `--full` on those
+//! just points you at the PDF or full-text link.
+
+use crate::client::{
+    fetch_biorxiv, fetch_openalex_work, fetch_paper_github, fetch_paper_markdown, fetch_pubmed,
+    versionless_id, BiorxivDetail, OpenAlexWork, PubmedArticle,
+};
+use crate::error::{anyhow, Result};
+use crate::LitSource;
+
+pub async fn run(args: crate::PaperArgs) -> Result<()> {
+    let source = args.source.unwrap_or_else(|| detect_source(&args.id));
+    ensure_source_enabled(source, &crate::config::disabled_lit_sources())?;
+    match source {
+        LitSource::Alphaxiv => run_alphaxiv(&args).await,
+        LitSource::Openalex => run_openalex(&args.id, args.full).await,
+        LitSource::Biorxiv => run_biorxiv(&args.id, args.full).await,
+        LitSource::Pubmed => run_pubmed(&args.id, args.full).await,
+    }
+}
+
+/// A source disabled by the user refuses to fetch too, so a
+/// source turned off is off everywhere, including discovery.
+fn ensure_source_enabled(source: LitSource, disabled: &[String]) -> Result<()> {
+    if disabled.iter().any(|d| d == source.as_str()) {
+        return Err(anyhow!(
+            "{} is disabled in your literature-source settings. Re-enable it to fetch this paper.",
+            source.display_name()
+        ));
+    }
+    Ok(())
+}
+
+async fn run_alphaxiv(args: &crate::PaperArgs) -> Result<()> {
+    let id = parse_paper_id(&args.id);
+    let paper_url = alphaxiv_paper_url(&id);
+    let kind = if args.full { "abs" } else { "overview" };
+
+    let (primary, github) = tokio::join!(fetch_paper_markdown(kind, &id), fetch_paper_github(&id));
+    let primary = primary?;
+    // Fetch full text only after a report miss so the common path does not double API traffic.
+    let md = match fallback_markdown_kind(args.full, primary.is_some()) {
+        Some(fallback_kind) => fetch_paper_markdown(fallback_kind, &id).await?,
+        None => primary,
+    };
+
+    match md {
+        Some(md) => {
+            println!("alphaXiv: {paper_url}");
+            // Best-effort: the GitHub link is useful context, never a reason to fail.
+            if let Ok(Some(url)) = github {
+                println!("GitHub: {}", url);
+            }
+            println!();
+            println!("{}", md);
+            Ok(())
+        }
+        None if args.full => Err(anyhow!(
+            "No full text extracted for {id} yet. Open the paper on alphaXiv: {paper_url}"
+        )),
+        None => Err(anyhow!(
+            "No report or extracted text available for {id} yet. Open the paper on alphaXiv: {paper_url}"
+        )),
+    }
+}
+
+fn fallback_markdown_kind(full: bool, primary_found: bool) -> Option<&'static str> {
+    match (full, primary_found) {
+        (false, false) => Some("abs"),
+        _ => None,
+    }
+}
+
+async fn run_openalex(raw: &str, full: bool) -> Result<()> {
+    match fetch_openalex_work(raw).await? {
+        Some(w) => {
+            print_openalex(&w, full);
+            Ok(())
+        }
+        None => Err(anyhow!(
+            "No OpenAlex work found for {raw:?}. Check the id/DOI, or search with `orx discover openalex <query>`."
+        )),
+    }
+}
+
+async fn run_biorxiv(raw: &str, full: bool) -> Result<()> {
+    let doi = biorxiv_doi(&extract_doi(raw).unwrap_or_else(|| raw.trim().to_string()));
+    match fetch_biorxiv(&doi).await? {
+        Some(d) => {
+            print_biorxiv(&d, full);
+            Ok(())
+        }
+        None => Err(anyhow!(
+            "No bioRxiv preprint found for {doi}. If it's a medRxiv or non-bioRxiv DOI, try `orx paper {doi} --source openalex`; or search with `orx discover biorxiv <query>`."
+        )),
+    }
+}
+
+async fn run_pubmed(raw: &str, full: bool) -> Result<()> {
+    let pmid = pubmed_id(raw).ok_or_else(|| {
+        anyhow!("{raw:?} is not a PubMed id. Pass a PMID such as 38308006, `pmid:38308006`, or a pubmed.ncbi.nlm.nih.gov URL.")
+    })?;
+    match fetch_pubmed(&pmid).await? {
+        Some(a) => {
+            print_pubmed(&a, full);
+            Ok(())
+        }
+        None => Err(anyhow!(
+            "No PubMed record found for PMID {pmid}. Check the id, or search with `orx discover pubmed <query>`."
+        )),
+    }
+}
+
+fn print_openalex(w: &OpenAlexWork, full: bool) {
+    if let Some(t) = &w.title {
+        println!("# {t}");
+    }
+    let authors = w.author_names();
+    if !authors.is_empty() {
+        println!("{}", format_authors(&authors));
+    }
+    let mut meta = Vec::new();
+    if let Some(d) = &w.publication_date {
+        meta.push(d.clone());
+    }
+    if let Some(c) = w.cited_by_count {
+        meta.push(format!("{c} citations"));
+    }
+    if !meta.is_empty() {
+        println!("{}", meta.join(" · "));
+    }
+    if let Some(doi) = w.doi_bare() {
+        println!("DOI: https://doi.org/{doi}");
+    }
+    if let Some(pdf) = w.oa_url() {
+        println!("PDF: {pdf}");
+    }
+    println!();
+    let abs = w.abstract_text();
+    if abs.is_empty() {
+        println!("(No abstract available from OpenAlex.)");
+    } else {
+        println!("{abs}");
+    }
+    if full {
+        eprintln!("OpenAlex has metadata + abstract only — open the PDF/DOI above for full text.");
+    }
+}
+
+fn print_biorxiv(d: &BiorxivDetail, full: bool) {
+    println!("# {}", d.title);
+    if !d.authors.is_empty() {
+        println!("{}", d.authors);
+    }
+    let mut meta = Vec::new();
+    if !d.date.is_empty() {
+        meta.push(d.date.clone());
+    }
+    if !d.category.is_empty() {
+        meta.push(d.category.clone());
+    }
+    if !d.version.is_empty() {
+        meta.push(format!("v{}", d.version));
+    }
+    if !meta.is_empty() {
+        println!("{}", meta.join(" · "));
+    }
+    if !d.doi.is_empty() {
+        println!("DOI: https://doi.org/{}", d.doi);
+        let ver = if d.version.is_empty() {
+            String::new()
+        } else {
+            format!("v{}", d.version)
+        };
+        println!(
+            "Full text: https://www.biorxiv.org/content/{}{}.full",
+            d.doi, ver
+        );
+    }
+    if !d.published.is_empty() && d.published != "NA" {
+        println!("Published: https://doi.org/{}", d.published);
+    }
+    println!();
+    if d.abstract_.is_empty() {
+        println!("(No abstract available from bioRxiv.)");
+    } else {
+        println!("{}", d.abstract_);
+    }
+    if full {
+        eprintln!(
+            "bioRxiv has metadata + abstract only — open the Full text link above for the PDF."
+        );
+    }
+}
+
+fn print_pubmed(a: &PubmedArticle, full: bool) {
+    println!("# {}", a.title);
+    if !a.authors.is_empty() {
+        println!("{}", format_authors(&a.authors));
+    }
+    let meta: Vec<&str> = [a.publication_date.as_deref(), Some(a.journal.as_str())]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !meta.is_empty() {
+        println!("{}", meta.join(" · "));
+    }
+    println!("PubMed: {}", pubmed_url(&a.pmid));
+    if let Some(doi) = &a.doi {
+        println!("DOI: https://doi.org/{doi}");
+    }
+    if let Some(pmcid) = &a.pmcid {
+        println!("Full text: https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/");
+    }
+    println!();
+    if a.abstract_.is_empty() {
+        println!("(No abstract available from PubMed.)");
+    } else {
+        println!("{}", a.abstract_);
+    }
+    if full {
+        eprintln!("PubMed has metadata + abstract only — open the DOI or PubMed Central link above for full text.");
+    }
+}
+
+fn pubmed_url(pmid: &str) -> String {
+    format!("https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
+}
+
+/// Join author names, capping a long list so the header stays readable.
+fn format_authors(names: &[String]) -> String {
+    const MAX: usize = 12;
+    if names.len() <= MAX {
+        names.join(", ")
+    } else {
+        format!(
+            "{}, … (+{} more)",
+            names[..MAX].join(", "),
+            names.len() - MAX
+        )
+    }
+}
+
+/// Decide which source an id belongs to, from its shape. Host hints
+/// (`biorxiv.org`, `openalex.org`, PubMed) and a `pmid:` prefix win first; then
+/// a `10.1101/…` DOI → bioRxiv, any other DOI → OpenAlex, a bare `W…` id →
+/// OpenAlex, a bare number → PubMed; everything else defaults to alphaXiv
+/// (arXiv ids and URLs), preserving prior behavior.
+fn detect_source(input: &str) -> LitSource {
+    let lower = input.trim().to_ascii_lowercase();
+    if lower.contains("biorxiv.org") {
+        return LitSource::Biorxiv;
+    }
+    if lower.contains("openalex.org") {
+        return LitSource::Openalex;
+    }
+    if lower.contains("pubmed.ncbi.nlm.nih.gov")
+        || lower.contains("ncbi.nlm.nih.gov/pubmed")
+        || lower.starts_with("pmid:")
+    {
+        return LitSource::Pubmed;
+    }
+    if let Some(doi) = extract_doi(input) {
+        return if doi.starts_with("10.1101/") {
+            LitSource::Biorxiv
+        } else {
+            LitSource::Openalex
+        };
+    }
+    let last = input.trim().rsplit('/').next().unwrap_or("");
+    if is_openalex_id(last) {
+        return LitSource::Openalex;
+    }
+    if is_pmid(input.trim()) {
+        return LitSource::Pubmed;
+    }
+    LitSource::Alphaxiv
+}
+
+/// A bare PubMed id: digits only. arXiv ids always carry a `.` or an archive prefix.
+fn is_pmid(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The PMID in a bare id, a `pmid:` id, or a PubMed URL, or `None` if there isn't one.
+fn pubmed_id(input: &str) -> Option<String> {
+    let s = input.trim();
+    let s = s.split(['?', '#']).next().unwrap_or(s);
+    let s = match s.get(..5) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("pmid:") => s[5..].trim(),
+        _ => s.trim_end_matches('/').rsplit('/').next().unwrap_or(s),
+    };
+    is_pmid(s).then(|| s.to_string())
+}
+
+/// A bare OpenAlex work id: `W`/`w` followed by digits.
+fn is_openalex_id(s: &str) -> bool {
+    matches!(s.chars().next(), Some('W') | Some('w'))
+        && s.len() > 1
+        && s[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Pull a DOI out of a raw id or URL, or `None` if there isn't one. A real DOI
+/// is `10.<registrant>/<suffix>` — the `/` is mandatory, which is what
+/// distinguishes it from an arXiv id whose October (`MM=10`) form also contains
+/// the substring `10.` (e.g. `2410.12345`) but never a slash. Keeps any trailing
+/// bioRxiv content-URL suffix (`v2.full`) — [`biorxiv_doi`] strips that when the
+/// DOI is handed to the bioRxiv API.
+fn extract_doi(input: &str) -> Option<String> {
+    let s = input.trim();
+    let s = s.split_once("doi.org/").map(|(_, r)| r).unwrap_or(s);
+    let s = s.strip_prefix("doi:").unwrap_or(s);
+    let idx = s.find("10.")?;
+    let doi = s[idx..].split(['?', '#']).next().unwrap_or(&s[idx..]);
+    let doi = doi.trim_end_matches('/');
+    doi.contains('/').then(|| doi.to_string())
+}
+
+/// bioRxiv's details API wants a versionless DOI. Strip a trailing content-URL
+/// suffix (`v2`, `v2.full`, `v2.full.pdf`). bioRxiv DOIs are date-numeric, so the
+/// last `v` before digits is unambiguously the version marker.
+fn biorxiv_doi(doi: &str) -> String {
+    match doi.rsplit_once('v') {
+        Some((head, tail)) if tail.starts_with(|c: char| c.is_ascii_digit()) => head.to_string(),
+        _ => doi.to_string(),
+    }
+}
+
+/// Normalize whatever the user passes (bare id, versioned id, citation line, or
+/// an arXiv / alphaXiv URL) into a canonical paper id like `2401.12345` or
+/// `2401.12345v2`.
+///
+/// Handles `arxiv.org/abs/<id>`, `arxiv.org/pdf/<id>[.pdf]`,
+/// `alphaxiv.org/overview/<id>`, `alphaxiv.org/abs/<id>`, `arXiv:<id>` citations
+/// (with an optional `[cs.CL]` category tag), trailing slashes, `.html` html/ar5iv
+/// URLs, and bare ids. Takes the last path segment and strips any `?`/`#` and
+/// `.pdf`/`.html`/`.md` suffix. An old-style id (`hep-th/9711200`) keeps its
+/// archive segment, since the number alone is not an id.
+pub(crate) fn parse_paper_id(input: &str) -> String {
+    let s = input.trim();
+    let s = s.split(['?', '#']).next().unwrap_or(s).trim();
+    let s = strip_arxiv_citation_prefix(s);
+    let s = strip_arxiv_category_tag(s);
+    let s = s.trim_end_matches('/');
+    let mut segments = s.rsplit('/');
+    let last = segments.next().unwrap_or(s);
+    let id = strip_arxiv_citation_prefix(
+        last.trim_end_matches(".pdf")
+            .trim_end_matches(".html")
+            .trim_end_matches(".md"),
+    );
+    match segments.next() {
+        Some(archive) if is_old_style_number(id) && is_archive(archive) => {
+            format!("{archive}/{id}")
+        }
+        _ => id.to_string(),
+    }
+}
+
+/// `arXiv:1706.03762` / `arxiv:hep-th/9711200` as they appear in citations.
+fn strip_arxiv_citation_prefix(s: &str) -> &str {
+    s.get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("arxiv:"))
+        .map(|_| s[6..].trim_start())
+        .unwrap_or(s)
+}
+
+/// Trailing `[cs.CL]` (and similar) on the arXiv abs-page citation line.
+fn strip_arxiv_category_tag(s: &str) -> &str {
+    s.split_once('[')
+        .map(|(head, _)| head.trim_end())
+        .unwrap_or(s)
+}
+
+/// The `YYMMNNN[vN]` half of an old-style arXiv id.
+fn is_old_style_number(s: &str) -> bool {
+    let number = versionless_id(s);
+    number.len() == 7 && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Plausibly an old-style archive segment, optionally with a subject class:
+/// `hep-th`, `math`, `math.GT`. Route words (`abs`, `pdf`, `overview`) pass
+/// too — a 7-digit number after one only appears on URLs that are already
+/// invalid.
+fn is_archive(s: &str) -> bool {
+    s.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphabetic() || b == b'-' || b == b'.')
+}
+
+fn alphaxiv_paper_url(id: &str) -> String {
+    format!("https://www.alphaxiv.org/abs/{}", versionless_id(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        alphaxiv_paper_url, biorxiv_doi, detect_source, ensure_source_enabled, extract_doi,
+        fallback_markdown_kind, parse_paper_id, pubmed_id,
+    };
+    use crate::LitSource;
+
+    #[test]
+    fn enforces_disabled_sources() {
+        assert!(ensure_source_enabled(LitSource::Biorxiv, &[]).is_ok());
+        let disabled = vec!["biorxiv".to_string()];
+        assert!(ensure_source_enabled(LitSource::Biorxiv, &disabled).is_err());
+        assert!(ensure_source_enabled(LitSource::Alphaxiv, &disabled).is_ok());
+    }
+
+    #[test]
+    fn parses_all_forms() {
+        let cases = [
+            ("2401.12345", "2401.12345"),
+            ("2401.12345v2", "2401.12345v2"),
+            ("https://arxiv.org/abs/2401.12345", "2401.12345"),
+            ("https://arxiv.org/pdf/2401.12345", "2401.12345"),
+            ("https://arxiv.org/pdf/2401.12345.pdf", "2401.12345"),
+            ("https://www.alphaxiv.org/overview/2401.12345", "2401.12345"),
+            ("https://alphaxiv.org/abs/2401.12345v2", "2401.12345v2"),
+            ("https://arxiv.org/abs/2401.12345?foo=bar", "2401.12345"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_paper_id(input), want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn parses_citation_forms_and_trailing_slashes() {
+        let cases = [
+            // The abs-page / bibtex citation line, not a URL.
+            ("arXiv:1706.03762", "1706.03762"),
+            ("arxiv:1706.03762v5", "1706.03762v5"),
+            ("ARXIV:1706.03762", "1706.03762"),
+            ("arXiv: 1706.03762", "1706.03762"),
+            ("arXiv:1706.03762 [cs.CL]", "1706.03762"),
+            ("arXiv:hep-th/9711200", "hep-th/9711200"),
+            ("arXiv:hep-th/9711200 [hep-th]", "hep-th/9711200"),
+            // Browsers and markdown links often keep a trailing slash.
+            ("https://arxiv.org/abs/1706.03762/", "1706.03762"),
+            ("https://arxiv.org/abs/hep-th/9711200/", "hep-th/9711200"),
+            ("https://arxiv.org/pdf/1706.03762.pdf/", "1706.03762"),
+            (
+                "https://ar5iv.labs.arxiv.org/html/1706.03762.html",
+                "1706.03762",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_paper_id(input), want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn keeps_the_archive_of_old_style_ids() {
+        let cases = [
+            // The id `orx discover` returns for a pre-2007 paper.
+            ("hep-th/9711200", "hep-th/9711200"),
+            ("hep-th/9711200v3", "hep-th/9711200v3"),
+            ("math.GT/0309136", "math.GT/0309136"),
+            ("https://arxiv.org/abs/hep-th/9711200", "hep-th/9711200"),
+            (
+                "https://arxiv.org/pdf/hep-th/9711200v3.pdf",
+                "hep-th/9711200v3",
+            ),
+            (
+                "https://www.alphaxiv.org/overview/math/0211159",
+                "math/0211159",
+            ),
+            ("https://arxiv.org/abs/math.GT/0309136", "math.GT/0309136"),
+            // No archive to keep.
+            ("9711200", "9711200"),
+            // A non-archive prefix — digits, or an empty segment — is dropped.
+            ("10.1234/9711200", "9711200"),
+            ("foo1/9711200", "9711200"),
+            ("x//9711200", "9711200"),
+            // Route words count as archives; pins the lenient behavior above.
+            ("https://arxiv.org/abs/9711200", "abs/9711200"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_paper_id(input), want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn builds_versionless_alphaxiv_links() {
+        assert_eq!(
+            alphaxiv_paper_url("2401.12345v2"),
+            "https://www.alphaxiv.org/abs/2401.12345"
+        );
+        assert_eq!(
+            alphaxiv_paper_url("2401.12345"),
+            "https://www.alphaxiv.org/abs/2401.12345"
+        );
+        assert_eq!(alphaxiv_paper_url("v2"), "https://www.alphaxiv.org/abs/v2");
+    }
+
+    #[test]
+    fn falls_back_only_when_the_default_report_is_missing() {
+        assert_eq!(fallback_markdown_kind(false, false), Some("abs"));
+        assert_eq!(fallback_markdown_kind(false, true), None);
+        assert_eq!(fallback_markdown_kind(true, false), None);
+    }
+
+    #[test]
+    fn detects_source_from_id_shape() {
+        let cases = [
+            ("2401.12345", LitSource::Alphaxiv),
+            ("2401.12345v2", LitSource::Alphaxiv),
+            ("https://arxiv.org/abs/2401.12345", LitSource::Alphaxiv),
+            // October arXiv ids contain the substring "10." but no slash — they
+            // must not be mistaken for DOIs (e.g. 1810.04805 = BERT).
+            ("2410.12345", LitSource::Alphaxiv),
+            ("1810.04805", LitSource::Alphaxiv),
+            ("https://arxiv.org/abs/2210.03629", LitSource::Alphaxiv),
+            ("https://arxiv.org/pdf/2410.12345.pdf", LitSource::Alphaxiv),
+            ("10.1101/2020.09.09.20191205", LitSource::Biorxiv),
+            (
+                "https://www.biorxiv.org/content/10.1101/2020.09.09.20191205v1",
+                LitSource::Biorxiv,
+            ),
+            ("10.1038/nature14539", LitSource::Openalex),
+            ("https://doi.org/10.1038/nature14539", LitSource::Openalex),
+            ("W2919115771", LitSource::Openalex),
+            ("https://openalex.org/W2919115771", LitSource::Openalex),
+            ("38308006", LitSource::Pubmed),
+            ("PMID:38308006", LitSource::Pubmed),
+            (
+                "https://pubmed.ncbi.nlm.nih.gov/38308006/",
+                LitSource::Pubmed,
+            ),
+            (
+                "https://www.ncbi.nlm.nih.gov/pubmed/38308006",
+                LitSource::Pubmed,
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(detect_source(input), want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn extracts_pubmed_ids() {
+        for input in [
+            "38308006",
+            " pmid: 38308006 ",
+            "PMID:38308006",
+            "https://pubmed.ncbi.nlm.nih.gov/38308006/",
+            "https://pubmed.ncbi.nlm.nih.gov/38308006/?from=search",
+            "https://www.ncbi.nlm.nih.gov/pubmed/38308006",
+        ] {
+            assert_eq!(
+                pubmed_id(input).as_deref(),
+                Some("38308006"),
+                "input: {input}"
+            );
+        }
+        assert_eq!(pubmed_id("2401.12345"), None);
+        assert_eq!(pubmed_id("https://pubmed.ncbi.nlm.nih.gov/"), None);
+    }
+
+    #[test]
+    fn extracts_and_versionless_biorxiv_doi() {
+        assert_eq!(
+            extract_doi("https://www.biorxiv.org/content/10.1101/2020.09.09.20191205v2.full"),
+            Some("10.1101/2020.09.09.20191205v2.full".to_string())
+        );
+        assert_eq!(
+            biorxiv_doi("10.1101/2020.09.09.20191205v2.full"),
+            "10.1101/2020.09.09.20191205"
+        );
+        // Versionless DOI is left untouched.
+        assert_eq!(
+            biorxiv_doi("10.1101/2020.09.09.20191205"),
+            "10.1101/2020.09.09.20191205"
+        );
+    }
+}

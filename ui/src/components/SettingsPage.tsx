@@ -1,0 +1,3633 @@
+import { cn } from "./ui/cn";
+import { TARGET_LABELS } from "../computeTargets";
+import { HarnessSetupDialog } from "./HarnessSetupDialog";
+import {
+  setScopedQueryData,
+  workspaceScope,
+  isCurrentScope,
+  queryClient,
+} from "../queries/client";
+import { useMutation, useQuery, useQueries } from "@tanstack/react-query";
+
+import {
+  getHarnessesQuery,
+  getHarnessSetupCommandsQuery,
+  refreshHarnesses,
+  getK8sSettingsQuery,
+  getModalSettingsQuery,
+  getSshMasterStatusQuery,
+  getSshSettingsQuery,
+  getSlurmSettingsQuery,
+  getRaySettingsQuery,
+  getLocalMachineQuery,
+  getComputeSettingsQuery,
+  getTinkerSettingsQuery,
+  getHfSettingsQuery,
+  getEnvVarsQuery,
+  getTelemetryQuery,
+  getProjectDefaultsQuery,
+  getProjectGitStatusQuery,
+  getDataDirQuery,
+} from "../queries/settings";
+
+import { getOverleafSettingsQuery } from "../queries/files";
+import { listRunsQuery } from "../queries/projects";
+import {
+  ArrowLeft,
+  ArrowRight,
+  ChevronDown,
+  Cpu,
+  ExternalLink,
+  Info,
+  Plus,
+  RefreshCw,
+  Settings,
+  SquareTerminal,
+  Sun,
+  Trash2,
+  X,
+} from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  deleteEnvVar,
+  deleteOverleafSession,
+  deleteOverleafToken,
+  fmtBytes,
+  fmtDuration,
+  fmtNumber,
+  setComputeDefault,
+  setProjectDefaults,
+  setTelemetry,
+  saveOverleafSession,
+  saveOverleafToken,
+  disableProjectGithub,
+  enableProjectGithub,
+  initializeProjectGit,
+  saveHfToken,
+  saveTinkerKey,
+  saveModalToken,
+  saveK8sSettings,
+  saveRaySettings,
+  saveSlurmSettings,
+  setEnvVar,
+  validateDataDir,
+  moveDataDir,
+  type DataDirSettings,
+  type DataDirValidation,
+  rayPreflight,
+  runDisplayStatus,
+  timeAgo,
+  type ComputeSettings,
+  type ComputeTargetId,
+  type ComputeTargetSummary,
+  type EnvVar,
+  type OverleafSettings,
+  type Project,
+  type ProjectDefaultsSettings,
+  type ProjectGitStatus,
+  type TelemetrySettings,
+  type Harness,
+  type HarnessSetupCommands,
+  type HarnessId,
+  type HfSettings,
+  type TinkerSettings,
+  type K8sSettings,
+  type LocalMachine,
+  type ModalSettings,
+  type RayPreflight,
+  type RaySettings,
+  type Run,
+  type SlurmPreflight,
+  type SlurmSettings,
+  type SshPreflight,
+  type SshExecutionPreflight,
+  testSshExecution,
+  applyUpdate,
+  installCli,
+  setAutoUpdate as setAutoUpdateApi,
+  type InstallChannel,
+  type InstalledCli,
+} from "../api";
+import { onDataDirMove } from "../events";
+import { releaseNotesUrl, useRestartApp, useUpdateStatus } from "./UpdateBanner";
+import { m } from "../paraglide/messages.js";
+import { ltr } from "../i18n";
+import { setLocale, useLocale } from "../locale";
+import { isLocale, type Locale } from "../paraglide/runtime.js";
+import { TokenForm } from "./GitTokenForm";
+import { renderNote } from "./agentNote";
+import { claudeProviderLabel } from "./claudeProvider";
+import { BackendBadge, BackendLogo } from "./BackendLogos";
+import { ProgressBar } from "./ProgressBar";
+import { OptionPicker } from "./ModelPicker";
+import { HarnessLogo } from "./HarnessLogo";
+import { LocalModelSetup } from "./LocalModelSetup";
+import { StatusBadge } from "./StatusBadge";
+import { SettingsCommandTerminal, SshConnectTerminal, SshTerminalTranscript } from "./SshConnectTerminal";
+import { SshExecutionSettings, SshDefaultHost } from "./SshExecutionSettings";
+import { SshConfigDialog } from "./SshConfigDialog";
+import {
+  Badge,
+  Button,
+  ButtonLink,
+  IconButton,
+  IconButtonLink,
+  Input,
+  LoadingRow,
+  showAlert,
+  Spinner,
+  Switch,
+  Tooltip,
+  type BadgeVariant,
+} from "./ui";
+
+const SETTINGS_CARD_CLASS_NAME = [
+  "settings-card [&_>_.error]:text-accent-red [&_>_.error]:text-base",
+  "[&_>_.error]:whitespace-pre-wrap bg-background border border-border",
+  "rounded-lg py-4 px-4.5 mb-4 [&_h3]:mt-0 [&_h3]:mx-0 [&_h3]:mb-2.5",
+  "[&_h3]:text-base [&_h3]:font-semibold [&_h3]:text-text",
+  "[&_.settings-sub]:mb-3 [&_.kv]:gap-y-1.5 [&_.kv]:gap-x-4.5",
+  "[&_>_.project-default-row:first-child]:pt-0 [&_>_.project-default-row:first-child]:border-t-0",
+].join(" ");
+
+const KV_CLASS_NAME = [
+  "kv grid grid-cols-[auto_1fr] items-baseline gap-y-[3px] gap-x-3.5 text-base",
+  "[&_.k]:text-sm [&_.k]:text-subtext [&_.v]:text-base [&_.v]:text-text",
+  "[&_.v]:break-all",
+].join(" ");
+
+const COMPUTE_DIAGNOSTIC_CLASS_NAME =
+  "mt-3 mx-0 mb-0 ps-3 border-s-2 border-s-accent-red font-sans text-base leading-relaxed text-text whitespace-pre-wrap";
+
+const SETTINGS_NOTE_CLASS_NAME = [
+  "settings-note mt-2.5 mx-0 mb-0 text-base py-2 px-2.5",
+  "border border-accent-amber rounded-md bg-accent-amber-subtle",
+  "text-accent-amber font-medium",
+].join(" ");
+
+const FORM_CLASS_NAME = [
+  "form font-sans text-sm text-text [&_.form-seg]:self-start [&_.form-seg]:mb-0.5",
+  "[&_.form-seg_button]:py-[5px] [&_.form-seg_button]:px-3",
+  "[&_.repo-hint]:font-normal [&_.repo-hint]:text-sm",
+  "[&_.repo-hint]:text-muted [&_.repo-hint.ok]:text-accent-teal",
+  "[&_.folder-picker-control]:flex [&_.folder-picker-control]:items-center",
+  "[&_.folder-picker-control]:gap-[9px] [&_.folder-picker-control]:w-full",
+  "[&_.folder-picker-control]:min-w-0 [&_.folder-picker-control]:py-2 [&_.folder-picker-control]:px-2.5",
+  "[&_.folder-picker-control]:overflow-hidden [&_.folder-picker-control]:bg-background",
+  "[&_.folder-picker-control]:border [&_.folder-picker-control]:border-border",
+  "[&_.folder-picker-control]:rounded-md [&_.folder-picker-control]:cursor-pointer",
+  "[&_.folder-picker-control]:text-start",
+  "[&_.folder-picker-control]:transition-[border-color,box-shadow] [&_.folder-picker-control]:duration-120 [&_.folder-picker-control]:ease-standard",
+  "[&_.folder-picker-control:hover:not(:disabled)]:border-muted",
+  "[&_.folder-picker-control:hover:not(:disabled)]:shadow-control-subtle",
+  "[&_.folder-picker-control:focus-visible]:outline-2 [&_.folder-picker-control:focus-visible]:outline-solid [&_.folder-picker-control:focus-visible]:outline-text",
+  "[&_.folder-picker-control:focus-visible]:outline-offset-2 [&_.folder-picker-control_span]:flex-1",
+  "[&_.folder-picker-control_span]:min-w-0 [&_.folder-picker-control_span]:overflow-hidden",
+  "[&_.folder-picker-control_span]:text-ellipsis [&_.folder-picker-control_span]:whitespace-nowrap",
+  "[&_.folder-picker-control_.placeholder]:text-muted [&_.folder-picker-icon]:flex-none",
+  "[&_.folder-picker-icon]:text-current [&_.folder-picker-chevron]:flex-none",
+  "[&_.folder-picker-chevron]:text-muted",
+  "[&_.folder-picker-control:hover:not(:disabled)_.folder-picker-chevron]:text-subtext",
+  "[&_.folder-picker-hint]:text-subtext [&_.folder-picker-hint]:text-sm",
+  "[&_.folder-picker-hint]:font-normal [&_.folder-picker-hint]:leading-[1.4]",
+  "[&_.project-location-field]:flex [&_.project-location-field]:flex-col",
+  "[&_.project-location-field]:gap-2 [&_.project-location-label]:text-text",
+  "[&_.project-location-label]:text-base",
+  "[&_.project-location-label]:font-medium [&_.project-field-label]:text-text",
+  "[&_.project-field-label]:text-base [&_.project-field-label]:font-medium",
+  "[&_.folder-picker-control:disabled]:cursor-default [&_.folder-picker-control:disabled]:opacity-65",
+  "[&_.paper-destination]:flex [&_.paper-destination]:items-center",
+  "[&_.paper-destination]:gap-2.5 [&_.paper-destination]:pt-2 [&_.paper-destination]:pe-2 [&_.paper-destination]:pb-2 [&_.paper-destination]:ps-3",
+  "[&_.paper-destination]:border [&_.paper-destination]:border-border [&_.paper-destination]:rounded-md",
+  "[&_.paper-destination]:bg-background [&_.paper-destination_code]:flex-1",
+  "[&_.paper-destination_code]:min-w-0 [&_.paper-destination_code]:overflow-hidden",
+  "[&_.paper-destination_code]:text-text [&_.paper-destination_code]:text-sm",
+  "[&_.paper-destination_code]:font-normal",
+  "[&_.paper-destination_code]:text-ellipsis [&_.paper-destination_code]:whitespace-nowrap",
+  "[&_.paper-destination_.btn]:flex-none [&_.project-path-notice]:py-[9px] [&_.project-path-notice]:px-[11px]",
+  "[&_.project-path-notice]:border [&_.project-path-notice]:border-border-variant",
+  "[&_.project-path-notice]:rounded-sm [&_.project-path-notice]:bg-surface",
+  "[&_.project-path-notice]:text-base [&_.project-path-notice]:leading-relaxed [&_.project-path-notice]:text-text",
+  "[&_.project-path-notice]:leading-[1.4]",
+  "[&_.project-path-notice.error]:border-danger-notice-border",
+  "[&_.paper-results]:flex [&_.paper-results]:flex-col",
+  "[&_.paper-results]:border [&_.paper-results]:border-border [&_.paper-results]:rounded-md",
+  "[&_.paper-results]:max-h-60 [&_.paper-results]:overflow-y-auto",
+  "[&_.paper-results_button]:flex [&_.paper-results_button]:flex-col",
+  "[&_.paper-results_button]:items-start [&_.paper-results_button]:gap-0.5",
+  "[&_.paper-results_button]:py-2 [&_.paper-results_button]:px-2.5 [&_.paper-results_button]:bg-none [&_.paper-results_button]:bg-transparent",
+  "[&_.paper-results_button]:border-0",
+  "[&_.paper-results_button]:border-b [&_.paper-results_button]:border-b-border-variant",
+  "[&_.paper-results_button]:text-start [&_.paper-results_button]:[font:inherit]",
+  "[&_.paper-results_button]:text-text [&_.paper-results_button]:cursor-pointer",
+  "[&_.paper-results_button:last-child]:border-b-0",
+  "[&_.paper-results_button:hover]:bg-surface [&_.paper-results_.title]:text-sm",
+  "[&_.paper-results_.title]:font-medium",
+  "[&_.paper-results_.id]:text-xs [&_.paper-results_.id]:text-muted",
+  "[&_.paper-pick_.id]:text-xs",
+  "[&_.paper-pick_.id]:text-muted [&_.paper-pick]:flex [&_.paper-pick]:items-center",
+  "[&_.paper-pick]:justify-between [&_.paper-pick]:gap-2.5 [&_.paper-pick]:py-2.5 [&_.paper-pick]:px-3",
+  "[&_.paper-pick]:border [&_.paper-pick]:border-border [&_.paper-pick]:rounded-md",
+  "[&_.paper-pick]:bg-surface [&_.paper-pick_.meta]:min-w-0",
+  "[&_.paper-pick_.title]:text-sm [&_.paper-pick_.title]:font-medium",
+  "flex flex-col gap-2.5 [&_label]:flex [&_label]:flex-col",
+  "[&_label]:gap-1 [&_label]:text-sm [&_label]:text-text",
+  "[&_label]:font-medium [&_.row2]:grid [&_.row2]:grid-cols-2",
+  "[&_input]:font-sans [&_input]:text-sm [&_input]:font-normal [&_input]:text-text [&_input::placeholder]:text-subtext",
+  "[&_select]:font-sans [&_select]:text-sm [&_select]:font-normal [&_select]:text-text",
+  "[&_.row2]:gap-2.5 [&_.actions]:flex [&_.actions]:justify-end",
+  "[&_.actions]:gap-2.5 [&_.actions]:mt-1.5 [&_.new-project-actions]:justify-start",
+  "[&_.new-project-actions]:mt-2.5",
+  "[&_.error]:text-accent-red [&_.error]:text-base [&_.error]:whitespace-pre-wrap",
+  "settings-form mt-3.5 pt-3.5 border-t border-t-border",
+].join(" ");
+
+const PROJECT_DEFAULT_ROW_CLASS_NAME = [
+  "project-default-row flex items-center justify-between gap-6",
+  "pt-3.5 border-t border-t-border-variant [&_p]:mt-[3px] [&_p]:mx-0 [&_p]:mb-0",
+  "[&_.project-default-title]:text-base [&_p]:text-sm [&_p]:leading-relaxed [&_p]:text-text",
+].join(" ");
+
+const GIT_SETTINGS_CARD_CLASS_NAME = [
+  "settings-card [&_>_.error]:text-accent-red [&_>_.error]:text-base",
+  "[&_>_.error]:whitespace-pre-wrap bg-background border border-border",
+  "rounded-lg mb-4 [&_h3]:mt-0 [&_h3]:mx-0 [&_h3]:mb-2.5 [&_h3]:text-base",
+  "[&_h3]:font-semibold [&_h3]:text-text [&_.settings-sub]:mb-3",
+  "[&_>_.project-default-row:first-child]:pt-0 [&_>_.project-default-row:first-child]:border-t-0",
+  "git-settings-card py-3.5 px-4 [&_h3]:mb-3",
+  "[&_.kv]:grid-cols-[132px_minmax(0,_1fr)] [&_.kv]:items-center [&_.kv]:gap-y-[9px] [&_.kv]:gap-x-4.5",
+  "[&_.kv_.k]:text-sm [&_.kv_.v]:flex [&_.kv_.v]:items-center",
+  "[&_.kv_.v]:flex-wrap [&_.kv_.v]:gap-[7px] [&_.kv_.v]:min-w-0 [&_.kv_.v]:font-sans",
+  "[&_.kv_.v]:text-base [&_.kv_.v]:break-normal",
+  "[@media((max-width:_640px))]:[&_.kv]:grid-cols-1",
+  "[@media((max-width:_640px))]:[&_.kv]:gap-[3px] [@media((max-width:_640px))]:[&_.kv_.v_+_.k]:mt-[7px]",
+].join(" ");
+
+const GIT_CARD_ACTIONS_CLASS_NAME = [
+  "git-card-actions flex flex-wrap gap-2 mt-3.5 pt-3.5",
+  "border-t border-t-border-variant",
+].join(" ");
+
+const SETTINGS_STACK_SECTION_CLASS_NAME = [
+  "settings-stack-section [&_+_.settings-stack-section]:mt-6 [&_>_:last-child]:mb-0",
+  "[&_>_h2]:mt-0 [&_>_h2]:mx-0 [&_>_h2]:mb-1.5 [&_>_h2]:text-xl",
+].join(" ");
+
+export type SettingsTab = import("../workspaceState").SettingsSection;
+type Tab = SettingsTab;
+
+// --- runnable notes ----------------------------------------------------------
+
+/** Commands the server's settings allowlist accepts; keep in sync with
+ * `SETTINGS_COMMANDS` in `src/commands/up.rs`. */
+const SETTINGS_COMMANDS = new Set(["gh auth login", "hf auth login", "claude auth status"]);
+
+function settingsCommandPath(command: string) {
+  return SETTINGS_COMMANDS.has(command) ? `/api/settings/commands/run?command=${encodeURIComponent(command)}` : undefined;
+}
+
+type CommandRun = { command: string; path: string; attempt: number; owner?: string };
+
+/** The run outlives the note that started it: a successful sign-in removes
+ * the note (and often its whole card section), and the terminal must stay. */
+function useCommandRun() {
+  const [run, setRun] = useState<CommandRun | null>(null);
+  const start = (command: string, path: string, owner?: string) =>
+    setRun((current) => ({ command, path, owner, attempt: (current?.attempt ?? 0) + 1 }));
+  return { run, start, clear: () => setRun(null) };
+}
+
+/** A note whose backticked commands get a play button when `resolve` maps
+ * them to a terminal route. `disabled` hides every button: remote workspaces
+ * (the routes are local) or a tool that is not installed yet. */
+function RunnableNote({ note, className, disabled, resolve = settingsCommandPath, onRun }: {
+  note: string | undefined;
+  className: string;
+  disabled: boolean;
+  resolve?: (command: string) => string | undefined;
+  onRun: (command: string, path: string) => void;
+}) {
+  if (!note) return null;
+  return (
+    <p className={className}>
+      {renderNote(note, {
+        canRun: (command) => !disabled && resolve(command) !== undefined,
+        onRun: (command) => {
+          const path = resolve(command);
+          if (path) onRun(command, path);
+        },
+      })}
+    </p>
+  );
+}
+
+function CommandRunTerminal({ run, onComplete, onClose }: {
+  run: CommandRun | null;
+  onComplete: () => void;
+  onClose: () => void;
+}) {
+  if (!run) return null;
+  return (
+    <SettingsCommandTerminal
+      key={`${run.command}-${run.attempt}`}
+      path={run.path}
+      label={run.command}
+      onComplete={onComplete}
+      onError={(error) => showAlert(error, "error")}
+      onClose={onClose}
+    />
+  );
+}
+
+// --- harnesses ---------------------------------------------------------------
+
+function harnessStatus(h: Harness): { cls: string; variant: BadgeVariant; label: string } {
+  if (h.catalogPending) return { cls: "warn", variant: "warning", label: m.onboarding_checking() };
+  if (h.authCheckFailed) return { cls: "warn", variant: "warning", label: m.settings_page_unable_to_verify() };
+  if (h.agentReady && !h.authenticated && h.authMethod !== "local") return { cls: "warn", variant: "warning", label: m.onboarding_not_signed_in() };
+  if (h.agentReady) return { cls: "ok", variant: "success", label: h.authMethod === "thirdParty" || claudeProviderLabel(h) ? m.settings_page_ready_to_use() : h.authMethod === "local" ? m.onboarding_ready() : m.settings_page_signed_in() };
+  // Not installed — the same blocker whether or not there's saved auth: the
+  // CLI has to be installed before anything can run. Amber "action needed".
+  if (!h.installed) return { cls: "warn", variant: "warning", label: m.settings_page_not_installed() };
+  if (h.installBroken) return { cls: "warn", variant: "warning", label: m.settings_page_install_broken() };
+  if (h.authMethod === "local") return { cls: "warn", variant: "warning", label: m.onboarding_server_unavailable() };
+  // A config fault reports `unsupported`, but no update repairs it; the note
+  // carries the actual repair, so the badge must not promise an update.
+  if (h.needsConfigRepair || h.authState === "unknown") return { cls: "warn", variant: "warning", label: m.settings_page_unable_to_verify() };
+  if (h.authState === "unsupported") return { cls: "warn", variant: "warning", label: m.settings_page_update_required() };
+  return { cls: "warn", variant: "warning", label: m.settings_page_not_signed_in() };
+}
+
+function AuthLabel({ h }: { h: Harness }) {
+  if (h.id === "opencode" && h.agentReady && !h.authenticated && !h.authMethod) return <>{m.settings_free_models_no_sign_in()}</>;
+  const provider = claudeProviderLabel(h);
+  if (provider) return <>{provider}</>;
+  if (!h.authMethod) return <>—</>;
+  if (h.authMethod === "local") return <>{m.projects_local()}</>;
+  if (h.authMethod === "thirdParty") return <>{m.settings_providers()}</>;
+  return <>{h.authMethod === "oauth" ? m.settings_oauth_login() : m.onboarding_api_key()}</>;
+}
+
+/** A note command that is one of the harness's setup commands runs through the
+ * setup route, which owns install/login/update semantics (telemetry, OpenCode's
+ * isolated store, verification); `shell` keeps the terminal open afterwards. */
+function harnessSetupPath(h: Harness, setup: HarnessSetupCommands | undefined, command: string) {
+  if (!setup) return undefined;
+  // Install notes quote the vendor one-liner (`curl … | bash`) while the shown
+  // setup command fetches to a temp file first, so exact equality would drop the
+  // play button from every install note. The shared bootstrap URL identifies it.
+  const installsSameSource = setup.installUrl !== undefined && command.includes(setup.installUrl);
+  const action = command === setup.login ? "login" : command === setup.install ? "install" : command === setup.update ? "update" : installsSameSource ? "install" : null;
+  if (!action) return undefined;
+  if (action !== "install" && (!h.installed || h.installBroken)) return undefined;
+  return `/api/harnesses/setup?${new URLSearchParams({ harness: h.id, action, shell: "true" })}`;
+}
+
+function HarnessesTab({ remote }: { remote: boolean }) {
+  const harnessesOptions = getHarnessesQuery();
+  const { data: harnesses = null } = useQuery(harnessesOptions);
+  const [active, setActive] = useState<HarnessId | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const setupRun = useCommandRun();
+  const [setupHarness, setSetupHarness] = useState<Harness | null>(null);
+  const setupCommands = useQuery(getHarnessSetupCommandsQuery());
+
+  const load = (refresh: boolean, retryRejected = false) => {
+    setRefreshing(true);
+    refreshHarnesses(refresh, retryRejected)
+      .catch(() => {})
+      .finally(() => setRefreshing(false));
+  };
+
+  const orderedHarnesses = [...(harnesses ?? [])].sort(
+    (a, b) => Number(b.agentReady) - Number(a.agentReady),
+  );
+  const h = orderedHarnesses.find((x) => x.id === active) ?? orderedHarnesses[0];
+
+  return (
+    <>
+      <h2>{m.settings_page_harnesses()}</h2>
+      {!remote && setupHarness && setupCommands.data && (
+        <HarnessSetupDialog
+          harness={setupHarness}
+          commands={setupCommands.data[setupHarness.id]}
+          onClose={() => setSetupHarness(null)}
+        />
+      )}
+      <div className="mt-3 mb-3.5 w-fit max-w-full [&_.option-menu]:w-max">
+        <OptionPicker
+          variant="field"
+          dropDown
+          title={m.settings_page_harnesses()}
+          choices={orderedHarnesses.map((harness) => ({ id: harness.id, label: harness.name }))}
+          value={h?.id ?? null}
+          onSelect={(id) => {
+            const selected = orderedHarnesses.find((harness) => harness.id === id);
+            if (selected) setActive(selected.id);
+          }}
+          renderIcon={(choice) => {
+            const harness = orderedHarnesses.find((harness) => harness.id === choice.id);
+            return harness && <HarnessLogo harness={harness.id} />;
+          }}
+          renderLabel={(choice) => {
+            const harness = orderedHarnesses.find((harness) => harness.id === choice.id);
+            const status = harness && harnessStatus(harness);
+            return (
+              <span className="inline-flex items-center gap-2 whitespace-nowrap">
+                {choice.label}
+                {status && (
+                  <>
+                    <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full bg-muted [&.ok]:bg-accent-green [&.err]:bg-accent-red [&.warn]:bg-accent-amber ${status.cls}`} />
+                    <span className="sr-only">{status.label}</span>
+                  </>
+                )}
+              </span>
+            );
+          }}
+        />
+      </div>
+      {!harnesses ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_detecting_harnesses()}
+        </LoadingRow>
+      ) : !h ? null : (
+        <div className={SETTINGS_CARD_CLASS_NAME}>
+          <div className="settings-card-head flex items-center gap-2.5 mb-3">
+            <Badge variant={harnessStatus(h).variant}>{harnessStatus(h).label}</Badge>
+            <div className="spacer flex-1" />
+            {!remote && !h.catalogPending && h.installed && !h.installBroken && !h.authenticated && !h.needsConfigRepair && (h.id === "claude-code" ? h.loginEligible : h.authMethod !== "local" && h.authMethod !== "apiKey" && h.authState !== "unsupported") && (
+              <Button size="small" onClick={() => setSetupHarness(h)} disabled={!setupCommands.data} aria-haspopup="dialog">
+                <SquareTerminal size={14} /> {m.harness_setup_login()}
+              </Button>
+            )}
+            <Button size="small" onClick={() => load(true, true)} disabled={refreshing}>
+              <RefreshCw size={12} className={refreshing ? "animate-[spin_0.9s_linear_infinite]" : ""} /> {m.settings_page_refresh()}
+            </Button>
+          </div>
+          <div className={cn(KV_CLASS_NAME, "[&_.v]:text-sm")}>
+            <span className="k">{m.settings_page_binary()}</span>
+            <span className="v">{h.binPath ?? m.settings_not_found_on_path()}</span>
+            <span className="k">{m.settings_page_version()}</span>
+            <span className="v">{h.version ?? "—"}</span>
+            {(h.authMethod === "apiKey" || h.authMethod === "thirdParty" || h.authMethod === "local" || claudeProviderLabel(h)) && (
+              <>
+                <span className="k">{m.settings_page_auth()}</span>
+                <span className="v"><AuthLabel h={h} /></span>
+              </>
+            )}
+            {h.account && (
+              <>
+                <span className="k">{h.id === "opencode" ? m.settings_providers() : m.settings_page_account()}</span>
+                <span className="v">{h.account}</span>
+              </>
+            )}
+            {h.org && (
+              <>
+                <span className="k">{m.settings_page_org()}</span>
+                <span className="v">{h.org}</span>
+              </>
+            )}
+            <span className="k">{m.settings_page_agent_models()}</span>
+            <span className="v">
+              {h.catalogPending
+                ? m.onboarding_checking()
+                : h.models.length > 0
+                ? m.settings_models_available({ count: fmtNumber(h.models.length) })
+                : h.agentReady ? m.model_picker_default_model() : m.settings_none()}
+            </span>
+          </div>
+          <RunnableNote
+            note={h.agentNote}
+            className={cn(SETTINGS_NOTE_CLASS_NAME, "text-sm")}
+            disabled={remote}
+            resolve={(command) => harnessSetupPath(h, setupCommands.data?.[h.id], command) ?? settingsCommandPath(command)}
+            onRun={(command, path) => setupRun.start(command, path, h.id)}
+          />
+          {setupRun.run && (
+            // Hidden, not unmounted, while another harness tab is showing: a
+            // switch mid-OAuth must not kill the sign-in.
+            <div hidden={setupRun.run.owner !== h.id}>
+              <CommandRunTerminal run={setupRun.run} onComplete={() => load(true, true)} onClose={setupRun.clear} />
+            </div>
+          )}
+          {h.id === "opencode" && <LocalModelSetup installed={h.installed} />}
+        </div>
+      )}
+    </>
+  );
+}
+
+// --- compute (kubernetes) -------------------------------------------------------
+
+function K8sHealthBadge({ s }: { s: K8sSettings }) {
+  const p = s.preflight;
+  if (!p.kubectlFound) return <Badge variant="error">{m.settings_page_kubectl_not_found()}</Badge>;
+  if (!p.reachable) return <Badge variant="error">{m.settings_page_cluster_unreachable()}</Badge>;
+  if (!p.canCreateJobs) return <Badge variant="error">{m.settings_page_no_job_create_permission()}</Badge>;
+  return <Badge variant="success">{m.settings_page_connected()}</Badge>;
+}
+
+function K8sSection({
+  onEditState,
+}: {
+  onEditState?: (state: { dirty: boolean; saving: boolean }) => void;
+}) {
+  const saveK8sSettingsMutation = useMutation({ mutationFn: saveK8sSettings });
+
+  const settingsOptions = getK8sSettingsQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const setSettings = (value: React.SetStateAction<K8sSettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const loadError = settings ? null : settingsQuery.error?.message ?? null;
+  const [context, setContext] = useState("");
+  const [namespace, setNamespace] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const apply = (s: K8sSettings) => {
+    setSettings(s);
+    setContext(s.context ?? "");
+    setNamespace(s.namespace);
+  };
+
+  const previousSettings = useRef<K8sSettings | null>(null);
+  useEffect(() => {
+    const previous = previousSettings.current;
+    previousSettings.current = settings;
+    if (settings && (!previous || (
+      context === (previous.context ?? "") && namespace.trim() === previous.namespace
+    ))) {
+      setContext(settings.context ?? "");
+      setNamespace(settings.namespace ?? "");
+    }
+  }, [settings, context, namespace]);
+
+  const unchanged =
+    settings !== null &&
+    context === (settings.context ?? "") &&
+    namespace.trim() === settings.namespace;
+  const dirty = settings !== null && !unchanged;
+
+  useEffect(() => {
+    onEditState?.({ dirty, saving });
+  }, [dirty, saving, onEditState]);
+
+  async function checkAgain() {
+    if (checking || saving || !unchanged) return;
+    setChecking(true);
+    try {
+      await queryClient.fetchQuery({ ...getK8sSettingsQuery(), staleTime: 0 });
+    } catch (err) {
+      showAlert(err instanceof Error ? err.message : String(err), "error");
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (saving || checking) return;
+    setSaving(true);
+    setError(null);
+    try {
+      apply(await saveK8sSettingsMutation.mutateAsync({ context, namespace: namespace.trim() }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      {loadError ? (
+        <p className="m-0 text-sm text-accent-red whitespace-pre-wrap break-words">{loadError}</p>
+      ) : !settings ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_checking_kubectl()}
+        </LoadingRow>
+      ) : (
+        <>
+          <dl className="m-0 flex items-center justify-between gap-4 text-sm">
+            <dt className="text-subtext">{m.settings_page_status()}</dt>
+            <dd className="m-0">
+              {checking || saving ? (
+                <Badge>{m.common_checking()}</Badge>
+              ) : dirty ? (
+                <Badge>{m.file_viewer_unsaved()}</Badge>
+              ) : (
+                <K8sHealthBadge s={settings} />
+              )}
+            </dd>
+          </dl>
+          {unchanged && !checking && !saving && settings.preflight.error && (
+            <p className={`${COMPUTE_DIAGNOSTIC_CLASS_NAME} break-words`}>{settings.preflight.error}</p>
+          )}
+          <form className="mt-5 flex flex-col gap-4" onSubmit={submit}>
+            <label className="flex flex-col gap-2 text-sm font-medium text-subtext">
+              {m.settings_page_context()}
+              <OptionPicker
+                choices={[
+                  {
+                    id: "",
+                    label: settings.currentContext ? m.settings_kubectl_default_context({ context: ltr(settings.currentContext) }) : m.settings_kubectl_default(),
+                  },
+                  ...(context && !settings.contexts.includes(context)
+                    ? [{ id: context, label: m.settings_not_in_kubeconfig({ context: ltr(context) }) }]
+                    : []),
+                  ...settings.contexts.map((item) => ({ id: item, label: item })),
+                ]}
+                value={context}
+                variant="field"
+                dropDown
+                disabled={saving || checking}
+                onSelect={setContext}
+              />
+            </label>
+            <label className="flex flex-col gap-2 text-sm font-medium text-subtext">
+              {m.settings_page_namespace()}
+              <Input
+                type="text"
+                value={namespace}
+                disabled={saving || checking}
+                onChange={(e) => setNamespace(e.target.value)}
+                placeholder={m.settings_page_default()}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            {error && <p className="m-0 text-sm text-accent-red whitespace-pre-wrap break-words">{error}</p>}
+            <div className="flex justify-end gap-2">
+              <Button type="button" onClick={() => void checkAgain()} disabled={saving || checking || !unchanged}>
+                <RefreshCw size={13} /> {checking ? m.common_checking() : m.settings_check_again()}
+              </Button>
+              <Button variant="primary" type="submit" disabled={saving || checking || unchanged}>
+                {saving ? m.common_saving() : m.common_save()}
+              </Button>
+            </div>
+          </form>
+        </>
+      )}
+    </>
+  );
+}
+
+// --- compute (modal) ------------------------------------------------------------
+
+function ModalSection() {
+  const saveModalTokenMutation = useMutation({ mutationFn: (args: Parameters<typeof saveModalToken>) => saveModalToken(...args) });
+
+  const sOptions = getModalSettingsQuery();
+  const sQuery = useQuery(sOptions);
+  const s = sQuery.data ?? null;
+  const setS = (value: React.SetStateAction<ModalSettings | null>) => {
+    setScopedQueryData(sOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const [actionError, setError] = useState<string | null>(null);
+  const error = actionError ?? sQuery.error?.message ?? null;
+  const [tokenId, setTokenId] = useState("");
+  const [tokenSecret, setTokenSecret] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const loading = sQuery.isPending || refreshing;
+  const [saving, setSaving] = useState(false);
+
+  async function refresh() {
+    if (loading || saving) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      await queryClient.fetchQuery({ ...getModalSettingsQuery(), staleTime: 0 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!tokenId.trim() || !tokenSecret.trim() || loading || saving || s?.processEnv) return;
+    setSaving(true);
+    setError(null);
+    try {
+      setS(await saveModalTokenMutation.mutateAsync([tokenId.trim(), tokenSecret.trim()]));
+      setTokenId("");
+      setTokenSecret("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      {!s && loading ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_checking_modal()}
+        </LoadingRow>
+      ) : s && (
+        <dl className="m-0 flex items-center justify-between gap-4 text-sm">
+          <dt className="font-medium text-subtext">{m.settings_page_status()}</dt>
+          <dd className="m-0">
+            <Badge variant={s.tokenConfigured ? "success" : "warning"}>
+              {s.tokenConfigured ? m.settings_page_ready_to_use() : m.settings_page_not_configured()}
+            </Badge>
+          </dd>
+        </dl>
+      )}
+      {s?.processEnv && <p className="mt-2 mb-0 text-sm text-subtext">{m.settings_modal_env_override()}</p>}
+      <form className="mt-5 flex flex-col gap-4" onSubmit={submit}>
+        <label className="flex flex-col gap-2 text-sm font-medium text-subtext">
+          {s?.tokenConfigured ? m.settings_modal_replace_id() : m.settings_modal_token_id()}
+          <Input type="password" value={tokenId} onChange={(event) => setTokenId(event.target.value)}
+            placeholder={s?.maskedTokenId ?? "ak-…"} autoComplete="new-password" disabled={s?.processEnv} />
+        </label>
+        <label className="flex flex-col gap-2 text-sm font-medium text-subtext">
+          {s?.tokenConfigured ? m.settings_modal_replace_secret() : m.settings_modal_token_secret()}
+          <Input type="password" value={tokenSecret} onChange={(event) => setTokenSecret(event.target.value)}
+            placeholder={s?.maskedTokenSecret ?? "as-…"} autoComplete="new-password" disabled={s?.processEnv} />
+        </label>
+        <a className="self-start text-sm text-subtext underline" href="https://modal.com/docs/sdk/py/latest/config" target="_blank" rel="noreferrer">
+          {m.settings_modal_setup_help()}
+        </a>
+        {error && <p className="m-0 text-sm text-accent-red">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button type="button" disabled={loading || saving} onClick={() => void refresh()}>
+            <RefreshCw size={13} /> {m.settings_page_refresh()}
+          </Button>
+          <Button variant="primary" type="submit" disabled={!tokenId.trim() || !tokenSecret.trim() || loading || saving || s?.processEnv}>
+            {saving ? m.common_saving() : m.common_save()}
+          </Button>
+        </div>
+      </form>
+    </>
+  );
+}
+
+// --- compute (ssh) ---------------------------------------------------------------
+
+const CONNECTION_BADGE_IDLE_CLASS = "rounded-sm border-border-strong bg-surface text-subtext";
+const CONNECTION_BADGE_CONNECTING_CLASS = "rounded-sm border-accent-blue bg-accent-blue-subtle text-accent-blue";
+const SSH_MASTER_POLL_MS = 5_000;
+
+function useSshMasterStatuses(hosts: string[]) {
+  const scope = workspaceScope();
+  const options = hosts.map((host) => getSshMasterStatusQuery(host));
+  const queries = useQueries({ queries: options.map((query) => ({ ...query, refetchInterval: SSH_MASTER_POLL_MS })) });
+  const statuses = Object.fromEntries(hosts.flatMap((host, index) => queries[index].data ? [[host, queries[index].data.running]] : []));
+  const markRunning = (host: string) => {
+    if (isCurrentScope(scope)) setScopedQueryData(getSshMasterStatusQuery(host).queryKey, { running: true });
+  };
+  return [statuses, markRunning] as const;
+}
+
+function HostTestCell({ test, connecting, masterRunning, containerFailed = false }: { test: SshPreflight | undefined; connecting: boolean; masterRunning: boolean | null | undefined; containerFailed?: boolean }) {
+  if (connecting)
+    return (
+      <span role="status">
+        <Badge className={CONNECTION_BADGE_CONNECTING_CLASS}>{m.settings_connecting()}</Badge>
+      </span>
+    );
+  if (test === undefined) return <Badge className={CONNECTION_BADGE_IDLE_CLASS}>{m.settings_page_not_checked()}</Badge>;
+  const missingTools = test.missingTools ?? [];
+  const disconnected = test.reachable && test.toolsFound && masterRunning === false;
+  const badge = !test.reachable || containerFailed ? (
+    <Badge className="rounded-sm" variant="error">{m.settings_page_failed()}</Badge>
+  ) : !test.toolsFound ? (
+    <Badge className="rounded-sm" variant="error">
+      {missingTools.length === 1 ? m.settings_needs_tool({ tool: ltr(missingTools[0]) }) : m.settings_needs_tools()}
+    </Badge>
+  ) : disconnected ? (
+    <Badge className="rounded-sm" variant="warning">{m.settings_disconnected()}</Badge>
+  ) : (
+    <Badge className="rounded-sm" variant="success">{m.settings_page_ready()}</Badge>
+  );
+  return (
+    <div className="flex items-center gap-4" role="status">
+      {badge}
+      {!disconnected && (
+        <span className="ssh-tested-at whitespace-nowrap text-xs text-subtext">{timeAgo(test.testedAt)}</span>
+      )}
+    </div>
+  );
+}
+
+function SshSection() {
+  const hostsOptions = getSshSettingsQuery();
+  const hostsQuery = useQuery(hostsOptions);
+  const hosts = hostsQuery.data?.hosts ?? (hostsQuery.isError ? [] : null);
+  const [configOpen, setConfigOpen] = useState(false);
+  const [tests, setTests] = useState<Record<string, SshExecutionPreflight>>({});
+  const [drafts, setDrafts] = useState<Record<string, string | null>>({});
+  const activeAttempt = useRef(0);
+  const [probing, setProbing] = useState(false);
+  const [expandedHosts, setExpandedHosts] = useState<Record<string, boolean>>({});
+  const [connectingHost, setConnectingHost] = useState<string | null>(null);
+  const [connectionFailed, setConnectionFailed] = useState(false);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const checkedHosts = hosts
+    ?.filter((host) => {
+      const test = tests[host.host] ?? host.lastTest;
+      return test?.reachable && test.toolsFound;
+    })
+    .map((host) => host.host) ?? [];
+  const [masterRunning, markMasterRunning] = useSshMasterStatuses(checkedHosts);
+
+  function connect(host: string) {
+    activeAttempt.current += 1;
+    setProbing(false);
+    setConnectionFailed(false);
+    setConnectionAttempt((attempt) => attempt + 1);
+    setConnectingHost(host);
+    setExpandedHosts((expanded) => ({ ...expanded, [host]: true }));
+  }
+
+  function cancelConnect() {
+    activeAttempt.current += 1;
+    setProbing(false);
+    setConnectionFailed(false);
+    setConnectingHost(null);
+  }
+
+  function toggle(host: string, open: boolean) {
+    setExpandedHosts((expanded) => ({ ...expanded, [host]: !open }));
+  }
+
+  return (
+    <>
+      {hostsQuery.error && <p className="text-sm text-accent-red">{hostsQuery.error.message}</p>}
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        {hostsQuery.data && <SshDefaultHost settings={hostsQuery.data} />}
+        <Button variant="ghost" className="ms-auto" onClick={() => setConfigOpen(true)}>
+          <Settings size={14} /> {m.ssh_configure_hosts()}
+        </Button>
+      </div>
+      {hosts === null ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_reading_ssh_config()}
+        </LoadingRow>
+      ) : hosts.length === 0 ? (
+        <p className="settings-empty mt-1 mx-0 mb-0 text-base text-subtext">{m.settings_page_no_hosts_found_in_ssh_config()}</p>
+      ) : (
+        <div className="border-y border-border-variant divide-y divide-border-variant">
+          {hosts.map((h) => {
+            // Session-local result wins; the persisted one covers restarts.
+            const reference = drafts[h.host] === undefined ? h.container ?? null : drafts[h.host];
+            const executionTest = tests[h.host];
+            const containerTest = reference !== null && executionTest?.container?.reference === reference.trim()
+              ? executionTest : undefined;
+            const hostTest = reference !== null ? containerTest
+              : executionTest?.container ? h.lastTest : executionTest ?? h.lastTest;
+            const containerError = containerTest?.container?.error;
+            const containerFailed = containerTest?.container?.ready === false;
+            const connectionError = hostTest?.error || containerError;
+            const connecting = connectingHost === h.host;
+            const open = expandedHosts[h.host] ?? false;
+            const hasTerminal = connecting || Boolean(connectionError);
+            const address =
+              `${h.user ? `${h.user}@` : ""}${h.hostname ?? h.host}${h.port ? `:${h.port}` : ""}`;
+            return (
+              <div key={h.host}>
+                <div
+                  className="flex items-center gap-3 py-3"
+                >
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                    <div className="min-w-0">
+                      <div className="truncate text-base font-medium text-text" title={h.host}>{h.host}</div>
+                      <div className="mt-1 truncate text-sm text-subtext" title={address}>{address}</div>
+                    </div>
+                  </div>
+                  <div className="grid flex-none grid-cols-[8.5rem_5rem] items-center gap-x-12">
+                    <div className="flex items-center gap-2 text-start">
+                      <HostTestCell test={hostTest} connecting={connecting && !connectionFailed} masterRunning={masterRunning[h.host]} containerFailed={containerFailed} />
+                      {hasTerminal && (
+                        <button
+                          type="button"
+                          className="flex-none inline-flex items-center p-0.5 rounded-sm [&:hover]:bg-panel"
+                          aria-expanded={open}
+                          aria-label={open ? m.a11y_collapse_item({ name: ltr(h.host) }) : m.a11y_expand_item({ name: ltr(h.host) })}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggle(h.host, open);
+                          }}
+                        >
+                          <ChevronDown
+                            size={18}
+                            className={`text-muted transition-transform duration-120 ease-standard${open ? " rotate-180" : ""}`}
+                          />
+                        </button>
+                      )}
+                    </div>
+                    <Button size="small"
+                      type="button"
+                      className="justify-self-end"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        if (connecting && !connectionFailed) cancelConnect();
+                        else connect(h.host);
+                      }}
+                      disabled={!connecting && ((connectingHost !== null && !connectionFailed) || (reference !== null && !reference.trim()))}
+                    >
+                      {connecting
+                        ? connectionFailed
+                          ? m.app_retry()
+                          : m.settings_page_cancel()
+                        : hostTest?.reachable === false || containerFailed
+                          ? m.app_retry()
+                          : hostTest
+                            ? m.settings_reconnect()
+                            : m.settings_connect()}
+                    </Button>
+                  </div>
+                </div>
+                <SshExecutionSettings host={h} connecting={connecting && !connectionFailed} reference={reference}
+                  onChange={(value) => {
+                    if (connecting) cancelConnect();
+                    setDrafts((drafts) => ({ ...drafts, [h.host]: value }));
+                    setTests((tests) => {
+                      const next = { ...tests };
+                      delete next[h.host];
+                      return next;
+                    });
+                  }} />
+                {hasTerminal && (open || connecting) && (
+                  <div className={`border-t border-t-border-variant py-3${open ? "" : " hidden"}`}>
+                    {!connecting && connectionError && (
+                      <SshTerminalTranscript host={h.host} transcript={connectionError} />
+                    )}
+                    {connecting && !probing && (
+                      <SshConnectTerminal
+                        key={connectionAttempt}
+                        host={h.host}
+                        backend="ssh"
+                        active={open}
+                        onComplete={(complete) => {
+                          if (complete.backend !== "ssh") return;
+                          markMasterRunning(h.host);
+                          const attempt = activeAttempt.current;
+                          if (reference === null) {
+                            setTests((tests) => ({ ...tests, [h.host]: { ...complete.result, container: null } }));
+                            setConnectionFailed(false);
+                            setConnectingHost(null);
+                            return;
+                          }
+                          setProbing(true);
+                          void testSshExecution(h.host, reference.trim()).then((result) => {
+                            if (activeAttempt.current !== attempt) return;
+                            setTests((tests) => ({ ...tests, [h.host]: {
+                              ...result,
+                              container: result.container ?? { reference: reference.trim(), ready: false, error: result.error ?? null },
+                            } }));
+                          }).catch((error: unknown) => {
+                            if (activeAttempt.current !== attempt) return;
+                            setTests((tests) => ({ ...tests, [h.host]: {
+                              ...complete.result,
+                              container: { reference: reference.trim(), ready: false, error: error instanceof Error ? error.message : String(error) },
+                            } }));
+                          }).finally(() => {
+                            if (activeAttempt.current !== attempt) return;
+                            setProbing(false);
+                            setConnectionFailed(false);
+                            setConnectingHost(null);
+                          });
+                        }}
+                        onError={(error) => {
+                          setConnectionFailed(true);
+                          setTests((tests) => ({
+                            ...tests,
+                            [h.host]: {
+                              container: reference === null ? null : { reference: reference.trim(), ready: false, error },
+                              reachable: false,
+                              toolsFound: false,
+                              missingTools: [],
+                              error,
+                              testedAt: Date.now(),
+                            },
+                          }));
+                        }}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {configOpen && (
+        <SshConfigDialog
+          onClose={() => setConfigOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// --- compute (slurm) --------------------------------------------------------------
+
+/** First failing check wins, like K8sHealthBadge. */
+function SlurmTestBadge({ test, connecting, masterRunning }: { test: SlurmPreflight | null; connecting: boolean; masterRunning: boolean | null | undefined }) {
+  if (connecting) return <Badge className={CONNECTION_BADGE_CONNECTING_CLASS}>{m.settings_connecting()}</Badge>;
+  if (test === null) return <Badge className={CONNECTION_BADGE_IDLE_CLASS}>{m.settings_page_not_checked()}</Badge>;
+  if (!test.reachable) return <Badge className="rounded-sm" variant="error">{m.settings_page_failed()}</Badge>;
+  if (!test.slurmFound) return <Badge className="rounded-sm" variant="error">{m.settings_page_no_slurm_cli()}</Badge>;
+  if (!test.toolsFound) return <Badge className="rounded-sm" variant="error">{m.settings_page_missing_bash_tar()}</Badge>;
+  if (masterRunning === false) return <Badge className="rounded-sm" variant="warning">{m.settings_disconnected()}</Badge>;
+  return <Badge className="rounded-sm" variant="success">{m.settings_page_ready()}</Badge>;
+}
+
+function SlurmSection() {
+  const saveSlurmSettingsMutation = useMutation({ mutationFn: saveSlurmSettings });
+
+  const settingsOptions = getSlurmSettingsQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const setSettings = (value: React.SetStateAction<SlurmSettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const loadError = settings ? null : settingsQuery.error?.message ?? null;
+  const [host, setHost] = useState("");
+  const [partition, setPartition] = useState("");
+  const [account, setAccount] = useState("");
+  const [timeLimit, setTimeLimit] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [test, setTest] = useState<SlurmPreflight | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [connectionFailed, setConnectionFailed] = useState(false);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const readyHost = host && test?.reachable && test.slurmFound && test.toolsFound ? [host] : [];
+  const [masterRunning, markMasterRunning] = useSshMasterStatuses(readyHost);
+
+  function connect() {
+    setConnectionFailed(false);
+    setConnectionAttempt((attempt) => attempt + 1);
+    setConnecting(true);
+  }
+
+  const apply = (s: SlurmSettings) => {
+    setSettings(s);
+    setHost(s.host ?? "");
+    setPartition(s.partition ?? "");
+    setAccount(s.account ?? "");
+    setTimeLimit(s.timeLimit ?? "");
+  };
+
+  const previousSettings = useRef<SlurmSettings | null>(null);
+  useEffect(() => {
+    const previous = previousSettings.current;
+    previousSettings.current = settings;
+    if (settings && (!previous || (
+      host === (previous.host ?? "")
+      && partition.trim() === (previous.partition ?? "")
+      && account.trim() === (previous.account ?? "")
+      && timeLimit.trim() === (previous.timeLimit ?? "")
+    ))) {
+      setHost(settings.host ?? "");
+      setPartition(settings.partition ?? "");
+      setAccount(settings.account ?? "");
+      setTimeLimit(settings.timeLimit ?? "");
+    }
+  }, [settings, host, partition, account, timeLimit]);
+
+  const unchanged =
+    settings !== null &&
+    host === (settings.host ?? "") &&
+    partition.trim() === (settings.partition ?? "") &&
+    account.trim() === (settings.account ?? "") &&
+    timeLimit.trim() === (settings.timeLimit ?? "");
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      apply(
+        await saveSlurmSettingsMutation.mutateAsync({
+          host,
+          partition: partition.trim(),
+          account: account.trim(),
+          timeLimit: timeLimit.trim(),
+        }),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      {loadError ? (
+        <div className="error">{loadError}</div>
+      ) : !settings ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_loading_slurm_settings()}
+        </LoadingRow>
+      ) : (
+        <>
+          {!connecting && test?.error && <p className={COMPUTE_DIAGNOSTIC_CLASS_NAME}>{test.error}</p>}
+          <form className={FORM_CLASS_NAME} onSubmit={submit}>
+            <div className="max-w-xl">
+              <label>
+                {m.settings_page_login_node()}
+                <OptionPicker
+                  choices={[
+                    { id: "", label: m.settings_page_not_set_pass_host_per_launch() },
+                    ...(host && !settings.hosts.some((item) => item.host === host)
+                      ? [{ id: host, label: `${host} (not in ~/.ssh/config)` }]
+                      : []),
+                    ...settings.hosts.map((item) => ({ id: item.host, label: item.host })),
+                  ]}
+                  value={host}
+                  variant="field"
+                  dropDown
+                  disabled={saving || connecting}
+                  onSelect={(id) => {
+                    setHost(id);
+                    setTest(null); // a badge earned by cluster A must not vouch for cluster B
+                    setConnecting(false);
+                    setConnectionFailed(false);
+                  }}
+                />
+              </label>
+            </div>
+            <div className="actions">
+              <Button
+                type="button"
+                onClick={() => {
+                  if (connecting && !connectionFailed) {
+                    setConnectionFailed(false);
+                    setConnecting(false);
+                  } else {
+                    connect();
+                  }
+                }}
+                disabled={!host}
+                title={host ? undefined : m.settings_pick_login_node()}
+              >
+                {connecting
+                  ? connectionFailed
+                    ? m.app_retry()
+                    : m.settings_page_cancel()
+                  : test
+                    ? m.settings_reconnect()
+                    : m.settings_connect()}
+              </Button>
+              <span role="status">
+                <SlurmTestBadge
+                  test={test}
+                  connecting={connecting && !connectionFailed}
+                  masterRunning={masterRunning[host]}
+                />
+              </span>
+            </div>
+            <div className="mt-5 border-t border-border pt-5">
+              <div className="row2">
+                <label>
+                  {m.settings_page_partition()}
+                  <Input
+                    type="text"
+                    list="slurm-partitions"
+                    value={partition}
+                    onChange={(e) => setPartition(e.target.value)}
+                    placeholder={m.settings_page_cluster_default()}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <datalist id="slurm-partitions">
+                    {test?.partitions.map((p) => <option key={p} value={p} />)}
+                  </datalist>
+                </label>
+                <label>
+                  {m.settings_page_account()}
+                  <Input
+                    type="text"
+                    value={account}
+                    onChange={(e) => setAccount(e.target.value)}
+                    placeholder={m.settings_page_cluster_default()}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </label>
+              </div>
+              <label className="mt-3 block max-w-xl">
+                {m.settings_page_time_limit()}
+                <Input
+                  type="text"
+                  value={timeLimit}
+                  onChange={(e) => setTimeLimit(e.target.value)}
+                  placeholder={m.settings_page_cluster_default_e_g_4h_30m()}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </label>
+            </div>
+            {error && <div className="error">{error}</div>}
+            <div className="actions">
+              <Button variant="primary" type="submit" disabled={saving || unchanged || connecting}>
+                {saving ? m.common_saving() : m.common_save()}
+              </Button>
+            </div>
+          </form>
+          {connecting && (
+            <SshConnectTerminal
+              key={connectionAttempt}
+              host={host}
+              backend="slurm"
+              onComplete={(complete) => {
+                if (complete.backend !== "slurm") return;
+                setTest(complete.result);
+                markMasterRunning(host);
+                setConnectionFailed(false);
+                setConnecting(false);
+              }}
+              onError={(error) => {
+                setConnectionFailed(true);
+                setTest({
+                  reachable: false,
+                  slurmFound: false,
+                  toolsFound: false,
+                  partitions: [],
+                  error,
+                });
+              }}
+            />
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+function RaySection() {
+  const saveRaySettingsMutation = useMutation({ mutationFn: saveRaySettings });
+
+  const settingsOptions = getRaySettingsQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const setSettings = (value: React.SetStateAction<RaySettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const loadError = settings ? null : settingsQuery.error?.message ?? null;
+  const [address, setAddress] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [test, setTest] = useState<"testing" | RayPreflight | null>(null);
+  const preflight = test !== null && test !== "testing" ? test : null;
+
+  const apply = (s: RaySettings) => {
+    setSettings(s);
+    setAddress(s.address ?? "");
+  };
+
+  const previousSettings = useRef<RaySettings | null>(null);
+  useEffect(() => {
+    const previous = previousSettings.current;
+    previousSettings.current = settings;
+    if (settings && (!previous || (address === (previous.address ?? "")))) {
+      setAddress(settings.address ?? "");
+    }
+  }, [settings, address]);
+
+  const unchanged = settings !== null && address === (settings.address ?? "");
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      apply(await saveRaySettingsMutation.mutateAsync({ address }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function runPreflight() {
+    setTest("testing");
+    try {
+      setTest(await rayPreflight(address.trim() || undefined));
+    } catch (err) {
+      setTest({
+        reachable: false,
+        address: address.trim() || "(unknown)",
+        rayVersion: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return (
+    <>
+      {loadError ? (
+        <div className="error">{loadError}</div>
+      ) : !settings ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_loading_ray_settings()}
+        </LoadingRow>
+      ) : (
+        <>
+          {preflight?.error && <p className={COMPUTE_DIAGNOSTIC_CLASS_NAME}>{preflight.error}</p>}
+          <form className={FORM_CLASS_NAME} onSubmit={submit}>
+            <label>
+              {m.settings_page_jobs_dashboard_url()}
+              <Input
+                type="text"
+                value={address}
+                onChange={(e) => {
+                  setAddress(e.target.value);
+                  setTest(null);
+                }}
+                placeholder="http://127.0.0.1:8265"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            <p className="m-0 text-sm text-subtext">
+              {m.settings_page_effective_url()}: {ltr(settings.resolvedAddress)} · {m.settings_page_source()}: {settings.source}
+            </p>
+            {error && <div className="error">{error}</div>}
+            <div className="actions">
+              <Button variant="primary" type="submit" disabled={saving || unchanged}>
+                {saving ? m.common_saving() : m.common_save()}
+              </Button>
+              <Button
+                type="button"
+
+                onClick={() => void runPreflight()}
+                disabled={test === "testing"}
+              >
+                {m.settings_page_test_connection()}
+              </Button>
+              <RayTestBadge test={test} />
+            </div>
+            {preflight?.reachable && preflight.rayVersion && (
+              <p className="m-0 text-sm text-subtext">
+                {m.settings_page_ray_version()}: {preflight.rayVersion}
+              </p>
+            )}
+          </form>
+        </>
+      )}
+    </>
+  );
+}
+
+function RayTestBadge({ test }: { test: "testing" | RayPreflight | null }) {
+  if (test === null) return null;
+  if (test === "testing") return <Badge>{m.settings_page_testing()}</Badge>;
+  if (test.reachable) return <Badge variant="success">{m.settings_page_reachable()}</Badge>;
+  return <Badge variant="error">{m.settings_page_failed()}</Badge>;
+}
+
+// --- compute (local) --------------------------------------------------------------
+
+function localMachineSummary(hw: LocalMachine) {
+  const processor = hw.chip ?? `${hw.os}/${hw.arch}`;
+  const memory = hw.memBytes === null ? null : fmtBytes(hw.memBytes);
+  const gpu = hw.gpus.length === 0 ? null : m.settings_gpu_count({ count: hw.gpus.length });
+  return [processor, hw.cpuCount > 0 ? m.settings_cpu_cores({ count: hw.cpuCount }) : null, memory, gpu]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+// --- compute -----------------------------------------------------------------
+
+const TARGET_CARD_DESCRIPTIONS: Record<ComputeTargetId, () => string> = {
+  local: m.compute_description_local,
+  ssh: m.compute_description_ssh,
+  tinker: m.compute_description_tinker,
+  hf: m.compute_description_hf,
+  modal: m.compute_description_modal,
+  k8s: m.compute_description_k8s,
+  slurm: m.compute_description_slurm,
+  ray: m.compute_description_ray,
+};
+
+/** Kind strings from the runs table — reuses the instances-table logos. */
+const TARGET_KIND: Record<ComputeTargetId, string> = {
+  local: "local_job",
+  tinker: "tinker_job",
+  hf: "hf_job",
+  modal: "modal_job",
+  k8s: "k8s_job",
+  ssh: "ssh_job",
+  slurm: "slurm_job",
+  ray: "ray_job",
+};
+
+/** Backends whose launches take --flavor; mirrors the server's validation. */
+const FLAVORED_TARGETS: ComputeTargetId[] = ["hf", "modal", "slurm", "ray"];
+/** Of those, the ones where a launch *requires* a flavor. */
+const FLAVOR_REQUIRED: ComputeTargetId[] = ["hf", "modal"];
+
+const FLAVOR_SUGGESTIONS: Partial<Record<ComputeTargetId, string[]>> = {
+  hf: ["cpu-basic", "t4-small", "a10g-small", "a10g-large", "a100-large", "h100", "h200"],
+  modal: ["cpu", "t4", "l4", "a10g", "a100", "a100-80gb", "l40s", "h100", "h100:2"],
+  slurm: ["gpu", "h100:1", "h100:2", "a100:4"],
+  ray: ["cpu", "cpu:2", "gpu", "gpu:1", "gpu:1,cpu:4", "gpu:1,mem:8GiB"],
+};
+
+const QUICK_SETUP_TARGETS: ComputeTargetId[] = ["tinker", "hf", "modal", "ray", "k8s"];
+
+const TARGET_USAGE: Partial<Record<ComputeTargetId, () => string>> = {
+  tinker: m.compute_usage_tinker,
+  hf: m.compute_usage_hf,
+  modal: m.compute_usage_modal,
+};
+
+const CUSTOM_FLAVOR_ID = "__custom__";
+
+function isCustomFlavor(backend: ComputeTargetId, flavor: string) {
+  return Boolean(flavor && !(FLAVOR_SUGGESTIONS[backend] ?? []).includes(flavor));
+}
+
+function DefaultDestinationEditor({
+  settings,
+  projectId,
+  onSaved,
+}: {
+  settings: ComputeSettings;
+  projectId?: string;
+  onSaved: (settings: ComputeSettings) => void;
+}) {
+  const setComputeDefaultMutation = useMutation({ mutationFn: setComputeDefault });
+
+  const savedBackend = settings.configuredDefaultBackend ?? settings.defaultBackend ?? "local";
+  const savedFlavor = settings.defaultFlavor ?? "";
+  const [backend, setBackend] = useState(savedBackend);
+  const [flavor, setFlavor] = useState(savedFlavor);
+  const [customFlavor, setCustomFlavor] = useState(isCustomFlavor(savedBackend, savedFlavor));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const target = settings.targets.find((candidate) => candidate.id === backend);
+  const choices = settings.targets.filter(
+    (candidate) => candidate.configured || candidate.id === savedBackend,
+  );
+  const flavored = FLAVORED_TARGETS.includes(backend);
+  const flavorRequired = FLAVOR_REQUIRED.includes(backend);
+  const flavorSuggestions = FLAVOR_SUGGESTIONS[backend] ?? [];
+  const unchanged =
+    backend === savedBackend && (!flavored || flavor.trim() === savedFlavor);
+  const destination = TARGET_LABELS[backend]();
+  const usage = TARGET_USAGE[backend];
+  const helperText =
+    saving
+      ? m.settings_updating_default_destination()
+      : flavorRequired && !flavor.trim()
+        ? m.settings_choose_flavor_for_runs({ destination })
+        : backend === "ssh"
+          ? m.settings_new_runs_use_ssh()
+          : m.settings_new_runs_use_destination({ destination });
+
+  useEffect(() => {
+    setBackend(savedBackend);
+    setFlavor(savedFlavor);
+    setCustomFlavor(isCustomFlavor(savedBackend, savedFlavor));
+  }, [savedBackend, savedFlavor]);
+
+  async function save(nextBackend: ComputeTargetId, nextFlavor: string) {
+    const nextFlavored = FLAVORED_TARGETS.includes(nextBackend);
+    if (saving || (FLAVOR_REQUIRED.includes(nextBackend) && !nextFlavor.trim())) return;
+    setSaving(true);
+    setError(null);
+    try {
+      onSaved(
+        await setComputeDefaultMutation.mutateAsync({
+          backend: nextBackend,
+          flavor: nextFlavored ? nextFlavor.trim() || null : null,
+          projectId,
+        }),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setBackend(savedBackend);
+      setFlavor(savedFlavor);
+      setCustomFlavor(isCustomFlavor(savedBackend, savedFlavor));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function changeBackend(id: string) {
+    const next = settings.targets.find((candidate) => candidate.id === id);
+    if (!next) return;
+    setBackend(next.id);
+    const nextFlavor = next.id === savedBackend ? savedFlavor : "";
+    setFlavor(nextFlavor);
+    setCustomFlavor(isCustomFlavor(next.id, nextFlavor));
+    if (!FLAVOR_REQUIRED.includes(next.id)) void save(next.id, nextFlavor);
+  }
+
+  function changeFlavor(id: string) {
+    if (id === CUSTOM_FLAVOR_ID) {
+      setCustomFlavor(true);
+      return;
+    }
+    setCustomFlavor(false);
+    setFlavor(id);
+    if (!flavorRequired || id) void save(backend, id);
+  }
+
+  return (
+    <section className="mb-8">
+      <h2 className="mt-0 mx-0 mb-2 text-lg">{m.settings_page_default_destination()}</h2>
+      <div>
+        <form
+          className="grid grid-cols-[minmax(12rem,18rem)_minmax(12rem,18rem)] items-start gap-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!unchanged) void save(backend, flavor);
+          }}
+        >
+          <OptionPicker
+            choices={choices.map((choice) => ({
+              id: choice.id,
+              label: TARGET_LABELS[choice.id](),
+            }))}
+            value={backend}
+            variant="field"
+            dropDown
+            disabled={saving}
+            renderIcon={(choice) => {
+              const target = settings.targets.find((candidate) => candidate.id === choice.id);
+              return target ? <BackendLogo kind={TARGET_KIND[target.id]} size={16} /> : null;
+            }}
+            onSelect={changeBackend}
+          />
+          {flavored && (
+            <div>
+              {customFlavor ? (
+                <div className="relative">
+                  <input
+                    className="h-9 w-full rounded-md border border-border bg-background py-0 pe-10 ps-3 font-sans text-sm text-text outline-none focus:border-text"
+                    type="text"
+                    value={flavor}
+                    onChange={(event) => setFlavor(event.target.value)}
+                    onBlur={() => {
+                      if (flavorRequired && !flavor.trim()) {
+                        if (backend === savedBackend) {
+                          setFlavor(savedFlavor);
+                          setCustomFlavor(isCustomFlavor(savedBackend, savedFlavor));
+                        }
+                        return;
+                      }
+                      if (!unchanged) void save(backend, flavor);
+                    }}
+                    placeholder={m.settings_page_custom_flavor()}
+                    autoFocus
+                    autoComplete="off"
+                    spellCheck={false}
+                    disabled={saving}
+                  />
+                  <button
+                    type="button"
+                    className="absolute inset-y-0 end-0 inline-flex w-9 items-center justify-center text-muted hover:text-text"
+                    aria-label={m.settings_page_choose_a_preset_flavor()}
+                    title={m.settings_page_choose_a_preset_flavor()}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => setCustomFlavor(false)}
+                  >
+                    <ChevronDown size={12} />
+                  </button>
+                </div>
+              ) : (
+                <OptionPicker
+                  choices={[
+                    {
+                      id: "",
+                      label: flavorRequired ? m.settings_choose_flavor() : m.settings_no_default_flavor(),
+                    },
+                    ...(flavor && !flavorSuggestions.includes(flavor)
+                      ? [{ id: flavor, label: m.settings_custom_value({ value: ltr(flavor) }) }]
+                      : []),
+                    ...flavorSuggestions.map((suggestion) => ({
+                      id: suggestion,
+                      label: suggestion,
+                    })),
+                    { id: CUSTOM_FLAVOR_ID, label: m.settings_page_custom_flavor_1c8a207() },
+                  ]}
+                  value={flavor}
+                  variant="field"
+                  dropDown
+                  disabled={saving}
+                  onSelect={changeFlavor}
+                />
+              )}
+            </div>
+          )}
+        </form>
+        {error && <div className="error mt-2.5">{error}</div>}
+        {target && !target.configured && (
+          <p className={SETTINGS_NOTE_CLASS_NAME}>
+            {m.settings_page_this_saved_destination_is_not_configured_set_it()}
+          </p>
+        )}
+      </div>
+      <p className="mt-2 mb-0 text-sm leading-relaxed text-subtext">{helperText}</p>
+      {usage && <p className="mt-1 mb-0 text-sm leading-relaxed text-subtext">{usage()}</p>}
+    </section>
+  );
+}
+
+function TargetTile({
+  target,
+  isDefault,
+  summary,
+  onOpen,
+  onOpenEnvironment,
+}: {
+  target: ComputeTargetSummary;
+  isDefault: boolean;
+  summary?: string;
+  onOpen?: () => void;
+  onOpenEnvironment: () => void;
+}) {
+  const summaryId = `compute-${target.id}-summary`;
+  const setupLabel = target.unverified
+    ? m.settings_check_setup()
+    : target.id === "ray"
+      ? m.settings_connect()
+      : m.settings_set_up();
+
+  return (
+    <div
+      className={`group relative flex min-h-41 w-full flex-col items-start rounded-lg border border-border bg-background p-5 text-start font-sans ${onOpen && target.enabled ? "transition-colors duration-120 ease-standard hover:border-text hover:bg-surface" : ""} ${!target.enabled ? "opacity-52" : ""}`}
+    >
+      {onOpen && (
+        <button
+          type="button"
+          className="absolute inset-0 z-10 rounded-lg focus-visible:outline-2 focus-visible:outline-text focus-visible:outline-offset-2 disabled:cursor-default"
+          onClick={onOpen}
+          disabled={!target.enabled}
+          aria-label={TARGET_LABELS[target.id]()}
+          aria-describedby={summaryId}
+          aria-haspopup={QUICK_SETUP_TARGETS.includes(target.id) ? "dialog" : undefined}
+        />
+      )}
+      <span className="flex h-16 w-40 flex-none items-center justify-start">
+        <BackendLogo kind={TARGET_KIND[target.id]} size={48} />
+      </span>
+      <span className="mt-5 text-lg font-semibold text-text">{TARGET_LABELS[target.id]()}</span>
+      <span className="mt-1 line-clamp-2 min-h-9 text-sm leading-normal text-text">
+        {TARGET_CARD_DESCRIPTIONS[target.id]()}
+      </span>
+      <span id={summaryId} className="mt-2 line-clamp-2 min-h-8 text-xs leading-normal text-subtext">
+        {target.fromEnvironmentTab ? (
+          <>
+            {target.id === "tinker" ? m.settings_key_from() : m.settings_token_from()}{" "}
+            <button
+              type="button"
+              className="relative z-20 text-primary underline-offset-2 hover:text-primary-hover hover:underline"
+              onClick={onOpenEnvironment}
+            >
+              {m.settings_environment_tab()}
+            </button>
+          </>
+        ) : summary ?? target.summary}
+      </span>
+      <span className="mt-auto flex w-full items-center justify-between gap-3 pt-3 text-sm">
+        <span className={isDefault ? "font-medium text-primary" : "text-subtext"}>
+          {isDefault
+            ? m.settings_page_default_808d7dc()
+            : target.configured
+              ? !onOpen || QUICK_SETUP_TARGETS.includes(target.id)
+                ? m.settings_page_ready_to_use()
+                : m.settings_view_settings()
+              : setupLabel}
+        </span>
+        {onOpen && (
+          <span className="text-subtext transition-transform duration-120 ease-standard group-hover:translate-x-0.5" aria-hidden="true">
+            <ArrowRight size={16} />
+          </span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function BackendDetailPage({
+  target,
+  isDefault,
+  onBack,
+}: {
+  target: ComputeTargetSummary;
+  isDefault: boolean;
+  onBack: () => void;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        className="settings-back mb-6 inline-flex items-center gap-2 text-sm font-medium text-subtext hover:text-text"
+        onClick={onBack}
+      >
+        <ArrowLeft size={16} /> {m.settings_page_back_to_compute()}
+      </button>
+      <div className="flex items-center justify-between gap-6">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-10 w-10 flex-none items-center justify-center">
+            <BackendLogo kind={TARGET_KIND[target.id]} size={36} />
+          </span>
+          <h1 className="m-0 min-w-0 text-2xl">{TARGET_LABELS[target.id]()}</h1>
+        </div>
+        {isDefault && (
+          <Badge className="flex-none border-primary bg-primary-subtle text-primary">
+            {m.settings_page_default_808d7dc()}
+          </Badge>
+        )}
+      </div>
+      <div className="mt-6 font-sans text-base text-text [&_.settings-card]:mb-0 [&_.settings-form]:mt-6 [&_.settings-form]:border-t-0 [&_.settings-form]:pt-0 [&>.settings-form:first-child]:mt-0 [&>div:first-child]:border-t-0">
+        {target.id === "ssh" && <SshSection />}
+        {target.id === "slurm" && <SlurmSection />}
+      </div>
+    </>
+  );
+}
+
+function QuickSetupDialog({ target, remote, onClose }: { target: ComputeTargetSummary; remote: boolean; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [editState, setEditState] = useState({ dirty: false, saving: false });
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+
+  const close = () => {
+    if (editState.saving) return;
+    if (editState.dirty && !window.confirm(m.settings_k8s_discard_changes())) return;
+    onClose();
+  };
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="m-auto w-140 max-w-[calc(100vw_-_40px)] max-h-[calc(100vh_-_40px)] overflow-y-auto rounded-xl border border-border bg-background p-5 text-text shadow-modal backdrop:bg-modal-backdrop-light"
+      aria-labelledby="compute-quick-setup-title"
+      // Escape on keydown (not just cancel) so a declined discard confirm can't be
+      // force-closed by the close watcher; an open OptionPicker swallows it first.
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        close();
+      }}
+      onCancel={(event) => {
+        event.preventDefault();
+        close();
+      }}
+    >
+      <div className="mb-5 flex items-center justify-between gap-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <BackendLogo kind={TARGET_KIND[target.id]} size={32} />
+          <h2 id="compute-quick-setup-title" className="m-0 text-xl font-medium text-text">
+            {TARGET_LABELS[target.id]()}
+          </h2>
+        </div>
+        <IconButton title={m.app_close_panel()} aria-label={m.app_close_panel()} onClick={close} disabled={editState.saving}>
+          <X size={14} />
+        </IconButton>
+      </div>
+      {target.id === "tinker" && <TinkerSection target={target} />}
+      {target.id === "hf" && <HfSection remote={remote} />}
+      {target.id === "modal" && <ModalSection />}
+      {target.id === "ray" && <RaySection />}
+      {target.id === "k8s" && <K8sSection onEditState={setEditState} />}
+    </dialog>
+  );
+}
+
+function ComputeTab({
+  project,
+  onViewHistory,
+  onOpenEnvironment,
+  remote,
+}: {
+  project: Project | null;
+  onViewHistory: () => void;
+  onOpenEnvironment: () => void;
+  remote: boolean;
+}) {
+  const settingsOptions = getComputeSettingsQuery(project?.id);
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const setSettings = (value: React.SetStateAction<ComputeSettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const loadError = settings ? null : settingsQuery.error?.message ?? null;
+  const [selectedTarget, setSelectedTarget] = useState<ComputeTargetId | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const localMachineOptions = getLocalMachineQuery();
+  const localMachineQuery = useQuery(localMachineOptions);
+  const localMachine = localMachineQuery.data ?? null;
+  const localMachineError = localMachineQuery.error?.message ?? null;
+  useEffect(() => { setSelectedTarget(null); setError(null); }, [project?.id]);
+
+  const apply = (s: ComputeSettings) => {
+    setSettings(s);
+    setError(null);
+  };
+
+  // Preserve server order except for the selected default, which leads its section.
+  const targets = settings ? settings.targets : null;
+  const defaultBackend = settings?.configuredDefaultBackend ?? settings?.defaultBackend;
+  const orderedTargets = targets
+    ? [...targets].sort(
+      (a, b) => Number(b.id === defaultBackend) - Number(a.id === defaultBackend),
+    )
+    : null;
+  const configuredTargets = orderedTargets?.filter((target) => target.configured) ?? [];
+  const availableTargets = orderedTargets?.filter((target) => !target.configured) ?? [];
+  const renderTarget = (target: ComputeTargetSummary) => (
+    <TargetTile
+      key={`${project?.id ?? "none"}:${target.id}`}
+      target={target}
+      isDefault={defaultBackend === target.id}
+      summary={target.id === "local" ? localMachine ? localMachineSummary(localMachine) : localMachineError ?? m.settings_page_detecting_hardware() : undefined}
+      onOpen={target.id === "local" ? undefined : () => setSelectedTarget(target.id)}
+      onOpenEnvironment={onOpenEnvironment}
+    />
+  );
+  const selected = selectedTarget
+    ? settings?.targets.find((target) => target.id === selectedTarget)
+    : null;
+
+  if (selected && !QUICK_SETUP_TARGETS.includes(selected.id)) {
+    return (
+      <BackendDetailPage
+        target={selected}
+        isDefault={defaultBackend === selected.id}
+        onBack={() => setSelectedTarget(null)}
+      />
+    );
+  }
+
+  return (
+    <>
+      <h1>{m.settings_page_compute()}</h1>
+      <p className="settings-sub mt-0 mx-0 mb-4.5 text-base leading-relaxed text-text">
+        {m.settings_page_connect_compute_backends_and_choose_where_new_runs()}
+      </p>
+      <ComputeActivity projectId={project?.id} onViewHistory={onViewHistory} />
+      {loadError ? (
+        <div className="error">{loadError}</div>
+      ) : !settings ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_checking_compute_targets()}
+        </LoadingRow>
+      ) : (
+        <>
+          {error && <div className="error">{error}</div>}
+          <DefaultDestinationEditor
+            settings={settings}
+            projectId={project?.id}
+            onSaved={apply}
+          />
+          <section className="mb-8">
+            <h2 className="mt-0 mx-0 mb-2 text-lg">{m.settings_page_ready_to_use()}</h2>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {configuredTargets.map(renderTarget)}
+            </div>
+          </section>
+          {availableTargets.length > 0 && (
+            <section className="mb-3.5">
+              <h2 className="mt-0 mx-0 mb-2 text-lg">{m.settings_page_more_compute_options()}</h2>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {availableTargets.map(renderTarget)}
+              </div>
+            </section>
+          )}
+          {selected && <QuickSetupDialog target={selected} remote={remote} onClose={() => setSelectedTarget(null)} />}
+        </>
+      )}
+    </>
+  );
+}
+
+// --- compute (tinker) ----------------------------------------------------------
+
+function TinkerSection({ target }: { target: ComputeTargetSummary }) {
+  const saveTinkerKeyMutation = useMutation({ mutationFn: saveTinkerKey });
+
+  const [apiKey, setApiKey] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [actionError, setError] = useState<string | null>(null);
+
+  const settingsOptions = getTinkerSettingsQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const error = actionError ?? settingsQuery.error?.message ?? null;
+  const setSettings = (value: React.SetStateAction<TinkerSettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const [refreshing, setRefreshing] = useState(false);
+  const checking = settingsQuery.isPending || refreshing;
+
+  async function refresh() {
+    if (checking || saving) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      await queryClient.fetchQuery({ ...getTinkerSettingsQuery(), staleTime: 0 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!apiKey.trim() || saving || checking) return;
+    setSaving(true);
+    setError(null);
+    try {
+      setSettings(await saveTinkerKeyMutation.mutateAsync(apiKey.trim()));
+      setApiKey("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      {!settings && checking ? <LoadingRow><Spinner /> {m.common_checking()}</LoadingRow> : settings && <dl className="m-0 flex items-center justify-between gap-4 text-sm">
+        <dt className="font-medium text-subtext">{m.settings_page_status()}</dt>
+        <dd className="m-0">
+          <Badge variant={settings.validationStatus === "valid" ? "success" : settings.validationStatus === "invalid" ? "error" : "warning"}>
+            {settings.validationStatus === "valid" ? m.settings_page_ready()
+              : settings.validationStatus === "invalid" ? m.settings_tinker_invalid_key()
+                : settings.validationStatus === "billingRequired" ? m.settings_tinker_billing_required()
+                  : m.settings_page_not_configured()}
+          </Badge>
+        </dd>
+      </dl>}
+      {settings?.validationStatus === "billingRequired" && (
+        <p className="mt-2 mb-0 text-sm text-subtext">
+          <a className="underline" href="https://tinker.thinkingmachines.ai/" target="_blank" rel="noreferrer">{m.settings_tinker_billing_help()}</a>
+        </p>
+      )}
+      {settings?.processEnv && <p className="mt-2 mb-0 text-sm text-subtext">{m.settings_tinker_env_override()}</p>}
+      <form className="mt-5 flex flex-col gap-4" onSubmit={submit}>
+        <label className="flex flex-col gap-2 text-sm font-medium text-subtext">
+          {target.configured || (settings !== null && settings.validationStatus !== "missing") ? m.settings_replace_key() : m.onboarding_api_key()}
+          <Input
+            type="password"
+            value={apiKey}
+            placeholder={settings?.maskedKey ?? ""}
+            onChange={(e) => setApiKey(e.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        {error && <p className="m-0 text-sm text-accent-red">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button type="button" disabled={saving || checking} onClick={() => void refresh()}>
+            <RefreshCw size={13} /> {checking ? m.common_checking() : m.settings_check_again()}
+          </Button>
+          <Button variant="primary" type="submit" disabled={!apiKey.trim() || saving || checking}>
+            {saving ? m.settings_validating() : m.common_save()}
+          </Button>
+        </div>
+      </form>
+    </>
+  );
+}
+
+// --- environment ---------------------------------------------------------------
+
+function HfStatusBadge({ settings }: { settings: HfSettings }) {
+  if (settings.validationStatus === "missing") return <Badge variant="warning">{m.settings_page_not_configured()}</Badge>;
+  if (settings.validationStatus === "invalid") return <Badge variant="error">{m.settings_page_invalid_token()}</Badge>;
+  if (settings.validationStatus !== "valid") return null;
+  if (settings.jobsWrite === true) return <Badge variant="success">{m.settings_page_ready()}</Badge>;
+  if (settings.jobsWrite === false)
+    return (
+      <span className="inline-flex items-center gap-2">
+        <Badge variant="warning">{m.settings_page_no_job_write_permission()}</Badge>
+        <Tooltip content={m.settings_hf_write_permission_help()} className="text-subtext">
+          <Info size={15} />
+        </Tooltip>
+      </span>
+    );
+  return null;
+}
+
+function HfSection({ remote }: { remote: boolean }) {
+  const saveHfTokenMutation = useMutation({ mutationFn: saveHfToken });
+
+  const settingsOptions = getHfSettingsQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const setSettings = (value: React.SetStateAction<HfSettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const loadError = settings ? null : settingsQuery.error?.message ?? null;
+  const [token, setToken] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const login = useCommandRun();
+
+  async function refresh() {
+    if (saving || refreshing || (!settings && !loadError)) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      await queryClient.fetchQuery({ ...getHfSettingsQuery(), staleTime: 0 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!token.trim() || saving || refreshing || (!settings && !loadError)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const next = await saveHfTokenMutation.mutateAsync(token.trim());
+      setSettings(next);
+      setError(null);
+      setToken("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      {loadError ? (
+        <div className="error">{loadError}</div>
+      ) : !settings ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_loading_status()}
+        </LoadingRow>
+      ) : (
+        <>
+          <dl className="m-0 flex flex-col gap-3 text-sm">
+            {settings.username && <div className="flex items-center justify-between gap-4">
+              <dt className="font-medium text-subtext">{m.settings_page_account()}</dt>
+              <dd className="m-0 text-text">
+                {settings.username}
+              </dd>
+            </div>}
+            {(settings.validationStatus === "missing" || settings.validationStatus === "invalid" ||
+              (settings.validationStatus === "valid" && settings.jobsWrite !== null)) && (
+                <div className="flex items-center justify-between gap-4">
+                  <dt className="font-medium text-subtext">{m.settings_page_status()}</dt>
+                  <dd className="m-0 text-text"><HfStatusBadge settings={settings} /></dd>
+                </div>
+              )}
+          </dl>
+          {settings.validationStatus === "unreachable" && settings.validationError && (
+            <p className={COMPUTE_DIAGNOSTIC_CLASS_NAME}>{settings.validationError}</p>
+          )}
+          {settings.source === "env" && (
+            <p className={SETTINGS_NOTE_CLASS_NAME}>
+              {m.settings_page_hf_token_is_set_in_the_environment_and()}
+            </p>
+          )}
+          {settings.validationStatus === "valid" && settings.jobsWrite === null && (
+            <RunnableNote
+              note={m.settings_hf_token_help({ login: "`hf auth login`", url: ltr("huggingface.co/settings/tokens") })}
+              className={SETTINGS_NOTE_CLASS_NAME}
+              disabled={remote}
+              onRun={login.start}
+            />
+          )}
+          <CommandRunTerminal run={login.run} onComplete={() => void settingsQuery.refetch()} onClose={login.clear} />
+        </>
+      )}
+      <form className="mt-5 flex flex-col gap-4" onSubmit={submit}>
+        <label className="flex flex-col gap-2 text-sm font-medium text-subtext">
+          {settings?.configured ? m.settings_replace_token() : m.settings_new_token()}
+          <Input
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder={settings?.maskedToken ?? m.settings_page_hf()}
+            autoComplete="off"
+          />
+        </label>
+        {error && <div className="error">{error}</div>}
+        <div className="flex justify-end gap-2">
+          <Button type="button" disabled={saving || refreshing || (!settings && !loadError)} onClick={() => void refresh()}>
+            <RefreshCw size={13} /> {refreshing ? m.common_checking() : m.settings_check_again()}
+          </Button>
+          <Button variant="primary" type="submit" disabled={!token.trim() || saving || refreshing || (!settings && !loadError)}>
+            {saving ? m.settings_validating() : m.common_save()}
+          </Button>
+        </div>
+      </form>
+    </>
+  );
+}
+
+// HF user access tokens are `hf_` + alphanumeric. Compute runs resolve the
+// token strictly by the name HF_TOKEN, so an hf_… value saved under any other
+// key is invisible to them — worth a (non-blocking) warning.
+const HF_TOKEN_RE = /^hf_[A-Za-z0-9]{10,}$/;
+
+/** The wrong-key warning shown when an hf_… value is headed somewhere else. */
+function HfHintRow() {
+  return (
+    <tr>
+      {/* colSpan tracks the EnvRow/AddVarRow column count */}
+      <td colSpan={3}>
+        <p dir="auto" className={SETTINGS_NOTE_CLASS_NAME}>
+          {m.settings_page_this_value_looks_like_a_hugging_face_token()}{" "}
+          <code>HF_TOKEN</code>{m.settings_page_save_it_under_that_key_if_it_apos()}
+        </p>
+      </td>
+    </tr>
+  );
+}
+
+// Keys runs typically need (HF_TOKEN is also read by orx itself), always
+// shown as rows alongside custom variables.
+const RECOMMENDED_ENV_KEYS = ["TINKER_API_KEY", "HF_TOKEN", "WANDB_API_KEY"];
+
+function showEnvError(name: string, err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  showAlert(message.includes(name) ? message : `${name}: ${message}`, "error");
+}
+
+/** One variable row. Set: masked value + delete. Unset: inline value input. */
+function EnvRow({
+  name,
+  entry,
+  onVars,
+}: {
+  name: string;
+  entry: EnvVar | undefined;
+  onVars: (vars: EnvVar[]) => void;
+}) {
+  const setEnvVarMutation = useMutation({ mutationFn: (args: Parameters<typeof setEnvVar>) => setEnvVar(...args) });
+  const deleteEnvVarMutation = useMutation({ mutationFn: deleteEnvVar });
+
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    if (!value.trim() || saving) return;
+    setSaving(true);
+    try {
+      onVars(await setEnvVarMutation.mutateAsync([name, value.trim()]));
+      setValue("");
+    } catch (err) {
+      showEnvError(name, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function remove() {
+    if (saving) return;
+    setSaving(true);
+    try {
+      onVars(await deleteEnvVarMutation.mutateAsync(name));
+    } catch (err) {
+      showEnvError(name, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <tr>
+        <td className="font-mono text-sm">{name}</td>
+        <td className="text-base text-subtext">
+          {entry ? (
+            <>
+              {entry.maskedValue}
+              {entry.inProcessEnv && <Badge>{m.settings_page_overridden_by_env()}</Badge>}
+            </>
+          ) : (
+            <Input
+              variant="inline"
+              className="text-base"
+              type="password"
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void save();
+                }
+                if (e.key === "Escape" && !saving) setValue("");
+              }}
+              placeholder={m.settings_page_value()}
+              aria-label={m.a11y_value_for({ name: ltr(name) })}
+              autoComplete="new-password"
+              disabled={saving}
+            />
+          )}
+        </td>
+        <td>
+          {entry ? (
+            <IconButton
+              className="[&:hover:not(:disabled)]:text-accent-red"
+              title={m.a11y_delete_item({ name: ltr(name) })}
+              aria-label={m.a11y_delete_item({ name: ltr(name) })}
+              onClick={() => void remove()}
+              disabled={saving}
+            >
+              <Trash2 size={13} />
+            </IconButton>
+          ) : (
+            value.trim() && (
+              <Button size="small" onClick={() => void save()} disabled={saving}>
+                {saving ? m.common_saving() : m.common_save()}
+              </Button>
+            )
+          )}
+        </td>
+      </tr>
+      {!entry && name !== "HF_TOKEN" && HF_TOKEN_RE.test(value.trim()) && <HfHintRow />}
+    </>
+  );
+}
+
+/** The in-table row for a new custom variable (opened by “Add variable”). */
+function AddVarRow({
+  onVars,
+  onDone,
+}: {
+  onVars: (vars: EnvVar[]) => void;
+  onDone: () => void;
+}) {
+  const setEnvVarMutation = useMutation({ mutationFn: (args: Parameters<typeof setEnvVar>) => setEnvVar(...args) });
+
+  const [key, setKey] = useState("");
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    if (!key.trim() || !value.trim() || saving) return;
+    setSaving(true);
+    try {
+      onVars(await setEnvVarMutation.mutateAsync([key.trim(), value.trim()]));
+      onDone();
+    } catch (err) {
+      showEnvError(key.trim(), err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void save();
+    }
+    if (e.key === "Escape" && !saving) onDone();
+  };
+
+  return (
+    <>
+      <tr>
+        <td>
+          <Input
+            autoFocus
+            variant="inline"
+            className="font-mono text-sm"
+            type="text"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="MY_API_KEY"
+            aria-label={m.settings_page_new_variable_key()}
+            autoComplete="off"
+            spellCheck={false}
+            disabled={saving}
+          />
+        </td>
+        <td>
+          <Input
+            variant="inline"
+            className="text-base"
+            type="password"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder={m.settings_page_value()}
+            aria-label={m.settings_page_new_variable_value()}
+            autoComplete="new-password"
+            disabled={saving}
+          />
+        </td>
+        <td>
+          <Button size="small"
+            onClick={() => void save()}
+            disabled={saving || !key.trim() || !value.trim()}
+          >
+            {saving ? m.common_saving() : m.common_save()}
+          </Button>
+          <IconButton
+            title={m.settings_page_cancel()}
+            aria-label={m.settings_page_cancel_new_variable()}
+            onClick={onDone}
+            disabled={saving}
+          >
+            <X size={13} />
+          </IconButton>
+        </td>
+      </tr>
+      {key.trim() !== "HF_TOKEN" && HF_TOKEN_RE.test(value.trim()) && <HfHintRow />}
+    </>
+  );
+}
+
+function EnvVarsSection() {
+  const varsOptions = getEnvVarsQuery();
+  const varsQuery = useQuery(varsOptions);
+  const vars = varsQuery.data ?? null;
+  const setVars = (value: React.SetStateAction<EnvVar[] | null>) => {
+    setScopedQueryData(varsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const loadError = vars ? null : varsQuery.error?.message ?? null;
+  const [adding, setAdding] = useState(false);
+
+  // Recommended keys first (fixed order), then custom variables in file order.
+  const customKeys =
+    vars === null ? [] : vars.map((v) => v.key).filter((k) => !RECOMMENDED_ENV_KEYS.includes(k));
+  const names = [...RECOMMENDED_ENV_KEYS, ...customKeys];
+
+  return (
+    <>
+      <div className="mb-4.5 flex items-center justify-between gap-4">
+        <p className="m-0 text-base leading-relaxed text-text">
+          {m.settings_page_variables_available_to_runs_and_the_research_agent()}
+        </p>
+        <Button size="small" className="shrink-0"
+          onClick={() => setAdding(true)}
+          disabled={adding || vars === null}
+        >
+          <Plus size={12} /> {m.settings_page_add_variable()}
+        </Button>
+      </div>
+      <div className={SETTINGS_CARD_CLASS_NAME}>
+        {loadError ? (
+          <div className="error">{loadError}</div>
+        ) : vars === null ? (
+          <LoadingRow>
+            <Spinner /> {m.settings_page_loading()}
+          </LoadingRow>
+        ) : (
+          <table className="env-table w-full table-fixed border-collapse text-base [&_td:first-child]:w-[32%] [&_td:first-child]:wrap-anywhere [&_.badge]:ms-2 [&_td]:h-12 [&_td]:pt-0 [&_td]:pe-2.5 [&_td]:pb-0 [&_td]:ps-0 [&_td]:align-middle [&_td]:border-b [&_td]:border-b-border-variant [&_td:last-child]:w-29 [&_td:last-child]:whitespace-nowrap [&_td:last-child]:text-end [&_td[colspan]]:whitespace-normal [&_td[colspan]]:text-start [&_.icon-btn]:ms-2 [&_.icon-btn]:align-middle">
+            <tbody>
+              {names.map((name) => (
+                <EnvRow
+                  key={name}
+                  name={name}
+                  entry={vars.find((v) => v.key === name)}
+                  onVars={setVars}
+                />
+              ))}
+              {adding && (
+                <AddVarRow onVars={setVars} onDone={() => setAdding(false)} />
+              )}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
+  );
+}
+
+// --- appearance ----------------------------------------------------------------
+
+const LOCALE_CHOICES: { id: Locale; label: string }[] = [
+  { id: "en", label: "English" },
+  { id: "zh-CN", label: "简体中文" },
+  { id: "fa", label: "فارسی" },
+  { id: "ar", label: "العربية" },
+  { id: "es", label: "Español" },
+  { id: "hi", label: "हिन्दी" },
+  { id: "ko", label: "한국어" },
+  { id: "ja", label: "日本語" },
+];
+
+function AppearanceTab() {
+  const locale = useLocale();
+
+  return (
+    <>
+      <h2>{m.settings_appearance_heading()}</h2>
+      <div className={`${SETTINGS_CARD_CLASS_NAME} mt-3`}>
+        <div className={`${PROJECT_DEFAULT_ROW_CLASS_NAME} pb-3.5`}>
+          <div className="project-default-title text-base font-medium">{m.settings_theme_heading()}</div>
+          <div
+            className="theme-segmented inline-flex flex-none items-center gap-1.5 rounded-md border border-border-variant bg-surface px-3 py-2"
+            role="group"
+            aria-label={m.settings_theme_heading()}
+          >
+            <Sun size={15} className="text-primary" aria-hidden="true" />
+            <span className="text-sm font-medium text-text">{m.settings_theme_light()}</span>
+          </div>
+        </div>
+        <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+          <div className="project-default-title text-base font-medium">{m.settings_language_heading()}</div>
+          <div className="w-52 flex-none">
+            <OptionPicker
+              choices={LOCALE_CHOICES}
+              value={locale}
+              variant="field"
+              dropDown
+              onSelect={(next) => {
+                if (isLocale(next)) setLocale(next);
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// --- updates -----------------------------------------------------------------
+
+const CHANNEL_LABELS: Record<InstallChannel, () => string> = {
+  installer: m.updates_channel_installer,
+  "app-bundle": m.updates_channel_app,
+  appimage: m.updates_channel_appimage,
+  portable: m.updates_channel_portable,
+  cargo: m.updates_channel_cargo,
+  homebrew: m.updates_channel_homebrew,
+  nix: m.updates_channel_nix,
+  unknown: m.updates_channel_unknown,
+};
+
+/** What to do about updates when orx can't do them itself. */
+const MANUAL_UPDATE_HINT: Partial<Record<InstallChannel, () => string>> = {
+  cargo: m.updates_hint_cargo,
+  homebrew: m.updates_hint_homebrew,
+  nix: m.updates_hint_nix,
+};
+
+function UpdatesTab() {
+  const setAutoUpdateApiMutation = useMutation({ mutationFn: (args: Parameters<typeof setAutoUpdateApi>) => setAutoUpdateApi(...args) });
+
+  const { status, error: loadError, apply } = useUpdateStatus();
+  // Per-action only so the right button reads "Working…"; any write disables
+  // all of them, since they mutate overlapping state.
+  const [busy, setBusy] = useState<"auto" | "apply" | "cli" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const restart = useRestartApp(status);
+  const locked = busy !== null || restart.restarting;
+
+  if (!status) {
+    return (
+      <>
+        <h2>{m.settings_page_updates()}</h2>
+        {loadError ? (
+          <div className={SETTINGS_CARD_CLASS_NAME}>
+            <div className="error">{loadError}</div>
+          </div>
+        ) : (
+          <LoadingRow>
+            <Spinner /> {m.settings_page_loading()}
+          </LoadingRow>
+        )}
+      </>
+    );
+  }
+
+  // Every mutating call returns the authoritative status; adopting it is what
+  // keeps the switch honest when a write fails or another client changes it.
+  const run = async (which: "auto" | "apply" | "cli", action: () => Promise<unknown>) => {
+    setBusy(which);
+    setError(null);
+    try {
+      await action();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <h2>{m.settings_page_updates()}</h2>
+      <div className={`${SETTINGS_CARD_CLASS_NAME} mt-3`}>
+        <div className={`${KV_CLASS_NAME} pb-3.5`}>
+          <div className="k">{m.settings_page_version()}</div>
+          <div className="v">{status.current}</div>
+          <div className="k">{m.settings_page_latest()}</div>
+          <div className="v">{status.latest ?? "—"}</div>
+          <div className="k">{m.settings_page_install()}</div>
+          <div className="v">{CHANNEL_LABELS[status.channel]()}</div>
+        </div>
+
+        {status.restartRequired && (
+          <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+            <div>
+              <div className="project-default-title text-base font-medium">
+                {m.settings_page_restart_to_finish_updating()}
+              </div>
+              <p>
+                {restart.error
+                  ? m.update_banner_restart_failed({ error: restart.error })
+                  : m.settings_restart_version({ installed: ltr(status.installedVersion ?? "—"), current: ltr(status.current ?? status.installedVersion ?? "—") })}
+              </p>
+            </div>
+            {status.canRestart && (
+              <Button
+                size="small"
+                type="button"
+                disabled={locked}
+                onClick={restart.restart}
+              >
+                {restart.restarting ? m.update_banner_restarting() : m.update_banner_restart()}
+              </Button>
+            )}
+          </div>
+        )}
+
+        {status.selfUpdates ? (
+          <>
+            <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+              <div>
+                <div className="project-default-title text-base font-medium">
+                  {m.settings_page_install_updates_automatically()}
+                </div>
+                <p>
+                  {m.settings_page_new_releases_are_downloaded_and_installed_in_the()}
+                  {status.envDisabled &&
+                    m.settings_updates_disabled_by_env()}
+                </p>
+              </div>
+              <Switch
+                type="button"
+                checked={status.autoUpdate}
+                aria-label={m.settings_page_install_updates_automatically()}
+                disabled={locked}
+                onClick={() =>
+                  void run("auto", () => setAutoUpdateApiMutation.mutateAsync([!status.autoUpdate]).then(apply))
+                }
+              />
+            </div>
+            <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+              <div>
+                <div className="project-default-title text-base font-medium">
+                  {status.updateAvailable ? m.settings_update_to_version({ version: ltr(status.latest ?? "—") }) : m.settings_check_for_updates()}
+                </div>
+                <p>
+                  {status.updateAvailable
+                    ? m.settings_install_release_now()
+                    : m.settings_checks_automatically()}
+                  {status.updateAvailable && status.latestTag && status.releaseRepository && (
+                    <> <a href={releaseNotesUrl(status.releaseRepository, status.latestTag)} target="_blank" rel="noreferrer" className="underline">{m.settings_release_notes()}</a></>
+                  )}
+                </p>
+              </div>
+              <Button size="small"
+                type="button"
+
+                disabled={locked}
+                onClick={() => void run("apply", () => applyUpdate().then(apply))}
+              >
+                {busy === "apply"
+                  ? m.chat_working()
+                  : status.updateAvailable
+                    ? m.settings_update_now()
+                    : m.settings_check_now()}
+              </Button>
+            </div>
+          </>
+        ) : (
+          <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+            <div>
+              <div className="project-default-title text-base font-medium">
+                {m.settings_page_orx_can_t_update_this_install()}
+              </div>
+              <p>
+                {MANUAL_UPDATE_HINT[status.channel]?.() ??
+                  m.settings_reinstall_for_updates()}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {status.channel === "app-bundle" && (
+          <InstallCliRow busy={busy} disabled={locked} run={run} />
+        )}
+        {error && <div className="error">{error}</div>}
+      </div>
+    </>
+  );
+}
+
+function TelemetryTab() {
+  const setTelemetryMutation = useMutation({ mutationFn: setTelemetry });
+
+  const settingsOptions = getTelemetryQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const setSettings = (value: React.SetStateAction<TelemetrySettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const [saving, setSaving] = useState(false);
+  const [actionError, setError] = useState<string | null>(null);
+  const error = actionError ?? settingsQuery.error?.message ?? null;
+
+  const toggle = () => {
+    if (!settings || saving) return;
+    setSaving(true);
+    setError(null);
+    void setTelemetryMutation.mutateAsync(!settings.preferenceEnabled)
+      .then(setSettings)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <>
+      <h2>{m.settings_page_usage_analytics()}</h2>
+      {!settings ? (
+        error ? <div className="error">{error}</div> : <LoadingRow><Spinner /> {m.settings_page_loading()}</LoadingRow>
+      ) : (
+        <div className={`${SETTINGS_CARD_CLASS_NAME} mt-3`}>
+          <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+            <div>
+              <div className="project-default-title inline-flex items-center gap-1.5 text-base font-medium">
+                {m.settings_page_anonymous_usage_analytics()}
+                {settings.locked && settings.reason && (
+                  <Tooltip
+                    content={`${m.settings_page_currently_off()} ${settings.reason}.`}
+                    className="text-subtext"
+                  >
+                    <Info size={15} />
+                  </Tooltip>
+                )}
+              </div>
+              <p>{m.settings_page_no_code_prompts_file_contents_or_account_identifiers()}</p>
+            </div>
+            <Switch
+              type="button"
+              checked={settings.enabled}
+              aria-label={m.settings_page_anonymous_usage_analytics()}
+              disabled={saving || settings.locked}
+              onClick={toggle}
+            />
+          </div>
+          {error && <div className="error">{error}</div>}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Offered only inside the macOS app: the bundle carries an `orx` its owner's
+ *  terminal can't see until it's linked onto PATH. */
+function InstallCliRow({
+  busy,
+  disabled,
+  run,
+}: {
+  busy: "auto" | "apply" | "cli" | null;
+  disabled: boolean;
+  run: (which: "cli", action: () => Promise<unknown>) => Promise<void>;
+}) {
+  const installCliMutation = useMutation({ mutationFn: installCli });
+
+  const [result, setResult] = useState<InstalledCli | null>(null);
+  // Set once a plain install was refused for an existing orx on PATH; the retry
+  // is what makes the backend's "re-run with --force" reachable from here.
+  const [needsForce, setNeedsForce] = useState(false);
+
+  const install = (force: boolean) =>
+    void run("cli", () =>
+      installCliMutation.mutateAsync(force)
+        .then((r) => {
+          setResult(r);
+          setNeedsForce(false);
+        })
+        .catch((e) => {
+          // Only the PATH-collision refusal is retryable with force; an
+          // unrelated failure must not relabel the button "Replace anyway".
+          setNeedsForce(!force && String(e?.message ?? e).includes("--force"));
+          throw e;
+        }),
+    );
+
+  return (
+    <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+      <div>
+        <div className="project-default-title text-base font-medium">
+          {m.settings_install_cli_title({ command: ltr("orx") })}
+        </div>
+        {result ? (
+          <p>
+            {result.alreadyCurrent
+              ? m.settings_cli_already_linked({ link: ltr(result.link) })
+              : m.settings_cli_linked({ link: ltr(result.link) })}
+            {!result.onPath && m.settings_add_to_path({ directory: ltr(result.dir) })}
+          </p>
+        ) : (
+          <p>
+            {m.settings_install_cli_description({ command: ltr("orx") })}
+          </p>
+        )}
+      </div>
+      <Button size="small"
+        type="button"
+
+        disabled={disabled}
+        onClick={() => install(needsForce)}
+      >
+        {busy === "cli" ? m.chat_working() : needsForce ? m.settings_replace_anyway() : result ? m.settings_relink() : m.settings_install()}
+      </Button>
+    </div>
+  );
+}
+
+// --- project defaults ----------------------------------------------------------
+
+function ProjectDefaultsTab({ remote }: { remote: boolean }) {
+  const setProjectDefaultsMutation = useMutation({ mutationFn: (args: Parameters<typeof setProjectDefaults>) => setProjectDefaults(...args) });
+
+  const settingsOptions = getProjectDefaultsQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const setSettings = (value: React.SetStateAction<ProjectDefaultsSettings | null>) => {
+    setScopedQueryData(settingsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const [saving, setSaving] = useState(false);
+  const [actionError, setError] = useState<string | null>(null);
+  const error = actionError ?? settingsQuery.error?.message ?? null;
+
+  const load = async () => { await settingsQuery.refetch({ cancelRefetch: false }); };
+  const gh = useCommandRun();
+
+  const toggle = () => {
+    if (!settings || saving) return;
+    const enabled = !settings.githubForNewProjects;
+    setSaving(true);
+    setError(null);
+    void setProjectDefaultsMutation.mutateAsync([enabled, true])
+      .then(setSettings)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <>
+      <h2>{m.settings_page_general()}</h2>
+      {!settings ? (
+        error ? <div className="error">{error}</div> : <LoadingRow><Spinner /> {m.settings_page_loading()}</LoadingRow>
+      ) : (
+        <div className={`${SETTINGS_CARD_CLASS_NAME} mt-3 project-defaults-card [&_.settings-card-head]:justify-between [&_.settings-card-head]:mb-0 [&_.settings-card-head]:pb-3 [&_.settings-card-head_h3]:m-0`}>
+          <div className="settings-card-head flex items-center gap-2.5 mb-3">
+            <h3>{m.settings_page_git_hub_publishing()}</h3>
+            <Badge variant={settings.githubAuthenticated ? "success" : settings.ghInstalled ? "warning" : "error"}>
+              {settings.githubAuthenticated ? m.settings_connected_via_github_cli() : m.settings_not_connected()}
+            </Badge>
+          </div>
+          <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+            <div>
+              <div className="project-default-title text-base font-medium">{m.settings_page_enable_git_hub_syncing_for_new_projects()}</div>
+              <p>
+                {m.settings_page_when_enabled_each_new_project_gets_a_private()}
+              </p>
+            </div>
+            <Switch
+              type="button"
+              checked={settings.githubForNewProjects}
+              aria-label={m.settings_page_enable_git_hub_syncing_for_new_projects()}
+              disabled={saving || (!settings.githubAuthenticated && !settings.githubForNewProjects)}
+              onClick={toggle}
+            />
+          </div>
+          {!settings.githubAuthenticated && (
+            <div className="mt-3.5 pt-3.5 border-t border-t-border-variant">
+              <GitHubCliHelp ghInstalled={settings.ghInstalled} remote={remote} onCheck={load} onRun={gh.start} />
+            </div>
+          )}
+          <CommandRunTerminal run={gh.run} onComplete={() => void load()} onClose={gh.clear} />
+          {error && <div className="error">{error}</div>}
+        </div>
+      )}
+    </>
+  );
+}
+
+function GitHubCliHelp({
+  ghInstalled,
+  remote,
+  onCheck,
+  onRun,
+}: {
+  ghInstalled: boolean;
+  remote: boolean;
+  onCheck: () => Promise<void>;
+  onRun: (command: string, path: string) => void;
+}) {
+  const [checking, setChecking] = useState(false);
+  const check = () => {
+    setChecking(true);
+    void onCheck().finally(() => setChecking(false));
+  };
+
+  return (
+    <>
+      <RunnableNote
+        note={ghInstalled ? m.settings_run_gh_auth_login() : m.settings_install_gh_then_login()}
+        className="git-card-helper m-0 text-sm leading-relaxed text-text"
+        disabled={remote || !ghInstalled}
+        onRun={onRun}
+      />
+      <div className="flex flex-wrap gap-2 mt-2.5">
+        {!ghInstalled && (
+          <ButtonLink variant="primary"
+            href="https://cli.github.com/"
+            target="_blank"
+            rel="noreferrer"
+          >
+            {m.settings_page_install_git_hub_cli()} <ExternalLink size={12} />
+          </ButtonLink>
+        )}
+        <Button type="button" variant={ghInstalled ? "warning" : "default"} disabled={checking} onClick={check}>
+          {checking ? m.common_checking() : m.settings_check_again()}
+        </Button>
+      </div>
+    </>
+  );
+}
+
+/** The Overleaf Git authentication token and session cookie are machine-wide.
+ * Which Overleaf *project* a paper pushes to is per-paper, and lives on the
+ * .tex tab. */
+function OverleafCard() {
+  const deleteOverleafTokenMutation = useMutation({ mutationFn: deleteOverleafToken });
+  const deleteOverleafSessionMutation = useMutation({ mutationFn: deleteOverleafSession });
+
+  const tokenOptions = getOverleafSettingsQuery();
+  const settings = useQuery(tokenOptions);
+  const hasToken = settings.data?.hasToken ?? null;
+  const hasSession = settings.data?.hasSession ?? null;
+  const patch = (next: Partial<OverleafSettings>) =>
+    setScopedQueryData(tokenOptions.queryKey, {
+      hasToken: hasToken ?? false,
+      hasSession: hasSession ?? false,
+      ...next,
+    });
+  const setHasToken = (value: boolean) => patch({ hasToken: value });
+  const [saving, setSaving] = useState(false);
+  const [actionError, setError] = useState<string | null>(null);
+
+  const error = actionError ?? settings.error?.message;
+
+  return (
+    <div className={GIT_SETTINGS_CARD_CLASS_NAME}>
+      <h3>{m.settings_page_overleaf()}</h3>
+      <div className={KV_CLASS_NAME}>
+        <span className="k">{m.settings_page_git_token()}</span>
+        <span className="v">
+          <Badge variant={hasToken ? "success" : "default"}>
+            {hasToken === null ? (error ? m.model_picker_unavailable() : m.common_checking()) : hasToken ? m.settings_saved() : m.settings_not_set()}
+          </Badge>
+        </span>
+      </div>
+      <p className="git-card-helper mt-3.5 mx-0 mb-0 text-sm leading-relaxed text-text">
+        {m.settings_page_with_a_token_saved_a_paper_opened_in()}
+      </p>
+      {hasToken ? (
+        <div className={GIT_CARD_ACTIONS_CLASS_NAME}>
+          <Button
+            disabled={saving}
+            onClick={() => {
+              setSaving(true);
+              setError(null);
+              void deleteOverleafTokenMutation.mutateAsync()
+                .then((s) => setHasToken(s.hasToken))
+                .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+                .finally(() => setSaving(false));
+            }}
+          >
+            {saving ? m.settings_removing() : m.settings_remove_token()}
+          </Button>
+        </div>
+      ) : (
+        <TokenForm
+          save={saveOverleafToken}
+          onSaved={(result) => setHasToken(result.hasToken)}
+          placeholder={m.settings_page_overleaf_git_authentication_token()}
+          createHref="https://www.overleaf.com/user/settings"
+        />
+      )}
+      <div className={KV_CLASS_NAME}>
+        <span className="k">{m.settings_page_session_cookie()}</span>
+        <span className="v">
+          <Badge variant={hasSession ? "success" : "default"}>
+            {hasSession === null ? (error ? m.model_picker_unavailable() : m.common_checking()) : hasSession ? m.settings_saved() : m.settings_not_set()}
+          </Badge>
+        </span>
+      </div>
+      <p className="git-card-helper mt-3.5 mx-0 mb-0 text-sm leading-relaxed text-text">
+        {m.settings_page_session_cookie_help()}
+      </p>
+      {hasSession ? (
+        <div className={GIT_CARD_ACTIONS_CLASS_NAME}>
+          <Button
+            disabled={saving}
+            onClick={() => {
+              setSaving(true);
+              setError(null);
+              void deleteOverleafSessionMutation.mutateAsync()
+                .then((s) => patch({ hasSession: s.hasSession }))
+                .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+                .finally(() => setSaving(false));
+            }}
+          >
+            {saving ? m.settings_removing() : m.settings_remove_session()}
+          </Button>
+        </div>
+      ) : (
+        <TokenForm
+          save={(session) => saveOverleafSession(session)}
+          onSaved={(result) => patch({ hasSession: result.hasSession })}
+          placeholder={m.overleaf_session_cookie()}
+          createHref="https://www.overleaf.com/project"
+          createLabel={m.overleaf_open_overleaf()}
+        />
+      )}
+      {error && <div className="error">{error}</div>}
+    </div>
+  );
+}
+
+// --- git -----------------------------------------------------------------------
+
+function GitTab({
+  project,
+  onProjectUpdate,
+  remote,
+}: {
+  project: Project | null;
+  onProjectUpdate: (project: Project) => void;
+  remote: boolean;
+}) {
+  const setProjectDefaultsMutation = useMutation({ mutationFn: (args: Parameters<typeof setProjectDefaults>) => setProjectDefaults(...args) });
+
+  const statusOptions = { ...getProjectGitStatusQuery(project?.id ?? ""), enabled: Boolean(project) };
+  const statusQuery = useQuery(statusOptions);
+  const gh = useCommandRun();
+  const status = statusQuery.data ?? null;
+  const setStatus = (value: React.SetStateAction<ProjectGitStatus | null>) => {
+    setScopedQueryData(statusOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+  };
+  const [saving, setSaving] = useState(false);
+  const [actionError, setError] = useState<string | null>(null);
+  const error = actionError ?? statusQuery.error?.message ?? null;
+  const [defaultPromptOpen, setDefaultPromptOpen] = useState(false);
+  const [defaultPromptSaving, setDefaultPromptSaving] = useState(false);
+  const [defaultPromptError, setDefaultPromptError] = useState<string | null>(null);
+  const hasGithubRepository = Boolean(status?.github.owner && status.github.repo);
+
+  const load = async () => { await statusQuery.refetch({ cancelRefetch: false }); };
+
+  const syncErrorMessage = (err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.toLowerCase().includes("archived")) {
+      return m.settings_github_archived_error();
+    }
+    if (message.includes("(fetch first)") || message.includes("non-fast-forward")) {
+      return m.settings_github_fetch_first_error();
+    }
+    if (message.includes("403") || message.toLowerCase().includes("permission denied")) {
+      return m.settings_github_permission_error();
+    }
+    return message;
+  };
+
+  const enableSync = () => {
+    if (!project) return;
+    setSaving(true);
+    setError(null);
+    void enableProjectGithub(project.id)
+      .then((result) => {
+        setStatus(result.git);
+        onProjectUpdate(result.project);
+        void queryClient.fetchQuery(getProjectDefaultsQuery())
+          .then((defaults) => {
+            if (!defaults.githubForNewProjects && !defaults.githubDefaultPromptSeen) {
+              setDefaultPromptOpen(true);
+            }
+          })
+          .catch(() => {});
+      })
+      .catch((err) => setError(syncErrorMessage(err)))
+      .finally(() => setSaving(false));
+  };
+
+  const finishDefaultPrompt = (enabled: boolean) => {
+    setDefaultPromptSaving(true);
+    setDefaultPromptError(null);
+    void setProjectDefaultsMutation.mutateAsync([enabled, true])
+      .then(() => setDefaultPromptOpen(false))
+      .catch((err) => setDefaultPromptError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setDefaultPromptSaving(false));
+  };
+
+  return (
+    <>
+      <h1>{m.settings_page_repository()}</h1>
+      <p className="settings-sub mt-0 mx-0 mb-4.5 text-base leading-relaxed text-text">
+        {m.settings_repository_description({ project: project?.name ?? m.settings_current_project() })}
+      </p>
+      {!project ? (
+        <div className={SETTINGS_CARD_CLASS_NAME}><p className={SETTINGS_NOTE_CLASS_NAME}>{m.settings_page_open_a_project_to_inspect_its_repository_and()}</p></div>
+      ) : error && !status ? (
+        <div className="error">{error}</div>
+      ) : !status ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_loading()}
+        </LoadingRow>
+      ) : (
+        <>
+          <div className={GIT_SETTINGS_CARD_CLASS_NAME}>
+            <h3>{m.settings_page_local_repository()}</h3>
+            <div className={KV_CLASS_NAME}>
+              <span className="k">{m.settings_page_path()}</span><span className="v">{status.path}</span>
+              <span className="k">Git</span><span className="v">{status.gitVersion ?? m.onboarding_not_found()}</span>
+              <span className="k">{m.settings_page_state()}</span><span className="v">{status.initialized ? m.settings_git_state({ branch: ltr(status.currentBranch ?? m.settings_detached()), state: status.clean ? m.settings_clean() : m.settings_has_changes() }) : m.settings_not_initialized()}</span>
+              <span className="k">{m.settings_page_baseline()}</span><span className="v">{status.baselineBranch}</span>
+              <span className="k">{m.settings_page_remotes()}</span><span className="v">{status.remotes.length ? status.remotes.map((remote) => `${remote.name}: ${remote.url}`).join(" · ") : m.settings_none()}</span>
+            </div>
+            {!status.initialized && <div className={GIT_CARD_ACTIONS_CLASS_NAME}><Button variant="primary" onClick={() => void initializeProjectGit(project.id).then(setStatus).catch((err) => setError(String(err)))}>{m.settings_page_initialize_git()}</Button></div>}
+          </div>
+          <div className={GIT_SETTINGS_CARD_CLASS_NAME}>
+            <h3>GitHub</h3>
+            <div className={KV_CLASS_NAME}>
+              <span className="k">{m.settings_page_authentication()}</span><span className="v"><Badge variant={status.github.authenticated ? "success" : status.github.ghInstalled ? "warning" : "error"}>{status.github.authenticated ? m.settings_connected_via_github_cli() : m.settings_not_connected()}</Badge></span>
+              <span className="k">{m.settings_page_project()}</span><span className="v">{hasGithubRepository ? <><span>{status.github.owner}/{status.github.repo}</span>{!status.github.enabled && <Badge>{m.settings_page_syncing_off()}</Badge>}</> : <Badge>{m.settings_page_local_only()}</Badge>}</span>
+              {status.github.enabled && <><span className="k">{m.settings_page_sync()}</span><span className="v">{status.github.syncStatus}</span></>}
+            </div>
+            {!status.github.authenticated && (
+              <div className="mt-3.5 pt-3.5 border-t border-t-border-variant">
+                <GitHubCliHelp ghInstalled={status.github.ghInstalled} remote={remote} onCheck={() => load()} onRun={gh.start} />
+              </div>
+            )}
+            <CommandRunTerminal run={gh.run} onComplete={() => void load()} onClose={gh.clear} />
+            {status.github.authenticated && !status.github.enabled && (
+              <>
+                <p className="git-card-helper mt-3.5 mx-0 mb-0 text-sm leading-relaxed text-text">
+                  {hasGithubRepository
+                    ? m.settings_use_existing_github_repository()
+                    : m.settings_create_private_github_repository()}
+                </p>
+                <div className={GIT_CARD_ACTIONS_CLASS_NAME}>
+                  {hasGithubRepository && status.github.url && <ButtonLink href={status.github.url} target="_blank" rel="noreferrer">{m.settings_page_open_on_git_hub()} <ExternalLink size={12} /></ButtonLink>}
+                  <Button variant="primary" disabled={saving} onClick={enableSync}>{saving ? m.repository_enabling() : m.repository_enable_syncing()}</Button>
+                </div>
+              </>
+            )}
+            {status.github.enabled && (
+              <>
+                <p className="git-card-helper mt-3.5 mx-0 mb-0 text-sm leading-relaxed text-text">
+                  {m.settings_page_disabling_syncing_stops_automatic_pushes_compute_continues_to()}
+                </p>
+                <div className={GIT_CARD_ACTIONS_CLASS_NAME}>
+                  {status.github.url && <ButtonLink href={status.github.url} target="_blank" rel="noreferrer">{m.settings_page_open_on_git_hub()} <ExternalLink size={12} /></ButtonLink>}
+                  <Button disabled={saving} onClick={() => { setSaving(true); void disableProjectGithub(project.id).then((result) => { setStatus(result.git); onProjectUpdate(result.project); }).catch((err) => setError(err instanceof Error ? err.message : String(err))).finally(() => setSaving(false)); }}>{saving ? m.repository_updating() : m.repository_disable_syncing()}</Button>
+                </div>
+              </>
+            )}
+          </div>
+          <OverleafCard />
+          {error && <div className="error">{syncErrorMessage(error)}</div>}
+        </>
+      )}
+      {defaultPromptOpen && (
+        <div className="modal-backdrop fixed inset-0 bg-modal-backdrop-light flex items-start justify-center pt-[var(--modal-top)] px-4 pb-6 overflow-y-auto z-100" onClick={() => finishDefaultPrompt(false)}>
+          <div
+            className="modal max-w-[94vw] max-h-[calc(100vh_-_var(--modal-top)_-_48px)] overflow-y-auto bg-background border border-border rounded-xl shadow-modal p-6 [&_h2]:mt-0 [&_h2]:mx-0 [&_h2]:mb-3.5 [&_h2]:text-xl github-default-modal w-110 [&_>_p]:m-0 [&_>_p]:text-sm [&_>_p]:leading-relaxed [&_>_p]:text-text [&_>_.error]:mt-3.5"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="github-default-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="github-default-title">{m.settings_page_make_git_hub_syncing_the_default()}</h2>
+            <p>
+              {m.settings_page_this_is_useful_when_collaborators_follow_project_changes()}
+            </p>
+            {defaultPromptError && <div className="error">{defaultPromptError}</div>}
+            <div className="github-default-actions flex justify-end gap-2.5 mt-5.5">
+              <Button disabled={defaultPromptSaving} onClick={() => finishDefaultPrompt(false)}>
+                {m.settings_page_not_now()}
+              </Button>
+              <Button variant="primary" disabled={defaultPromptSaving} onClick={() => finishDefaultPrompt(true)}>
+                {defaultPromptSaving ? m.common_saving() : m.settings_make_default()}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// --- storage (data directory) ------------------------------------------------
+
+const DATA_DIR_SOURCE_LABEL: Record<DataDirSettings["source"], () => string> = {
+  env: m.storage_source_env,
+  config: m.storage_source_saved,
+  xdg: m.storage_source_xdg,
+  default: m.storage_source_default,
+};
+
+const MOVE_PHASE_LABELS: Record<string, () => string> = {
+  preparing: m.storage_preparing,
+  copying: m.storage_copying,
+  verifying: m.storage_verifying,
+  finalizing: m.storage_finalizing,
+};
+const movePhaseLabel = (phase: string) => MOVE_PHASE_LABELS[phase]?.() ?? phase;
+
+type MoveState =
+  | { kind: "idle" }
+  | { kind: "moving"; phase: string; copied: number; total: number }
+  | { kind: "done"; oldPathLeft?: string }
+  | { kind: "error"; message: string };
+
+function StorageTab() {
+  const settingsOptions = getDataDirQuery();
+  const settingsQuery = useQuery(settingsOptions);
+  const settings = settingsQuery.data ?? null;
+  const loadError = settings ? null : settingsQuery.error?.message ?? null;
+  const [path, setPath] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [validation, setValidation] = useState<DataDirValidation | null>(null);
+  const [move, setMove] = useState<MoveState>({ kind: "idle" });
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (settings) setPath((current) => current || settings.current);
+  }, [settings]);
+
+  // Subscribe to move progress streamed over the shared SSE.
+  useEffect(() => {
+    return onDataDirMove((ev) => {
+      if (ev.type === "progress") {
+        // The "preparing" tick reports total 0 (sized after the checkpoint);
+        // keep the last known non-zero total so the bar doesn't flicker to 0.
+        setMove((m) => {
+          const prevTotal = m.kind === "moving" ? m.total : 0;
+          return {
+            kind: "moving",
+            phase: ev.phase,
+            copied: ev.copiedBytes,
+            total: ev.totalBytes || prevTotal,
+          };
+        });
+      } else if (ev.type === "done") {
+        setMove({ kind: "done", oldPathLeft: ev.oldPathLeft });
+        setValidation(null);
+        // The acknowledged snapshot seeds the new path.
+        setPath("");
+      } else if (ev.type === "error") {
+        setMove({ kind: "error", message: ev.error });
+      }
+    });
+  }, []);
+
+  const envForced = settings?.source === "env";
+  const trimmed = path.trim();
+  const unchanged = settings !== null && trimmed === settings.current;
+
+  async function check() {
+    if (checking || !trimmed) return;
+    setChecking(true);
+    setError(null);
+    setValidation(null);
+    try {
+      setValidation(await validateDataDir(trimmed));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function startMove(e: React.FormEvent) {
+    e.preventDefault();
+    if (move.kind === "moving" || !trimmed || unchanged) return;
+    setError(null);
+    // Confirm — this relocates all projects' data. Same-disk moves are atomic;
+    // cross-disk moves copy and leave the old folder for you to remove.
+    if (
+      !window.confirm(m.storage_move_confirm({ path: ltr(trimmed) }))
+    )
+      return;
+    setMove({ kind: "moving", phase: "preparing", copied: 0, total: validation?.treeBytes ?? 0 });
+    try {
+      await moveDataDir(trimmed);
+      // 202 accepted — progress/done arrive over SSE. Nothing else to do here.
+    } catch (err) {
+      // 409 in-flight guard or a validation error surfaces here.
+      setMove({ kind: "idle" });
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return (
+    <>
+      <h2>{m.settings_page_storage()}</h2>
+      <p className="settings-sub mt-0 mx-0 mb-4.5 text-sm leading-relaxed text-subtext">
+        {m.settings_storage_description()}
+      </p>
+      {loadError ? (
+        <div className={SETTINGS_CARD_CLASS_NAME}>
+          <div className="error">{loadError}</div>
+        </div>
+      ) : !settings ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_loading()}
+        </LoadingRow>
+      ) : (
+        <div className={SETTINGS_CARD_CLASS_NAME}>
+          <div className="settings-card-head mb-3">
+            <h3>{m.settings_page_data_directory()}</h3>
+          </div>
+          <div className={KV_CLASS_NAME}>
+            <span className="k">{m.settings_page_current()}</span>
+            <span className="v">{settings.current}</span>
+            <span className="k">{m.settings_page_source()}</span>
+            <span className="v">{DATA_DIR_SOURCE_LABEL[settings.source]()}</span>
+          </div>
+
+          {!envForced && (
+            <form className={FORM_CLASS_NAME} onSubmit={startMove}>
+              <label>
+                {m.settings_page_new_location()}
+                <input
+                  className="text-sm"
+                  type="text"
+                  value={path}
+                  onChange={(e) => {
+                    setPath(e.target.value);
+                    setValidation(null);
+                  }}
+                  placeholder="/absolute/path/to/research-project"
+                  autoComplete="off"
+                  spellCheck={false}
+                  disabled={move.kind === "moving"}
+                />
+              </label>
+
+              {validation && !validation.error && validation.ok && (
+                <p className={SETTINGS_NOTE_CLASS_NAME}>
+                  {m.settings_page_ready_to_move()} {fmtBytes(validation.treeBytes ?? 0)}
+                  {validation.freeBytes != null && ` — ${m.storage_free_at_target({ size: ltr(fmtBytes(validation.freeBytes)) })}`}
+                  {validation.sameFilesystem ? m.storage_same_disk() : ""}.
+                </p>
+              )}
+              {validation && validation.ok === false && validation.error && (
+                <div className="error">{validation.error}</div>
+              )}
+              {error && <div className="error">{error}</div>}
+
+              {move.kind === "moving" && (
+                <ProgressBar
+                  value={move.copied}
+                  max={move.total}
+                  label={movePhaseLabel(move.phase)}
+                  caption={
+                    move.total > 0 ? (
+                      <span className="text-sm">
+                        {fmtBytes(move.copied)} / {fmtBytes(move.total)}
+                      </span>
+                    ) : undefined
+                  }
+                />
+              )}
+              {move.kind === "done" && (
+                <p className={SETTINGS_NOTE_CLASS_NAME}>
+                  {m.settings_page_moved_orx_is_now_using_the_new_location()}
+                  {move.oldPathLeft && (
+                    <>
+                      {" "}
+                      {m.settings_old_copy_left({ path: ltr(move.oldPathLeft) })}
+                    </>
+                  )}
+                </p>
+              )}
+              {move.kind === "error" && <div className="error">{m.settings_page_move_failed()} {move.message}</div>}
+
+              <div className="actions">
+                <Button
+                  type="button"
+
+                  onClick={check}
+                  disabled={checking || !trimmed || unchanged || move.kind === "moving"}
+                >
+                  {checking ? m.common_checking() : m.settings_check()}
+                </Button>
+                <Button variant="primary"
+                  type="submit"
+
+                  disabled={!trimmed || unchanged || move.kind === "moving"}
+                >
+                  {move.kind === "moving" ? m.storage_moving() : m.storage_move_here()}
+                </Button>
+              </div>
+            </form>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+// --- instances ---------------------------------------------------------------
+
+const isLive = (status: string) => status === "running" || status === "starting";
+
+/** Runtime: live instances show elapsed-so-far, finished ones total duration.
+ *  Both start at submission time, so provisioning/queue time is included —
+ *  that's the span the provider bills for. */
+function runtimeLabel(inst: Run): string {
+  if (isLive(inst.status)) return fmtDuration(Date.now() - inst.createdAt);
+  if (inst.endedAt) return fmtDuration(inst.endedAt - inst.createdAt);
+  return "—";
+}
+
+/** One section's table: backend (logo + flavor), status, started, runtime. */
+function InstancesTable({ instances, emptyLabel }: { instances: Run[]; emptyLabel: string }) {
+  if (instances.length === 0) {
+    return <p className="instances-empty m-0 rounded-lg border border-border bg-background py-3.5 px-4 text-base text-subtext">{emptyLabel}</p>;
+  }
+  return (
+    <div className="instances-table-wrap overflow-x-auto">
+      <table className="runs-table w-full border-collapse bg-background text-base [&_th]:text-start [&_th]:text-text [&_th]:text-sm [&_th]:font-medium [&_th]:py-2 [&_th]:px-3 [&_th]:border-b [&_th]:border-b-border [&_th]:sticky [&_th]:top-0 [&_th]:bg-background [&_th]:z-1 [&_td]:py-2 [&_td]:px-3 [&_td]:border-b [&_td]:border-b-divider-faint [&_td]:whitespace-nowrap [&_tr:last-child_td]:border-b-0 [&_tr.clickable]:cursor-pointer [&_tr.clickable:hover_td]:bg-canvas">
+        <thead>
+          <tr>
+            <th>{m.settings_page_backend()}</th>
+            <th>{m.settings_page_status()}</th>
+            <th>{m.settings_page_started()}</th>
+            <th>{m.settings_page_runtime()}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {instances.map((inst) => {
+            // HF jobs carry their dashboard URL; Modal stores only a sandbox id.
+            const url = typeof inst.backend?.url === "string" ? inst.backend.url : undefined;
+            return (
+              <tr key={inst.id}>
+                <td>
+                  <span className="backend-cell inline-flex items-center gap-0.5">
+                    <BackendBadge backend={inst.backend} />
+                    {url && (
+                      <IconButtonLink size="small"
+                        href={url}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={m.settings_page_open_job_page()}
+                        aria-label={m.settings_page_open_job_page()}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <ExternalLink size={12} />
+                      </IconButtonLink>
+                    )}
+                  </span>
+                </td>
+                <td>
+                  <StatusBadge status={runDisplayStatus(inst)} />
+                </td>
+                <td>{timeAgo(inst.createdAt)}</td>
+                <td>{runtimeLabel(inst)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ComputeActivity({ projectId, onViewHistory }: { projectId?: string; onViewHistory: () => void }) {
+  const query = useQuery({ ...listRunsQuery(projectId ?? ""), enabled: Boolean(projectId), subscribed: Boolean(projectId) });
+  const instances = projectId ? query.data ?? (query.error ? [] : null) : [];
+  const error = query.error?.message;
+  const refreshing = query.isFetching;
+
+  // Re-render every 30s so live rows' Runtime keeps counting (client-side
+  // only — the minute-level display doesn't warrant a refetch).
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const load = () => { if (projectId) void query.refetch(); };
+
+  const byRecent = (a: Run, b: Run) => b.createdAt - a.createdAt;
+  const running = instances?.filter((i) => isLive(i.status)).sort(byRecent);
+  const past = instances?.filter((i) => !isLive(i.status)).sort(byRecent);
+
+  return (
+    <section className="compute-activity [&_.count-badge]:inline-flex [&_.count-badge]:items-center [&_.count-badge]:justify-center [&_.count-badge]:min-w-4.5 [&_.count-badge]:h-4.5 [&_.count-badge]:py-0 [&_.count-badge]:px-[5px] [&_.count-badge]:rounded-md [&_.count-badge]:bg-canvas [&_.count-badge]:border [&_.count-badge]:border-border [&_.count-badge]:text-xs [&_.count-badge]:font-medium [&_.count-badge]:text-text mt-5.5 mx-0 mb-8">
+      <div className="compute-activity-head flex items-start justify-between gap-5 mb-3.5 [&_h2]:flex [&_h2]:items-center [&_h2]:gap-2 [&_h2]:m-0 [&_h2]:text-lg [@media((max-width:_640px))]:items-stretch [@media((max-width:_640px))]:flex-col">
+        <div>
+          <h2>
+            {m.settings_page_running_instances()}
+            {running && running.length > 0 && <span className="count-badge">{running.length}</span>}
+          </h2>
+        </div>
+        <div className="compute-activity-actions flex gap-2 flex-none [@media((max-width:_640px))]:justify-start">
+          <Button size="small" onClick={load} disabled={refreshing}>
+            <RefreshCw size={12} className={refreshing ? "animate-[spin_0.9s_linear_infinite]" : ""} /> {m.settings_page_refresh()}
+          </Button>
+          <Button size="small" onClick={onViewHistory}>
+            {past?.length ? m.instances_view_history_count({ count: fmtNumber(past.length) }) : m.instances_view_history()}
+          </Button>
+        </div>
+      </div>
+      {error && <div className="error">{error}</div>}
+      {!running || !past ? (
+        <LoadingRow>
+          <Spinner /> {m.settings_page_loading()}
+        </LoadingRow>
+      ) : <InstancesTable instances={running} emptyLabel={projectId ? m.instances_nothing_running() : m.instances_select_project_runs()} />}
+    </section>
+  );
+}
+
+function InstanceHistory({ projectId, onBack }: { projectId?: string; onBack: () => void }) {
+  const query = useQuery({ ...listRunsQuery(projectId ?? ""), enabled: Boolean(projectId), subscribed: Boolean(projectId) });
+  const instances = projectId ? query.data ?? (query.error ? [] : null) : [];
+  const error = query.error?.message;
+  const refreshing = query.isFetching;
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => setTick((tick) => tick + 1), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const load = () => { if (projectId) void query.refetch(); };
+
+  return (
+    <>
+      <button type="button" className="settings-back inline-flex items-center gap-1.5 mt-0 mx-0 mb-4.5 text-subtext text-sm font-medium [&:hover]:text-text" onClick={onBack}>
+        <ArrowLeft size={14} /> {m.settings_page_back_to_compute()}
+      </button>
+      <div className="settings-head-row flex items-center justify-between gap-2.5 [&_h1]:m-0">
+        <h1>{m.settings_page_instance_history()}</h1>
+        <Button size="small" onClick={load} disabled={refreshing}>
+          <RefreshCw size={12} className={refreshing ? "animate-[spin_0.9s_linear_infinite]" : ""} /> {m.settings_page_refresh()}
+        </Button>
+      </div>
+      {error && <div className="error">{error}</div>}
+      {!instances ? (
+        <LoadingRow><Spinner /> {m.settings_page_loading()}</LoadingRow>
+      ) : (
+        <InstancesTable instances={[...instances].sort((a, b) => b.createdAt - a.createdAt)} emptyLabel={projectId ? m.instances_none_yet() : m.instances_select_project_history()} />
+      )}
+    </>
+  );
+}
+
+// --- embedded view -----------------------------------------------------------
+
+type SettingsNavItem = {
+  id: Tab;
+  label: () => string;
+  icon: React.ReactNode;
+  activeTabs: Tab[];
+};
+
+const SETTINGS_SECTIONS: Tab[] = ["projects", "harnesses", "storage"];
+
+/** Primary rail entries. Configuration sections share the Settings entry. */
+export const SETTINGS_NAV: SettingsNavItem[] = [
+  {
+    id: "compute",
+    label: m.settings_page_compute,
+    icon: <Cpu size={15} />,
+    activeTabs: ["compute", "instances"],
+  },
+  { id: "environment", label: m.settings_page_environment, icon: <SquareTerminal size={15} />, activeTabs: ["environment"] },
+  {
+    id: "settings",
+    label: m.settings_page_settings,
+    icon: <Settings size={15} />,
+    activeTabs: ["settings", ...SETTINGS_SECTIONS],
+  },
+];
+
+function isSettingsSection(tab: Tab): boolean {
+  return SETTINGS_SECTIONS.includes(tab);
+}
+
+/** One settings section's content, shown in the middle pane in place of chat. */
+export function SettingsView({
+  tab,
+  project,
+  onProjectUpdate,
+  onSelectTab,
+  remote = false,
+}: {
+  tab: Tab;
+  project: Project | null;
+  onProjectUpdate: (project: Project) => void;
+  onSelectTab: (tab: Tab) => void;
+  remote?: boolean;
+}) {
+  const showsSettings = tab === "settings" || isSettingsSection(tab);
+  const sectionRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const section = sectionRef.current;
+    const stack = section?.parentElement;
+    if (!section || !stack) return;
+    const reveal = () => section.scrollIntoView({ block: "start" });
+    // Earlier sections load asynchronously; keep the target visible until the user interacts.
+    const observer = new ResizeObserver(reveal);
+    observer.observe(stack);
+    reveal();
+    const stop = () => observer.disconnect();
+    const events = ["wheel", "touchstart", "pointerdown", "keydown"];
+    for (const event of events) window.addEventListener(event, stop, { passive: true });
+    return () => {
+      stop();
+      for (const event of events) window.removeEventListener(event, stop);
+    };
+  }, [tab, project?.id]);
+
+  return (
+    <div className="settings-view max-w-readable my-0 mx-auto pt-6 px-8 pb-15 [&_h1]:mt-0 [&_h1]:mx-0 [&_h1]:mb-1.5 [&_h1]:text-3xl [&_>_.error]:text-accent-red [&_>_.error]:text-base [&_>_.error]:whitespace-pre-wrap [&_>_.error]:mt-0 [&_>_.error]:mx-0 [&_>_.error]:mb-3">
+      {showsSettings && (
+        <>
+          <h1>{m.settings_page_settings()}</h1>
+          <div className="settings-stack mt-4.5">
+            <section className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+              <AppearanceTab />
+            </section>
+            <section ref={tab === "projects" ? sectionRef : undefined} className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+              <ProjectDefaultsTab remote={remote} />
+            </section>
+            <section ref={tab === "harnesses" ? sectionRef : undefined} className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+              <HarnessesTab remote={remote} />
+            </section>
+            {!remote && (
+              <section ref={tab === "storage" ? sectionRef : undefined} className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+                <StorageTab />
+              </section>
+            )}
+            <section className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+              <TelemetryTab />
+            </section>
+            {!remote && (
+              <section className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+                <UpdatesTab />
+              </section>
+            )}
+          </div>
+        </>
+      )}
+      {tab === "compute" && (
+        <ComputeTab
+          project={project}
+          onViewHistory={() => onSelectTab("instances")}
+          onOpenEnvironment={() => onSelectTab("environment")}
+          remote={remote}
+        />
+      )}
+      {tab === "instances" && (
+        <InstanceHistory projectId={project?.id} onBack={() => onSelectTab("compute")} />
+      )}
+      {tab === "environment" && (
+        <>
+          <h1>{m.settings_page_environment()}</h1>
+          <EnvVarsSection />
+        </>
+      )}
+      {tab === "git" && (
+        <GitTab
+          project={project}
+          onProjectUpdate={onProjectUpdate}
+          remote={remote}
+        />
+      )}
+    </div>
+  );
+}

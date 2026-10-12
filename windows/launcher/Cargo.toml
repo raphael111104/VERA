@@ -1,0 +1,17 @@
+[package]
+name = "openresearch-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "VERA: Windows desktop app launcher, optionally packaged as one file"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "VERA"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+embed-resource = "3"

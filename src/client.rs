@@ -1,0 +1,1888 @@
+//! HTTP clients for public scholarly literature APIs.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::error::{anyhow, Result};
+
+fn http() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| crate::net::remote_client().build().expect("http client"))
+}
+
+fn transport_error(base: &str, err: reqwest::Error) -> crate::error::Error {
+    let mut detail = err.to_string();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !detail.contains(&text) {
+            detail.push_str(": ");
+            detail.push_str(&text);
+        }
+        source = std::error::Error::source(cause);
+    }
+    anyhow!("Could not reach {}: {}", base, detail)
+}
+
+// alphaXiv literature endpoints (public — no auth, different hosts).
+//
+// These keyless endpoints hit public API/web hosts, so discovery and paper
+// reading work without an account. They keep their own error semantics and
+// translate a 404 into `Ok(None)` where "not generated yet" is a normal answer.
+// ---------------------------------------------------------------------------
+
+/// Sent on external requests — some CDNs reject the default (empty) UA.
+const ALPHAXIV_UA: &str = concat!("VERA/", env!("CARGO_PKG_VERSION"));
+
+/// Longest `Retry-After` worth waiting out in-process; a longer one fails fast with the wait.
+const MAX_RETRY_WAIT_SECS: u64 = 5;
+
+/// How long to wait before retrying a throttled request: the host's `Retry-After`,
+/// else a growing backoff, plus jitter so concurrent `orx` processes don't retry in lockstep.
+fn retry_delay(retry_after: Option<u64>, attempt: u64) -> std::time::Duration {
+    let secs = retry_after.unwrap_or(attempt);
+    let jitter_ms = u64::try_from(uuid::Uuid::new_v4().as_u128() % 500).unwrap_or(0);
+    std::time::Duration::from_millis(secs * 1000 + jitter_ms)
+}
+
+/// `Retry-After` as seconds from now: either delta-seconds or an HTTP-date (RFC 9110).
+fn retry_after_secs(value: &str) -> Option<u64> {
+    let value = value.trim();
+    value.parse().ok().or_else(|| {
+        let at = httpdate::parse_http_date(value).ok()?;
+        Some(
+            at.duration_since(std::time::SystemTime::now())
+                .map_or(0, |d| d.as_secs()),
+        )
+    })
+}
+
+/// Send a keyless literature GET, retrying 429s: parallel agent calls routinely
+/// burst past these hosts' per-IP limits. Other statuses are left to the caller.
+async fn public_get(
+    request: impl Fn() -> reqwest::RequestBuilder,
+    service: &str,
+    unreachable: impl Fn(reqwest::Error) -> crate::error::Error,
+) -> Result<reqwest::Response> {
+    const ATTEMPTS: u64 = 3;
+    let mut attempt = 1;
+    loop {
+        let res = request()
+            .header("user-agent", ALPHAXIV_UA)
+            .send()
+            .await
+            .map_err(&unreachable)?;
+        if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(res);
+        }
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(retry_after_secs);
+        drop(res);
+        if attempt == ATTEMPTS || retry_after.is_some_and(|secs| secs > MAX_RETRY_WAIT_SECS) {
+            let wait = match retry_after {
+                Some(secs) if secs > 0 => format!("retry in {secs}s"),
+                _ => "wait a minute before retrying".to_string(),
+            };
+            return Err(anyhow!(
+                "{service} is rate-limiting requests (429 Too Many Requests); {wait}"
+            ));
+        }
+        tokio::time::sleep(retry_delay(retry_after, attempt)).await;
+        attempt += 1;
+    }
+}
+
+/// One alphaXiv full-text or discovery search hit. Serialize is derived so the
+/// CLI can emit endpoint results verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperHit {
+    pub paper_id: String,
+    pub title: String,
+    #[serde(rename = "abstract", default)]
+    pub abstract_: String,
+    #[serde(default)]
+    pub publication_date: Option<String>,
+    #[serde(default)]
+    pub votes: i64,
+    #[serde(default)]
+    pub snippets: Vec<PaperSnippet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperSnippet {
+    #[serde(default)]
+    pub page_number: i64,
+    pub snippet: String,
+}
+
+#[derive(Clone, Copy)]
+pub struct PaperDiscoveryOptions<'a> {
+    pub published_after: Option<&'a str>,
+    pub published_before: Option<&'a str>,
+    pub prioritize: &'a str,
+}
+
+#[derive(Clone, Copy)]
+pub struct OpenAlexDiscoveryOptions<'a> {
+    pub limit: u32,
+    pub published_after: Option<&'a str>,
+    pub published_before: Option<&'a str>,
+    pub prioritize: &'a str,
+    pub source_filter: Option<&'a str>,
+}
+
+fn paper_discovery_url(
+    base: &str,
+    strategy: &str,
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("{base}/search/v2/paper/discover/{strategy}"))?;
+    {
+        let mut params = url.query_pairs_mut();
+        params.append_pair("q", query);
+        params.append_pair("prioritize", options.prioritize);
+        if let Some(date) = options.published_after {
+            params.append_pair("publishedAfter", date);
+        }
+        if let Some(date) = options.published_before {
+            params.append_pair("publishedBefore", date);
+        }
+    }
+    Ok(url)
+}
+
+async fn discover_papers(
+    strategy: &str,
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<Vec<PaperHit>> {
+    let base = crate::config::alphaxiv_api_url();
+    let url = paper_discovery_url(&base, strategy, query, options)?;
+    let res = public_get(
+        || http().get(url.clone()),
+        "alphaXiv",
+        |e| transport_error(&base, e),
+    )
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "alphaXiv {} retrieval failed ({} {})",
+            strategy,
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(res.json::<Vec<PaperHit>>().await?)
+}
+
+pub async fn discover_papers_by_keyword(
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<Vec<PaperHit>> {
+    discover_papers("keyword", query, options).await
+}
+
+pub async fn discover_papers_by_embedding(
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<Vec<PaperHit>> {
+    discover_papers("embedding", query, options).await
+}
+
+/// `2401.12345v2` → `2401.12345`; alphaXiv lookups want the versionless id.
+pub(crate) fn versionless_id(paper_id: &str) -> &str {
+    paper_id
+        .rfind('v')
+        .filter(|&i| i > 0 && !paper_id[i + 1..].is_empty())
+        .filter(|&i| paper_id[i + 1..].chars().all(|c| c.is_ascii_digit()))
+        .map_or(paper_id, |i| &paper_id[..i])
+}
+
+/// One hit from the fast (Google-backed) paper search — the endpoint built for
+/// title lookups, versus the BM25 discovery primitive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FastPaperHit {
+    pub paper_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub snippet: Option<String>,
+}
+
+/// Title/keyword paper search (`GET /search/v2/paper/fast`).
+pub async fn search_papers_fast(query: &str) -> Result<Vec<FastPaperHit>> {
+    let base = crate::config::alphaxiv_api_url();
+    let url = format!(
+        "{}/search/v2/paper/fast?q={}&includePrivate=false",
+        base,
+        urlencoding::encode(query)
+    );
+    let res = public_get(
+        || http().get(&url),
+        "alphaXiv",
+        |e| transport_error(&base, e),
+    )
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "alphaXiv search failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(res.json::<Vec<FastPaperHit>>().await?)
+}
+
+/// A paper resolved for the "start from a paper" project flow.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedPaper {
+    /// Canonical versionless id (`2401.12345`).
+    pub paper_id: String,
+    pub title: Option<String>,
+    /// Linked GitHub repo — author repos first, then most stars.
+    pub repo_url: Option<String>,
+    pub repo_stars: Option<i64>,
+}
+
+/// Resolve an arXiv id to title + linked GitHub repo. `/papers/v3/{id}` scrapes
+/// arXiv on a miss, so brand-new papers resolve too (their repo links may lag).
+/// A missing or unparseable implementations answer just means no repo; a rate limit or
+/// unreachable host fails the resolve rather than silently starting a blank project.
+pub async fn resolve_paper(paper_id: &str) -> Result<ResolvedPaper> {
+    let id = versionless_id(paper_id);
+    let base = crate::config::alphaxiv_api_url();
+    let url = format!("{}/papers/v3/{}", base, urlencoding::encode(id));
+    let res = public_get(
+        || http().get(&url),
+        "alphaXiv",
+        |e| transport_error(&base, e),
+    )
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Paper {} not found on alphaXiv/arXiv ({})",
+            id,
+            status.as_u16()
+        ));
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Paper {
+        group_id: Option<String>,
+        universal_id: Option<String>,
+        title: Option<String>,
+    }
+    let paper = res.json::<Paper>().await?;
+    let mut resolved = ResolvedPaper {
+        paper_id: paper.universal_id.unwrap_or_else(|| id.to_string()),
+        title: paper.title,
+        repo_url: None,
+        repo_stars: None,
+    };
+    let Some(group_id) = paper.group_id.filter(|g| !g.is_empty()) else {
+        return Ok(resolved);
+    };
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Implementations {
+        #[serde(default)]
+        paper_resources: Vec<Resource>,
+        #[serde(default)]
+        alpha_xiv_implementations: Vec<Resource>,
+    }
+    #[derive(Deserialize)]
+    struct Resource {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        url: Option<String>,
+        #[serde(default)]
+        stars: Option<i64>,
+        #[serde(default)]
+        source: Option<String>,
+    }
+    let url = format!(
+        "{}/papers/v3/{}/implementations",
+        base,
+        urlencoding::encode(&group_id)
+    );
+    let res = public_get(
+        || http().get(&url),
+        "alphaXiv",
+        |e| transport_error(&base, e),
+    )
+    .await?;
+    if !res.status().is_success() {
+        return Ok(resolved);
+    }
+    let Ok(impls) = res.json::<Implementations>().await else {
+        return Ok(resolved);
+    };
+
+    let is_github = |r: &&Resource| {
+        r.kind.as_deref() == Some("github") && r.url.as_deref().is_some_and(|u| !u.is_empty())
+    };
+    let best = impls
+        .paper_resources
+        .iter()
+        .filter(is_github)
+        // Author repos beat community ones; stars break ties.
+        .max_by_key(|r| (r.source.as_deref() == Some("author"), r.stars.unwrap_or(0)))
+        .or_else(|| impls.alpha_xiv_implementations.iter().find(is_github));
+    if let Some(repo) = best {
+        resolved.repo_url = repo.url.clone();
+        resolved.repo_stars = repo.stars;
+    }
+    Ok(resolved)
+}
+
+/// A declared length past this is not a paper; arXiv's own submission limit is
+/// far below it.
+const MAX_PAPER_PDF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `export.arxiv.org` is the host arXiv asks automated clients to use. Old-style
+/// ids (`hep-th/9901001`) carry a slash, so each segment is encoded separately.
+fn paper_pdf_url(paper_id: &str) -> String {
+    let path = versionless_id(paper_id)
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("https://export.arxiv.org/pdf/{path}")
+}
+
+/// Download a paper's PDF, for paper projects that start blank because the
+/// paper has no linked public code repository.
+pub async fn fetch_paper_pdf(paper_id: &str) -> Result<Vec<u8>> {
+    // The id reaches here straight from the request body; `..` would walk to
+    // another paper's PDF on the same host.
+    if paper_id
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(anyhow!("{} is not an arXiv id", paper_id));
+    }
+    let url = paper_pdf_url(paper_id);
+    let res = public_get(
+        || http().get(&url).timeout(std::time::Duration::from_secs(30)),
+        "arXiv",
+        |e| anyhow!("Could not reach arXiv at {}: {}", url, e),
+    )
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "arXiv PDF download failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+    // arXiv answers some unknown ids with an HTML page rather than a 404.
+    let is_pdf = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/pdf"));
+    if !is_pdf {
+        return Err(anyhow!("{} did not return a PDF", url));
+    }
+    if res
+        .content_length()
+        .is_some_and(|len| len > MAX_PAPER_PDF_BYTES)
+    {
+        return Err(anyhow!("{} is too large to download", url));
+    }
+    Ok(res.bytes().await?.to_vec())
+}
+
+/// Look up a paper's linked GitHub repository (the most-starred repo associated
+/// with it on alphaXiv). Returns `Ok(None)` when the paper has no linked repo or
+/// isn't known to alphaXiv. Best-effort metadata — callers shouldn't fail on it.
+pub async fn fetch_paper_github(paper_id: &str) -> Result<Option<String>> {
+    // The feed lookup wants a versionless universal id (`2401.12345`, not `2401.12345v2`).
+    let versionless = versionless_id(paper_id);
+    let base = crate::config::alphaxiv_api_url();
+    let url = format!(
+        "{}/papers/v3/feed?universalId={}&pageNum=0&pageSize=1&sort=Hot&interval=All%20time",
+        base,
+        urlencoding::encode(versionless)
+    );
+    let res = public_get(
+        || http().get(&url),
+        "alphaXiv",
+        |e| transport_error(&base, e),
+    )
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "alphaXiv paper lookup failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct FeedResponse {
+        papers: Vec<FeedPaper>,
+    }
+    #[derive(Deserialize)]
+    struct FeedPaper {
+        github_url: Option<String>,
+    }
+
+    let body = res.json::<FeedResponse>().await?;
+    Ok(body.papers.into_iter().next().and_then(|p| p.github_url))
+}
+
+/// Fetch one of a paper's markdown documents from the alphaXiv web app.
+/// `kind` is `"overview"` (the machine-readable report) or `"abs"` (full text).
+/// Returns `Ok(None)` on 404 — i.e. that document hasn't been generated yet.
+pub async fn fetch_paper_markdown(kind: &str, paper_id: &str) -> Result<Option<String>> {
+    let base = crate::config::alphaxiv_web_url();
+    let url = format!("{}/{}/{}.md", base, kind, paper_id);
+    let res = public_get(
+        || http().get(&url),
+        "alphaXiv",
+        |e| transport_error(&base, e),
+    )
+    .await?;
+    let status = res.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "alphaXiv request for {} failed ({} {})",
+            url,
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(Some(res.text().await?))
+}
+
+// ---------------------------------------------------------------------------
+// Unified literature hit + OpenAlex / bioRxiv sources.
+//
+// Discovery returns a uniform list and `orx paper` fetches one paper. Like the
+// alphaXiv block above, these hit public hosts with
+// no token and keep their own light error semantics. bioRxiv has no search API,
+// so `--source biorxiv` searches OpenAlex filtered to bioRxiv's source and
+// bioRxiv's own API is used only to fetch a preprint by DOI.
+// ---------------------------------------------------------------------------
+
+/// OpenAlex source id for the bioRxiv repository — `--source biorxiv` filters to it.
+pub const BIORXIV_SOURCE_ID: &str = "S4306402567";
+
+/// A single discovery hit, uniform across sources. Per-source-only fields
+/// (`votes`, `citations`, `snippets`) are omitted when empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LitHit {
+    /// `"alphaxiv" | "openalex" | "biorxiv" | "pubmed"` — set by the search fn.
+    pub source: String,
+    /// Self-routing id for `orx paper`: an arXiv id, a DOI, an OpenAlex `W…` id, or a PMID.
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "abstract", default)]
+    pub abstract_: String,
+    #[serde(default)]
+    pub publication_date: Option<String>,
+    /// alphaXiv community votes; `None` for other sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<i64>,
+    /// Citation count (OpenAlex); `None` for alphaXiv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<i64>,
+    /// Matched full-text snippets; alphaXiv only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<PaperSnippet>,
+}
+
+impl From<PaperHit> for LitHit {
+    fn from(h: PaperHit) -> Self {
+        LitHit {
+            source: "alphaxiv".to_string(),
+            id: h.paper_id,
+            title: h.title,
+            abstract_: h.abstract_,
+            publication_date: h.publication_date,
+            votes: Some(h.votes),
+            citations: None,
+            snippets: h.snippets,
+        }
+    }
+}
+
+/// `https://openalex.org/W123` (or any `.../W123`) → `W123`.
+fn strip_openalex_prefix(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+/// `https://doi.org/10.1101/x` / `doi:10.1101/x` → `10.1101/x`.
+fn strip_doi_prefix(doi: &str) -> &str {
+    doi.strip_prefix("https://doi.org/")
+        .or_else(|| doi.strip_prefix("http://doi.org/"))
+        .or_else(|| doi.strip_prefix("doi:"))
+        .unwrap_or(doi)
+}
+
+/// Rebuild abstract text from OpenAlex's `abstract_inverted_index` (token →
+/// positions). Returns `""` when the index is absent (OpenAlex omits abstracts
+/// for some works).
+fn reconstruct_abstract(index: &Option<HashMap<String, Vec<i64>>>) -> String {
+    let Some(index) = index else {
+        return String::new();
+    };
+    let mut positioned: Vec<(i64, &str)> = Vec::new();
+    for (token, positions) in index {
+        for &p in positions {
+            positioned.push((p, token.as_str()));
+        }
+    }
+    positioned.sort_by_key(|(p, _)| *p);
+    positioned
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// OpenAlex serves snake_case JSON, so the Rust field names match the wire
+// directly — no `rename_all` here.
+#[derive(Debug, Clone, Deserialize)]
+struct OaAuthor {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OaAuthorship {
+    #[serde(default)]
+    author: Option<OaAuthor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OaLocation {
+    #[serde(default)]
+    pdf_url: Option<String>,
+    #[serde(default)]
+    landing_page_url: Option<String>,
+}
+
+/// One OpenAlex work — used both for `/works` search rows (populated per the
+/// `select` list) and for a single-work fetch (all fields present). Unselected
+/// fields simply default.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAlexWork {
+    // The three fields `paper.rs` reads straight off the struct stay `pub`; the
+    // rest are reached through the accessor methods below.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    doi: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub publication_date: Option<String>,
+    #[serde(default)]
+    pub cited_by_count: Option<i64>,
+    #[serde(default)]
+    abstract_inverted_index: Option<HashMap<String, Vec<i64>>>,
+    #[serde(default)]
+    authorships: Vec<OaAuthorship>,
+    #[serde(default)]
+    best_oa_location: Option<OaLocation>,
+}
+
+impl OpenAlexWork {
+    /// Abstract text reconstructed from the inverted index (`""` when absent).
+    pub fn abstract_text(&self) -> String {
+        reconstruct_abstract(&self.abstract_inverted_index)
+    }
+
+    /// Author display names, in order.
+    pub fn author_names(&self) -> Vec<String> {
+        self.authorships
+            .iter()
+            .filter_map(|a| a.author.as_ref()?.display_name.clone())
+            .collect()
+    }
+
+    /// Bare DOI (`10.…`) when the work has one.
+    pub fn doi_bare(&self) -> Option<String> {
+        self.doi.as_deref().map(|d| strip_doi_prefix(d).to_string())
+    }
+
+    /// Bare OpenAlex work id (`W…`) when present.
+    pub fn work_id(&self) -> Option<String> {
+        self.id
+            .as_deref()
+            .map(|i| strip_openalex_prefix(i).to_string())
+    }
+
+    /// A readable open-access URL: PDF if OpenAlex has one, else the landing page.
+    pub fn oa_url(&self) -> Option<String> {
+        self.best_oa_location
+            .as_ref()
+            .and_then(|l| l.pdf_url.clone().or_else(|| l.landing_page_url.clone()))
+    }
+
+    /// Best self-routing id for `orx paper`. For bioRxiv-sourced hits always the
+    /// DOI (routes back to the richer bioRxiv fetch); otherwise the DOI when
+    /// present, else the bare OpenAlex work id.
+    fn routing_id(&self, prefer_doi: bool) -> String {
+        let doi = self.doi_bare();
+        if prefer_doi {
+            if let Some(d) = doi {
+                return d;
+            }
+        }
+        doi.or_else(|| self.work_id()).unwrap_or_default()
+    }
+
+    fn into_lit_hit(self, biorxiv: bool) -> LitHit {
+        let id = self.routing_id(biorxiv);
+        let abstract_ = self.abstract_text();
+        LitHit {
+            source: if biorxiv { "biorxiv" } else { "openalex" }.to_string(),
+            id,
+            title: self.title.unwrap_or_default(),
+            abstract_,
+            publication_date: self.publication_date,
+            votes: None,
+            citations: self.cited_by_count,
+            snippets: Vec::new(),
+        }
+    }
+}
+
+/// Use relevance order from Crossref rather than sorting the whole corpus by citations.
+fn crossref_discovery_url(
+    base: &str,
+    query: &str,
+    after: &str,
+    before: &str,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("{base}/works"))?;
+    url.query_pairs_mut()
+        .append_pair("query.bibliographic", query)
+        .append_pair("rows", "25")
+        .append_pair(
+            "filter",
+            &format!("from-pub-date:{after},until-pub-date:{before},type:journal-article"),
+        );
+    Ok(url)
+}
+
+fn crossref_hit(work: &Value) -> Option<LitHit> {
+    let id = work["DOI"].as_str()?.trim();
+    let title = work["title"].as_array()?.first()?.as_str()?.trim();
+    if !id.starts_with("10.") || id.contains(char::is_whitespace) || title.is_empty() {
+        return None;
+    }
+    // Keep partial dates partial; do not invent a publication month or day.
+    let date = work["published"]["date-parts"]
+        .as_array()?
+        .first()?
+        .as_array()?;
+    let year = date.first()?.as_u64()?;
+    let mut publication_date = format!("{year:04}");
+    if let Some(month) = date
+        .get(1)
+        .and_then(Value::as_u64)
+        .filter(|m| (1..=12).contains(m))
+    {
+        publication_date.push_str(&format!("-{month:02}"));
+        if let Some(day) = date
+            .get(2)
+            .and_then(Value::as_u64)
+            .filter(|d| (1..=31).contains(d))
+        {
+            publication_date.push_str(&format!("-{day:02}"));
+        }
+    }
+    Some(LitHit {
+        source: "crossref".into(),
+        id: id.into(),
+        title: title.into(),
+        abstract_: work["abstract"].as_str().unwrap_or("").into(),
+        publication_date: Some(publication_date),
+        votes: None,
+        citations: work["is-referenced-by-count"].as_i64(),
+        snippets: vec![],
+    })
+}
+
+#[cfg(test)]
+mod crossref_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_keeps_query_dates_and_bounded_relevance_page() {
+        let url = crossref_discovery_url(
+            "https://example.org",
+            "claims & evidence",
+            "2022-01-01",
+            "2026-10-09",
+        )
+        .unwrap();
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["query.bibliographic"], "claims & evidence");
+        assert_eq!(params["rows"], "25");
+        assert_eq!(
+            params["filter"],
+            "from-pub-date:2022-01-01,until-pub-date:2026-10-09,type:journal-article"
+        );
+        assert!(!params.contains_key("sort"));
+    }
+
+    #[test]
+    fn metadata_preserves_missing_abstract_citations_and_partial_dates() {
+        let mut work = serde_json::json!({"DOI":"10.1234/test", "title":["A real metadata title"], "published":{"date-parts":[[2025]]}});
+        let hit = crossref_hit(&work).unwrap();
+        assert_eq!(hit.source, "crossref");
+        assert_eq!(hit.publication_date.as_deref(), Some("2025"));
+        assert!(hit.abstract_.is_empty());
+        assert_eq!(hit.citations, None);
+        work["published"]["date-parts"] = serde_json::json!([[2025, 3, 4]]);
+        work["is-referenced-by-count"] = serde_json::json!(0);
+        assert_eq!(
+            crossref_hit(&work).unwrap().publication_date.as_deref(),
+            Some("2025-03-04")
+        );
+        assert_eq!(crossref_hit(&work).unwrap().citations, Some(0));
+        work["title"] = serde_json::json!([]);
+        assert!(crossref_hit(&work).is_none());
+    }
+}
+
+/// Independent metadata fallback when all planned sources fail. Never supplies full text.
+pub async fn discover_crossref(query: &str, after: &str, before: &str) -> Result<Vec<LitHit>> {
+    let base =
+        std::env::var("CROSSREF_API_URL").unwrap_or_else(|_| "https://api.crossref.org".into());
+    let url = crossref_discovery_url(&base, query, after, before)?;
+    let res = public_get(
+        || {
+            http()
+                .get(url.clone())
+                .timeout(std::time::Duration::from_secs(30))
+        },
+        "Crossref",
+        |e| anyhow!("Could not reach Crossref: {e}"),
+    )
+    .await?;
+    if !res.status().is_success() {
+        return Err(anyhow!(
+            "Crossref search failed ({})",
+            res.status().as_u16()
+        ));
+    }
+    let body: Value = res.json().await?;
+    let items = body["message"]["items"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Crossref returned invalid metadata"))?;
+    Ok(items.iter().filter_map(crossref_hit).collect())
+}
+
+/// Fields to request from OpenAlex `/works` search — keeps the payload small.
+const OPENALEX_SELECT: &str =
+    "id,doi,title,publication_date,cited_by_count,abstract_inverted_index";
+
+fn openalex_discovery_url(
+    base: &str,
+    query: &str,
+    mailto: &str,
+    options: OpenAlexDiscoveryOptions<'_>,
+) -> Result<reqwest::Url> {
+    // Preserve relevance by reranking a broader page instead of sorting the whole corpus by date.
+    let fetch_limit = if options.prioritize == "default" {
+        options.limit
+    } else {
+        options.limit.saturating_mul(4).max(50)
+    };
+    let mut url = reqwest::Url::parse(&format!("{base}/works"))?;
+    {
+        let mut params = url.query_pairs_mut();
+        params.append_pair("search", query);
+        params.append_pair("per_page", &fetch_limit.clamp(1, 200).to_string());
+        params.append_pair("mailto", mailto);
+        params.append_pair("select", OPENALEX_SELECT);
+
+        let mut filters = Vec::new();
+        if let Some(source) = options.source_filter {
+            filters.push(format!("primary_location.source.id:{source}"));
+        }
+        if let Some(date) = options.published_after {
+            filters.push(format!("from_publication_date:{date}"));
+        }
+        if let Some(date) = options.published_before {
+            filters.push(format!("to_publication_date:{date}"));
+        }
+        if !filters.is_empty() {
+            params.append_pair("filter", &filters.join(","));
+        }
+    }
+    Ok(url)
+}
+
+fn rerank_openalex_works(works: &mut [OpenAlexWork], prioritize: &str) {
+    match prioritize {
+        "recency" => {
+            works.sort_by(|a, b| compare_dates(&a.publication_date, &b.publication_date, true))
+        }
+        "historical" => {
+            works.sort_by(|a, b| compare_dates(&a.publication_date, &b.publication_date, false))
+        }
+        "popular" => works.sort_by(|a, b| {
+            b.cited_by_count
+                .unwrap_or_default()
+                .cmp(&a.cited_by_count.unwrap_or_default())
+        }),
+        _ => {}
+    }
+}
+
+/// Search OpenAlex works, optionally restricted to a source such as bioRxiv.
+pub async fn discover_openalex(
+    query: &str,
+    options: OpenAlexDiscoveryOptions<'_>,
+) -> Result<Vec<LitHit>> {
+    let base = crate::config::openalex_api_url();
+    let url = openalex_discovery_url(&base, query, &crate::config::openalex_mailto(), options)?;
+    let res = public_get(
+        || http().get(url.clone()),
+        "OpenAlex",
+        |e| anyhow!("Could not reach OpenAlex at {}: {}", base, e),
+    )
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "OpenAlex search failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct WorksResponse {
+        #[serde(default)]
+        results: Vec<OpenAlexWork>,
+    }
+    let biorxiv = options.source_filter == Some(BIORXIV_SOURCE_ID);
+    let mut body = res.json::<WorksResponse>().await?;
+    rerank_openalex_works(&mut body.results, options.prioritize);
+    Ok(body
+        .results
+        .into_iter()
+        .take(options.limit as usize)
+        .map(|w| w.into_lit_hit(biorxiv))
+        .collect())
+}
+
+/// The `/works/{id}` selector for a work fetched by id or DOI. A DOI (bare,
+/// `doi:`-prefixed, or a `doi.org` URL) becomes OpenAlex's `doi:<doi>` form
+/// (slashes kept literal); anything else is treated as a bare `W…` work id.
+fn openalex_selector(input: &str) -> String {
+    let bare = strip_doi_prefix(input.trim());
+    if bare.starts_with("10.") {
+        return format!("doi:{}", bare);
+    }
+    strip_openalex_prefix(bare).to_string()
+}
+
+/// Fetch a single OpenAlex work by its `W…` id or a DOI. Returns `Ok(None)` on
+/// 404 (unknown id) — a normal "not found" answer.
+pub async fn fetch_openalex_work(id_or_doi: &str) -> Result<Option<OpenAlexWork>> {
+    let base = crate::config::openalex_api_url();
+    let url = format!(
+        "{}/works/{}?mailto={}",
+        base,
+        openalex_selector(id_or_doi),
+        urlencoding::encode(&crate::config::openalex_mailto()),
+    );
+    let res = public_get(
+        || http().get(&url),
+        "OpenAlex",
+        |e| anyhow!("Could not reach OpenAlex at {}: {}", base, e),
+    )
+    .await?;
+    let status = res.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "OpenAlex lookup failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(Some(res.json::<OpenAlexWork>().await?))
+}
+
+/// One version row from the bioRxiv details API. `authors` is a single
+/// semicolon-delimited string; `published` is the peer-reviewed DOI or the
+/// literal string `"NA"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiorxivDetail {
+    #[serde(default)]
+    pub doi: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub authors: String,
+    #[serde(rename = "abstract", default)]
+    pub abstract_: String,
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub published: String,
+}
+
+/// Fetch a bioRxiv preprint's metadata by DOI (`10.1101/…`). The details
+/// endpoint lists every version oldest→newest; this returns the latest, or
+/// `Ok(None)` when bioRxiv knows no such preprint (200 with an empty collection).
+pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
+    let base = crate::config::biorxiv_api_url();
+    let url = format!("{}/details/biorxiv/{}/na/json", base, doi.trim());
+    let res = public_get(
+        || http().get(&url),
+        "bioRxiv",
+        |e| anyhow!("Could not reach bioRxiv at {}: {}", base, e),
+    )
+    .await?;
+    let status = res.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "bioRxiv lookup failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct DetailsResponse {
+        #[serde(default)]
+        collection: Vec<BiorxivDetail>,
+    }
+    let body = res.json::<DetailsResponse>().await?;
+    Ok(body.collection.into_iter().last())
+}
+
+// ---------------------------------------------------------------------------
+// PubMed via NCBI E-utilities: esearch ranks PMIDs (Best Match), efetch returns
+// the records. efetch serves abstracts only as XML, so records are parsed here.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+pub struct PubmedDiscoveryOptions<'a> {
+    pub limit: u32,
+    pub published_after: Option<&'a str>,
+    pub published_before: Option<&'a str>,
+    pub prioritize: &'a str,
+}
+
+/// One PubMed record, parsed from an efetch `<PubmedArticle>` or `<PubmedBookArticle>`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PubmedArticle {
+    pub pmid: String,
+    pub title: String,
+    pub abstract_: String,
+    pub authors: Vec<String>,
+    /// Journal title, or the book title for a book record.
+    pub journal: String,
+    /// `YYYY[-MM[-DD]]`: the electronic date when present, else the issue date.
+    pub publication_date: Option<String>,
+    pub doi: Option<String>,
+    pub pmcid: Option<String>,
+}
+
+impl PubmedArticle {
+    fn into_lit_hit(self) -> LitHit {
+        LitHit {
+            source: "pubmed".to_string(),
+            id: self.pmid,
+            title: self.title,
+            abstract_: self.abstract_,
+            publication_date: self.publication_date,
+            votes: None,
+            citations: None,
+            snippets: Vec::new(),
+        }
+    }
+}
+
+fn pubmed_discovery_url(
+    base: &str,
+    query: &str,
+    email: &str,
+    options: PubmedDiscoveryOptions<'_>,
+) -> Result<reqwest::Url> {
+    // PubMed has no citation counts, so only date priorities rerank a broader relevance page.
+    let fetch_limit = if matches!(options.prioritize, "recency" | "historical") {
+        options.limit.saturating_mul(4).max(50)
+    } else {
+        options.limit
+    };
+    let mut url = reqwest::Url::parse(&format!("{base}/esearch.fcgi"))?;
+    {
+        let mut params = url.query_pairs_mut();
+        params.append_pair("db", "pubmed");
+        params.append_pair("term", query);
+        params.append_pair("retmode", "json");
+        params.append_pair("retmax", &fetch_limit.clamp(1, 200).to_string());
+        params.append_pair("sort", "relevance");
+        params.append_pair("tool", "orx");
+        params.append_pair("email", email);
+        // E-utilities ignores a date range unless both bounds are set.
+        if options.published_after.is_some() || options.published_before.is_some() {
+            let bound = |date: Option<&str>, fallback: &str| {
+                date.map_or_else(|| fallback.to_string(), |d| d.replace('-', "/"))
+            };
+            params.append_pair("datetype", "pdat");
+            params.append_pair("mindate", &bound(options.published_after, "1000/01/01"));
+            params.append_pair("maxdate", &bound(options.published_before, "3000/12/31"));
+        }
+    }
+    Ok(url)
+}
+
+fn pubmed_fetch_url(base: &str, pmids: &[String], email: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("{base}/efetch.fcgi"))?;
+    url.query_pairs_mut()
+        .append_pair("db", "pubmed")
+        .append_pair("id", &pmids.join(","))
+        .append_pair("retmode", "xml")
+        .append_pair("tool", "orx")
+        .append_pair("email", email);
+    Ok(url)
+}
+
+async fn pubmed_get(base: &str, url: reqwest::Url, action: &str) -> Result<reqwest::Response> {
+    let res = public_get(
+        || http().get(url.clone()),
+        "PubMed",
+        |e| anyhow!("Could not reach PubMed at {}: {}", base, e),
+    )
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "PubMed {} failed ({} {})",
+            action,
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(res)
+}
+
+async fn fetch_pubmed_articles(pmids: &[String]) -> Result<Vec<PubmedArticle>> {
+    let base = crate::config::pubmed_api_url();
+    let url = pubmed_fetch_url(&base, pmids, &crate::config::ncbi_email())?;
+    let xml = pubmed_get(&base, url, "lookup").await?.text().await?;
+    parse_pubmed_articles(&xml)
+}
+
+/// Search PubMed, keeping esearch's relevance order unless a date priority reranks it.
+pub async fn discover_pubmed(
+    query: &str,
+    options: PubmedDiscoveryOptions<'_>,
+) -> Result<Vec<LitHit>> {
+    let base = crate::config::pubmed_api_url();
+    let url = pubmed_discovery_url(&base, query, &crate::config::ncbi_email(), options)?;
+
+    #[derive(Deserialize)]
+    struct SearchResult {
+        #[serde(default)]
+        idlist: Vec<String>,
+        #[serde(rename = "ERROR")]
+        error: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct SearchResponse {
+        esearchresult: SearchResult,
+    }
+    let result = pubmed_get(&base, url, "search")
+        .await?
+        .json::<SearchResponse>()
+        .await?
+        .esearchresult;
+    if let Some(error) = result.error {
+        return Err(anyhow!("PubMed search failed: {error}"));
+    }
+    if result.idlist.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // efetch returns records in the order of the requested ids.
+    let mut articles = fetch_pubmed_articles(&result.idlist).await?;
+    rerank_pubmed_articles(&mut articles, options.prioritize);
+    Ok(articles
+        .into_iter()
+        .take(options.limit as usize)
+        .map(PubmedArticle::into_lit_hit)
+        .collect())
+}
+
+fn rerank_pubmed_articles(articles: &mut [PubmedArticle], prioritize: &str) {
+    match prioritize {
+        "recency" => {
+            articles.sort_by(|a, b| compare_dates(&a.publication_date, &b.publication_date, true))
+        }
+        "historical" => {
+            articles.sort_by(|a, b| compare_dates(&a.publication_date, &b.publication_date, false))
+        }
+        _ => {}
+    }
+}
+
+/// Undated records sort last in either direction.
+fn compare_dates(a: &Option<String>, b: &Option<String>, newest_first: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) if newest_first => b.cmp(a),
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Fetch one PubMed record by PMID. Returns `Ok(None)` when PubMed has no such
+/// record (efetch answers 200 with an empty set).
+pub async fn fetch_pubmed(pmid: &str) -> Result<Option<PubmedArticle>> {
+    Ok(fetch_pubmed_articles(&[pmid.to_string()])
+        .await?
+        .into_iter()
+        .next())
+}
+
+fn xml_child<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
+    node.children().find(|c| c.has_tag_name(name))
+}
+
+fn xml_path<'a, 'i>(
+    node: roxmltree::Node<'a, 'i>,
+    path: &[&str],
+) -> Option<roxmltree::Node<'a, 'i>> {
+    path.iter().try_fold(node, |n, name| xml_child(n, name))
+}
+
+/// All text under a node, so inline markup (`<i>`, `<sup>`) in titles and abstracts is kept as text.
+fn xml_text(node: roxmltree::Node<'_, '_>) -> String {
+    node.descendants()
+        .filter(|n| n.is_text())
+        .filter_map(|n| n.text())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// `<Year>/<Month>/<Day>` → `YYYY[-MM[-DD]]`. Month may be numeric or `Jan`…`Dec`;
+/// an issue date may instead be a free-form `<MedlineDate>` such as `2024 Jan-Feb`.
+fn pubmed_date(node: roxmltree::Node<'_, '_>) -> Option<String> {
+    let year = match xml_child(node, "Year") {
+        Some(y) => xml_text(y),
+        None => xml_text(xml_child(node, "MedlineDate")?)
+            .get(..4)
+            .filter(|y| y.bytes().all(|b| b.is_ascii_digit()))?
+            .to_string(),
+    };
+    let month = xml_child(node, "Month").map(xml_text).and_then(|m| {
+        const MONTHS: [&str; 12] = [
+            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        ];
+        let lower = m.to_ascii_lowercase();
+        match lower.parse::<u32>() {
+            Ok(n) if (1..=12).contains(&n) => Some(n),
+            _ => MONTHS
+                .iter()
+                .position(|name| lower.starts_with(name))
+                .map(|i| i as u32 + 1),
+        }
+    });
+    let day = xml_child(node, "Day").and_then(|d| xml_text(d).parse::<u32>().ok());
+    Some(match (month, day) {
+        (Some(m), Some(d)) => format!("{year}-{m:02}-{d:02}"),
+        (Some(m), None) => format!("{year}-{m:02}"),
+        _ => year,
+    })
+}
+
+/// Labeled sections of a (possibly structured) `<Abstract>` under `parent`.
+fn pubmed_abstract(parent: roxmltree::Node<'_, '_>) -> String {
+    let Some(abs) = xml_child(parent, "Abstract") else {
+        return String::new();
+    };
+    abs.children()
+        .filter(|c| c.has_tag_name("AbstractText"))
+        .map(|section| match section.attribute("Label") {
+            Some(label) if !label.eq_ignore_ascii_case("unlabelled") => {
+                format!("{label}: {}", xml_text(section))
+            }
+            _ => xml_text(section),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Author names under `parent`.
+fn pubmed_authors(parent: roxmltree::Node<'_, '_>) -> Vec<String> {
+    let Some(list) = xml_child(parent, "AuthorList") else {
+        return Vec::new();
+    };
+    list.children()
+        .filter(|c| c.has_tag_name("Author"))
+        .filter_map(|author| {
+            if let Some(collective) = xml_child(author, "CollectiveName") {
+                return Some(xml_text(collective));
+            }
+            let last = xml_text(xml_child(author, "LastName")?);
+            Some(match xml_child(author, "ForeName") {
+                Some(fore) => format!("{} {last}", xml_text(fore)),
+                None => last,
+            })
+        })
+        .collect()
+}
+
+/// An id of `kind` from the record's own id list; each reference in `ReferenceList` carries one too.
+fn pubmed_article_id(data: roxmltree::Node<'_, '_>, kind: &str) -> Option<String> {
+    xml_child(data, "ArticleIdList")?
+        .children()
+        .find(|c| c.has_tag_name("ArticleId") && c.attribute("IdType") == Some(kind))
+        .map(xml_text)
+}
+
+fn parse_pubmed_article(node: roxmltree::Node<'_, '_>) -> Option<PubmedArticle> {
+    let citation = xml_child(node, "MedlineCitation")?;
+    let article = xml_child(citation, "Article")?;
+    let data = xml_child(node, "PubmedData");
+    let doi = data.and_then(|d| pubmed_article_id(d, "doi")).or_else(|| {
+        article
+            .children()
+            .find(|c| c.has_tag_name("ELocationID") && c.attribute("EIdType") == Some("doi"))
+            .map(xml_text)
+    });
+    Some(PubmedArticle {
+        pmid: xml_text(xml_child(citation, "PMID")?),
+        title: xml_child(article, "ArticleTitle")
+            .map(xml_text)
+            .unwrap_or_default(),
+        abstract_: pubmed_abstract(article),
+        authors: pubmed_authors(article),
+        journal: xml_path(article, &["Journal", "Title"])
+            .map(xml_text)
+            .unwrap_or_default(),
+        publication_date: xml_child(article, "ArticleDate")
+            .and_then(pubmed_date)
+            .or_else(|| {
+                xml_path(article, &["Journal", "JournalIssue", "PubDate"]).and_then(pubmed_date)
+            }),
+        doi,
+        pmcid: data.and_then(|d| pubmed_article_id(d, "pmc")),
+    })
+}
+
+/// Book chapters (e.g. StatPearls) come back as `<PubmedBookArticle>` and rank highly for clinical queries.
+fn parse_pubmed_book_article(node: roxmltree::Node<'_, '_>) -> Option<PubmedArticle> {
+    let document = xml_child(node, "BookDocument")?;
+    let book = xml_child(document, "Book");
+    let book_title = book
+        .and_then(|b| xml_child(b, "BookTitle"))
+        .map(xml_text)
+        .unwrap_or_default();
+    Some(PubmedArticle {
+        pmid: xml_text(xml_child(document, "PMID")?),
+        title: xml_child(document, "ArticleTitle")
+            .map(xml_text)
+            .unwrap_or_else(|| book_title.clone()),
+        abstract_: pubmed_abstract(document),
+        authors: pubmed_authors(document),
+        journal: book_title,
+        publication_date: book
+            .and_then(|b| xml_child(b, "PubDate"))
+            .and_then(pubmed_date),
+        doi: xml_child(node, "PubmedBookData").and_then(|d| pubmed_article_id(d, "doi")),
+        pmcid: None,
+    })
+}
+
+fn parse_pubmed_articles(xml: &str) -> Result<Vec<PubmedArticle>> {
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let doc = roxmltree::Document::parse_with_options(xml, options)
+        .map_err(|e| anyhow!("Could not parse the PubMed response: {e}"))?;
+    Ok(doc
+        .root_element()
+        .children()
+        .filter_map(|n| match n.tag_name().name() {
+            "PubmedArticle" => parse_pubmed_article(n),
+            "PubmedBookArticle" => parse_pubmed_book_article(n),
+            _ => None,
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        openalex_discovery_url, openalex_selector, paper_discovery_url, reconstruct_abstract,
+        rerank_openalex_works, LitHit, OpenAlexDiscoveryOptions, OpenAlexWork,
+        PaperDiscoveryOptions, PaperHit, BIORXIV_SOURCE_ID,
+    };
+    use super::{
+        parse_pubmed_articles, public_get, pubmed_discovery_url, pubmed_fetch_url,
+        rerank_pubmed_articles, retry_after_secs, retry_delay, PubmedArticle,
+        PubmedDiscoveryOptions,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn pubmed_discovery_url_fills_the_open_date_bound_and_widens_date_priorities() {
+        let url = pubmed_discovery_url(
+            "https://eutils.example/entrez/eutils",
+            "crispr base editing",
+            "orx@example.com",
+            PubmedDiscoveryOptions {
+                limit: 10,
+                published_after: Some("2024-01-01"),
+                published_before: None,
+                prioritize: "recency",
+            },
+        )
+        .expect("valid PubMed URL");
+        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(url.path(), "/entrez/eutils/esearch.fcgi");
+        assert_eq!(params["term"], "crispr base editing");
+        assert_eq!(params["retmax"], "50");
+        assert_eq!(params["sort"], "relevance");
+        assert_eq!(params["datetype"], "pdat");
+        assert_eq!(params["mindate"], "2024/01/01");
+        assert_eq!(params["maxdate"], "3000/12/31");
+        assert_eq!(params["tool"], "orx");
+        assert_eq!(params["email"], "orx@example.com");
+
+        let url = pubmed_discovery_url(
+            "https://eutils.example",
+            "q",
+            "e",
+            PubmedDiscoveryOptions {
+                limit: 10,
+                published_after: None,
+                published_before: None,
+                prioritize: "popular",
+            },
+        )
+        .unwrap();
+        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["retmax"], "10");
+        assert!(!params.contains_key("mindate"));
+    }
+
+    #[test]
+    fn pubmed_fetch_url_joins_pmids() {
+        let url =
+            pubmed_fetch_url("https://eutils.example", &["1".into(), "2".into()], "e").unwrap();
+        assert_eq!(url.path(), "/efetch.fcgi");
+        assert!(url.query().unwrap().contains("id=1%2C2"));
+    }
+
+    /// Trimmed from a real efetch response: DTD header, inline markup, structured
+    /// abstract, collective author, and a reference whose DOI must be ignored.
+    #[test]
+    fn parses_pubmed_efetch_records() {
+        let xml = r#"<?xml version="1.0" ?>
+<!DOCTYPE PubmedArticleSet PUBLIC "-//NLM//DTD PubMedArticle, 1st January 2025//EN" "https://dtd.nlm.nih.gov/ncbi/pubmed/out/pubmed_250101.dtd">
+<PubmedArticleSet>
+<PubmedArticle><MedlineCitation><PMID Version="1">111</PMID><Article>
+<Journal><JournalIssue><PubDate><Year>2024</Year><Month>Jun</Month></PubDate></JournalIssue><Title>Nature reviews</Title></Journal>
+<ArticleTitle>CRISPR in <i>E. coli</i>.</ArticleTitle>
+<ELocationID EIdType="doi" ValidYN="Y">10.1/eloc</ELocationID>
+<Abstract><AbstractText Label="BACKGROUND">Why.</AbstractText><AbstractText Label="RESULTS">What.</AbstractText></Abstract>
+<AuthorList><Author><LastName>Villiger</LastName><ForeName>Lukas</ForeName></Author><Author><CollectiveName>CRISPR Consortium</CollectiveName></Author></AuthorList>
+<ArticleDate DateType="Electronic"><Year>2024</Year><Month>02</Month><Day>02</Day></ArticleDate>
+</Article></MedlineCitation>
+<PubmedData><ArticleIdList><ArticleId IdType="pubmed">111</ArticleId><ArticleId IdType="doi">10.1/own</ArticleId><ArticleId IdType="pmc">PMC123</ArticleId></ArticleIdList>
+<ReferenceList><Reference><ArticleIdList><ArticleId IdType="doi">10.1/ref</ArticleId></ArticleIdList></Reference></ReferenceList></PubmedData>
+</PubmedArticle>
+<PubmedArticle><MedlineCitation><PMID>222</PMID><Article>
+<Journal><JournalIssue><PubDate><MedlineDate>1998 Jan-Feb</MedlineDate></PubDate></JournalIssue><Title>J</Title></Journal>
+<ArticleTitle>Old</ArticleTitle><ELocationID EIdType="doi">10.1/eloc2</ELocationID>
+<Abstract><AbstractText Label="UNLABELLED">Plain.</AbstractText></Abstract>
+</Article></MedlineCitation><PubmedData><ArticleIdList><ArticleId IdType="pubmed">222</ArticleId></ArticleIdList></PubmedData></PubmedArticle>
+<PubmedBookArticle><BookDocument><PMID Version="1">333</PMID>
+<Book><BookTitle book="statpearls">StatPearls</BookTitle><PubDate><Year>2026</Year><Month>01</Month></PubDate>
+</Book>
+<ArticleTitle>Splenectomy</ArticleTitle>
+<AuthorList Type="authors"><Author><LastName>Menon</LastName><ForeName>Gopal</ForeName></Author></AuthorList>
+<Abstract><AbstractText>Removal of the spleen.</AbstractText><CopyrightInformation>Copyright</CopyrightInformation></Abstract>
+</BookDocument><PubmedBookData><ArticleIdList><ArticleId IdType="pubmed">333</ArticleId></ArticleIdList></PubmedBookData></PubmedBookArticle>
+</PubmedArticleSet>"#;
+        let articles = parse_pubmed_articles(xml).expect("valid PubMed XML");
+        assert_eq!(
+            articles[0],
+            PubmedArticle {
+                pmid: "111".into(),
+                title: "CRISPR in E. coli.".into(),
+                abstract_: "BACKGROUND: Why.\n\nRESULTS: What.".into(),
+                authors: vec!["Lukas Villiger".into(), "CRISPR Consortium".into()],
+                journal: "Nature reviews".into(),
+                publication_date: Some("2024-02-02".into()),
+                doi: Some("10.1/own".into()),
+                pmcid: Some("PMC123".into()),
+            }
+        );
+        assert_eq!(articles[1].publication_date.as_deref(), Some("1998"));
+        assert_eq!(articles[1].doi.as_deref(), Some("10.1/eloc2"));
+        assert_eq!(articles[1].pmcid, None);
+        assert_eq!(articles[1].abstract_, "Plain.");
+        assert_eq!(
+            articles[2],
+            PubmedArticle {
+                pmid: "333".into(),
+                title: "Splenectomy".into(),
+                abstract_: "Removal of the spleen.".into(),
+                authors: vec!["Gopal Menon".into()],
+                journal: "StatPearls".into(),
+                publication_date: Some("2026-01".into()),
+                doi: None,
+                pmcid: None,
+            }
+        );
+
+        let empty = r#"<?xml version="1.0" ?><PubmedArticleSet></PubmedArticleSet>"#;
+        assert!(parse_pubmed_articles(empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retry_delay_prefers_retry_after_over_backoff() {
+        let ms = |retry_after, attempt| retry_delay(retry_after, attempt).as_millis();
+        assert!((2000..2500).contains(&ms(Some(2), 1)));
+        assert!((1000..1500).contains(&ms(None, 1)));
+        assert!((2000..2500).contains(&ms(None, 2)));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_or_an_http_date() {
+        assert_eq!(retry_after_secs(" 30 "), Some(30));
+        assert_eq!(retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"), Some(0));
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        let secs = retry_after_secs(&httpdate::fmt_http_date(later)).unwrap();
+        assert!((118..=120).contains(&secs));
+        assert_eq!(retry_after_secs("soon"), None);
+    }
+
+    #[test]
+    fn reranks_pubmed_by_date_with_undated_last() {
+        let article = |pmid: &str, date: Option<&str>| PubmedArticle {
+            pmid: pmid.into(),
+            publication_date: date.map(Into::into),
+            ..Default::default()
+        };
+        let articles = || {
+            vec![
+                article("a", Some("2020-05")),
+                article("b", None),
+                article("c", Some("2024-01-01")),
+            ]
+        };
+        let order = |a: &[PubmedArticle]| a.iter().map(|a| a.pmid.clone()).collect::<Vec<_>>();
+        let mut recency = articles();
+        rerank_pubmed_articles(&mut recency, "recency");
+        assert_eq!(order(&recency), ["c", "a", "b"]);
+        let mut historical = articles();
+        rerank_pubmed_articles(&mut historical, "historical");
+        assert_eq!(order(&historical), ["a", "c", "b"]);
+        let mut popular = articles();
+        rerank_pubmed_articles(&mut popular, "popular");
+        assert_eq!(order(&popular), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn paper_pdf_url_drops_the_version_and_keeps_legacy_id_slashes() {
+        assert_eq!(
+            super::paper_pdf_url("2401.12345v2"),
+            "https://export.arxiv.org/pdf/2401.12345"
+        );
+        assert_eq!(
+            super::paper_pdf_url("hep-th/9901001"),
+            "https://export.arxiv.org/pdf/hep-th/9901001"
+        );
+    }
+
+    #[test]
+    fn paper_discovery_url_encodes_strategy_and_controls() {
+        let url = paper_discovery_url(
+            "https://api.alphaxiv.org",
+            "keyword",
+            "attention & memory",
+            PaperDiscoveryOptions {
+                published_after: Some("2024-01-01"),
+                published_before: Some("2025-12-31"),
+                prioritize: "historical",
+            },
+        )
+        .expect("valid discovery URL");
+        let params = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(url.path(), "/search/v2/paper/discover/keyword");
+        assert_eq!(
+            params.get("q").map(|value| value.as_ref()),
+            Some("attention & memory")
+        );
+        assert_eq!(
+            params.get("publishedAfter").map(|value| value.as_ref()),
+            Some("2024-01-01")
+        );
+        assert_eq!(
+            params.get("publishedBefore").map(|value| value.as_ref()),
+            Some("2025-12-31")
+        );
+        assert_eq!(
+            params.get("prioritize").map(|value| value.as_ref()),
+            Some("historical")
+        );
+    }
+
+    #[test]
+    fn openalex_discovery_url_encodes_source_dates_and_priority() {
+        let url = openalex_discovery_url(
+            "https://api.openalex.org",
+            "protein folding & agents",
+            "dev@example.org",
+            OpenAlexDiscoveryOptions {
+                limit: 15,
+                published_after: Some("2024-01-01"),
+                published_before: Some("2026-01-31"),
+                prioritize: "popular",
+                source_filter: Some(BIORXIV_SOURCE_ID),
+            },
+        )
+        .expect("valid OpenAlex URL");
+        let params = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            params.get("search").map(|value| value.as_ref()),
+            Some("protein folding & agents")
+        );
+        assert_eq!(
+            params.get("per_page").map(|value| value.as_ref()),
+            Some("60")
+        );
+        assert_eq!(params.get("sort"), None);
+        assert_eq!(
+            params.get("filter").map(|value| value.as_ref()),
+            Some("primary_location.source.id:S4306402567,from_publication_date:2024-01-01,to_publication_date:2026-01-31")
+        );
+    }
+
+    #[test]
+    fn reranks_only_the_relevant_openalex_result_pool() {
+        let json = r#"[
+            {"title":"middle","publication_date":"2020-01-01","cited_by_count":5},
+            {"title":"new","publication_date":"2025-01-01","cited_by_count":1},
+            {"title":"old","publication_date":"2010-01-01","cited_by_count":20},
+            {"title":"unknown","publication_date":null,"cited_by_count":2}
+        ]"#;
+        let works = || serde_json::from_str::<Vec<OpenAlexWork>>(json).expect("valid works");
+
+        let mut recency = works();
+        rerank_openalex_works(&mut recency, "recency");
+        assert_eq!(recency[0].title.as_deref(), Some("new"));
+
+        let mut historical = works();
+        rerank_openalex_works(&mut historical, "historical");
+        assert_eq!(historical[0].title.as_deref(), Some("old"));
+        assert_eq!(historical[3].title.as_deref(), Some("unknown"));
+
+        let mut popular = works();
+        rerank_openalex_works(&mut popular, "popular");
+        assert_eq!(popular[0].title.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn reconstructs_openalex_abstract() {
+        let work: OpenAlexWork = serde_json::from_str(
+            r#"{ "abstract_inverted_index": { "Deep": [0], "learning": [1], "works": [2] } }"#,
+        )
+        .expect("should deserialize");
+        assert_eq!(work.abstract_text(), "Deep learning works");
+        assert_eq!(reconstruct_abstract(&None), "");
+    }
+
+    /// A DOI (bare, `doi:`-prefixed, or a `doi.org` URL) becomes the `doi:` form
+    /// with slashes kept literal; anything else resolves to a bare `W…` work id.
+    #[test]
+    fn openalex_selector_routes_doi_vs_work_id() {
+        assert_eq!(
+            openalex_selector("10.1038/nature14539"),
+            "doi:10.1038/nature14539"
+        );
+        assert_eq!(openalex_selector("doi:10.1038/x"), "doi:10.1038/x");
+        assert_eq!(
+            openalex_selector("https://doi.org/10.1101/2020.09.09.20191205"),
+            "doi:10.1101/2020.09.09.20191205"
+        );
+        assert_eq!(openalex_selector("W2919115771"), "W2919115771");
+        assert_eq!(
+            openalex_selector("https://openalex.org/W2919115771"),
+            "W2919115771"
+        );
+    }
+
+    /// An OpenAlex `/works` row (id + doi as URLs, citations, inverted-index
+    /// abstract, plus unselected extra fields) maps to a `LitHit`: DOI preferred
+    /// as the routing id, `citations` set, `votes`/`snippets` empty.
+    #[test]
+    fn maps_openalex_work_to_lit_hit() {
+        let work: OpenAlexWork = serde_json::from_str(
+            r#"{
+                "id": "https://openalex.org/W2919115771",
+                "doi": "https://doi.org/10.1038/nature14539",
+                "title": "Deep learning",
+                "publication_date": "2015-05-26",
+                "cited_by_count": 82932,
+                "abstract_inverted_index": { "A": [0], "review.": [1] },
+                "authorships": [{ "author": { "display_name": "Yann LeCun" } }],
+                "some_unknown_field": true
+            }"#,
+        )
+        .expect("should deserialize");
+
+        assert_eq!(work.author_names(), vec!["Yann LeCun".to_string()]);
+        assert_eq!(work.work_id().as_deref(), Some("W2919115771"));
+
+        let hit = work.into_lit_hit(false);
+        assert_eq!(hit.source, "openalex");
+        assert_eq!(hit.id, "10.1038/nature14539");
+        assert_eq!(hit.title, "Deep learning");
+        assert_eq!(hit.abstract_, "A review.");
+        assert_eq!(hit.citations, Some(82932));
+        assert_eq!(hit.votes, None);
+        assert!(hit.snippets.is_empty());
+    }
+
+    /// A bioRxiv-filtered OpenAlex hit routes through its `10.1101/…` DOI (so
+    /// `orx paper` hits the richer bioRxiv fetch) and is labeled `biorxiv`.
+    #[test]
+    fn maps_biorxiv_filtered_hit_by_doi() {
+        assert_eq!(BIORXIV_SOURCE_ID, "S4306402567");
+        let work: OpenAlexWork = serde_json::from_str(
+            r#"{
+                "id": "https://openalex.org/W123",
+                "doi": "https://doi.org/10.1101/2020.09.09.20191205",
+                "title": "A preprint",
+                "cited_by_count": 3
+            }"#,
+        )
+        .expect("should deserialize");
+        let hit = work.into_lit_hit(true);
+        assert_eq!(hit.source, "biorxiv");
+        assert_eq!(hit.id, "10.1101/2020.09.09.20191205");
+        assert_eq!(hit.citations, Some(3));
+    }
+
+    /// An alphaXiv `PaperHit` maps to `LitHit` keeping `votes` and `snippets`;
+    /// the JSON stays uniform, omitting the `None`/empty per-source fields.
+    #[test]
+    fn maps_paper_hit_and_serializes_uniform_json() {
+        let ph: PaperHit = serde_json::from_str(
+            r#"{
+                "paperId": "2401.12345",
+                "title": "A paper",
+                "abstract": "Body.",
+                "publicationDate": "2024-01-01T00:00:00Z",
+                "votes": 7,
+                "snippets": [{ "pageNumber": 2, "snippet": "hit" }]
+            }"#,
+        )
+        .expect("should deserialize");
+
+        let hit = LitHit::from(ph);
+        assert_eq!(hit.source, "alphaxiv");
+        assert_eq!(hit.id, "2401.12345");
+        assert_eq!(hit.votes, Some(7));
+        assert_eq!(hit.snippets.len(), 1);
+
+        let value = serde_json::to_value(&hit).unwrap();
+        assert_eq!(value.get("source"), Some(&json!("alphaxiv")));
+        assert_eq!(value.get("votes"), Some(&json!(7)));
+        // Per-source-only fields are omitted when empty.
+        assert!(value.get("citations").is_none());
+
+        let openalex = LitHit {
+            source: "openalex".to_string(),
+            id: "10.1/x".to_string(),
+            title: "T".to_string(),
+            abstract_: String::new(),
+            publication_date: None,
+            votes: None,
+            citations: Some(5),
+            snippets: Vec::new(),
+        };
+        let value = serde_json::to_value(&openalex).unwrap();
+        assert_eq!(value.get("citations"), Some(&json!(5)));
+        assert!(value.get("votes").is_none());
+        assert!(value.get("snippets").is_none());
+    }
+
+    /// The bioRxiv details API wraps versions in a `collection`; we take the last
+    /// (latest) and tolerate the extra top-level `messages` block.
+    #[test]
+    fn parses_biorxiv_latest_version() {
+        #[derive(serde::Deserialize)]
+        struct DetailsResponse {
+            #[serde(default)]
+            collection: Vec<super::BiorxivDetail>,
+        }
+        let body: DetailsResponse = serde_json::from_str(
+            r#"{
+                "messages": [{ "status": "ok" }],
+                "collection": [
+                    { "doi": "10.1101/2020.09.09.20191205", "title": "T", "version": "1",
+                      "authors": "A; B", "abstract": "old", "date": "2020-09-09",
+                      "category": "cell_biology", "published": "NA" },
+                    { "doi": "10.1101/2020.09.09.20191205", "title": "T", "version": "2",
+                      "authors": "A; B", "abstract": "new", "date": "2020-09-15",
+                      "category": "cell_biology", "published": "10.1000/j.x" }
+                ]
+            }"#,
+        )
+        .expect("should deserialize");
+        let latest = body.collection.into_iter().last().expect("has a version");
+        assert_eq!(latest.version, "2");
+        assert_eq!(latest.abstract_, "new");
+        assert_eq!(latest.published, "10.1000/j.x");
+    }
+
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    async fn serve_statuses(
+        responses: &'static [&'static str],
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await.unwrap();
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    async fn loopback_public_get(url: &str) -> anyhow::Result<reqwest::Response> {
+        let client = crate::net::loopback_client().build().unwrap();
+        public_get(|| client.get(url), "Test", |e| anyhow::anyhow!("{e}")).await
+    }
+
+    #[tokio::test]
+    async fn public_get_retries_a_rate_limit_then_succeeds() {
+        let (url, server) = serve_statuses(&[
+            LIMITED,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ])
+        .await;
+        let res = loopback_public_get(&url).await.unwrap();
+        assert_eq!(res.status(), 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_get_gives_up_after_persistent_rate_limits() {
+        let (url, server) = serve_statuses(&[LIMITED, LIMITED, LIMITED]).await;
+        let err = loopback_public_get(&url).await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Test is rate-limiting requests (429 Too Many Requests); wait a minute before retrying"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_get_fails_fast_when_the_wait_is_long() {
+        let (url, server) = serve_statuses(&[
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ])
+        .await;
+        let err = loopback_public_get(&url).await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Test is rate-limiting requests (429 Too Many Requests); retry in 60s"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_error_includes_the_source_chain() {
+        let err = crate::net::loopback_client()
+            .build()
+            .expect("build loopback client")
+            .get("http://127.0.0.1:1/unreachable")
+            .send()
+            .await
+            .expect_err("connection to port 1 must fail");
+
+        let mut cause = std::error::Error::source(&err).expect("transport error has a cause");
+        while let Some(next) = std::error::Error::source(cause) {
+            cause = next;
+        }
+        let deepest_cause = cause.to_string();
+        assert!(!err.to_string().contains(&deepest_cause));
+
+        let rendered = super::transport_error("https://api.example.test", err).to_string();
+
+        assert!(
+            rendered.starts_with("Could not reach https://api.example.test:"),
+            "prefix preserved: {rendered}"
+        );
+        assert!(
+            rendered.contains(&deepest_cause),
+            "deepest cause {deepest_cause:?} missing: {rendered}"
+        );
+    }
+}

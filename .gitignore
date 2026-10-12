@@ -1,0 +1,62 @@
+# Rust build outputs
+/target/
+/windows/launcher/target/
+**/target/
+
+# JavaScript dependencies and generated output
+**/node_modules/
+/dist/
+/app-dist/
+/app-installer/
+/app-staging/
+*.tsbuildinfo
+ui/package-lock.json
+
+# Local environment and credentials
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!.env.template
+!**/.env.example
+!**/.env.template
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+
+# Local data, logs, and caches
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+Claude.local.md
+
+# OS and editor state
+.DS_Store
+Thumbs.db
+desktop.ini
+/.idea/
+/.vscode/
+
+# Local git worktrees and private skills
+.claude/worktrees/
+.claude/skills/
+.agents/skills/
+.cursor/skills/
+
+# Stray SQLite store if the binary is run from the repository root
+/orx.db
+/orx.db-wal
+/orx.db-shm

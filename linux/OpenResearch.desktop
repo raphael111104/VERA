@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=VERA
+Comment=Local-first research workspace with coding agents
+Exec=orx app
+Icon=vera
+Categories=Development;
+Terminal=false
+StartupWMClass=VERA

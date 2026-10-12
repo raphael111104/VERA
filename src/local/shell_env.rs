@@ -1,0 +1,511 @@
+//! The slice of the user's shell environment that a Finder-launched app never
+//! inherits, and everything that has to agree with a terminal `orx`.
+//!
+//! A bundle started by launchd gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no
+//! shell rc sourced, so without this the app finds no `codex` at all and
+//! `claude`/`opencode` only at their installer drop locations, and it resolves
+//! its data and config directories to the defaults while the CLI on the same
+//! machine uses whatever the user exported. Two VERA installs then
+//! disagree about which database they are looking at.
+//!
+//! App mode on macOS and Linux probes the shell once at startup
+//! ([`crate::commands::app`]) and installs the answer here (only PATH if it
+//! arrives after startup has moved on); every other entry point falls through
+//! to the process environment unchanged. The Linux AppImage also hands host
+//! programs the session's GTK settings ([`host_gui_env`]).
+//!
+//! Scope is orx's own resolution, the children it spawns (including `git`), and
+//! the dashboard's PTY terminals. `kubectl` and `ssh` still inherit the process
+//! environment.
+
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Deliberately short. These are the variables whose divergence makes the app
+/// and the CLI behave like different installs; credentials reach harness
+/// children through `chat::prepare_env` instead.
+pub const IMPORTED: [&str; 11] = [
+    "PATH",
+    "ORX_DATA_DIR",
+    "ORX_CACHE_DIR",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "OPENCODE_DB",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CODEX_HOME",
+    "CURSOR_CONFIG_DIR",
+    "CURSOR_DATA_DIR",
+];
+
+static OVERRIDE: OnceLock<HashMap<&'static str, OsString>> = OnceLock::new();
+
+/// Like `env::var_os`, but preferring what the user's shell reported.
+pub fn var(key: &str) -> Option<OsString> {
+    OVERRIDE
+        .get()
+        .and_then(|vars| vars.get(key).cloned())
+        .or_else(|| std::env::var_os(key))
+}
+
+/// The PATH to search for the binaries orx spawns, and to hand its children.
+#[cfg(not(windows))]
+pub fn search_path() -> Option<OsString> {
+    var("PATH")
+}
+
+/// The PATH to search, extended by the registry's current PATH so a tool installed
+/// while orx runs is found without a restart, then by the Git orx installs.
+#[cfg(windows)]
+pub fn search_path() -> Option<OsString> {
+    let base = var("PATH");
+    let mut path = base.clone().unwrap_or_default();
+    let mut seen: Vec<String> = std::env::split_paths(&path)
+        .map(|dir| path_key(&dir))
+        .collect();
+    let added = registry_path()
+        .into_iter()
+        .chain(super::portable_git::cmd_dir())
+        .filter(|dir| dir.is_absolute());
+    for dir in added {
+        let key = path_key(&dir);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if !path.is_empty() {
+            path.push(PATH_LIST_SEPARATOR);
+        }
+        path.push(dir);
+    }
+    (base.is_some() || !path.is_empty()).then_some(path)
+}
+
+/// Windows paths compare case-insensitively, with or without a trailing separator.
+#[cfg(windows)]
+fn path_key(dir: &std::path::Path) -> String {
+    dir.to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase()
+}
+
+/// The machine then user `Path`, as a new process would compose them, expanded.
+#[cfg(windows)]
+fn registry_path() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+    fn read(root: HKEY, key: &str) -> Option<OsString> {
+        let (key, value) = (wide(key), wide("Path"));
+        let mut buffer = vec![0u16; 4096];
+        // Expansion can outgrow the size a first call reports, so retry on ERROR_MORE_DATA.
+        for _ in 0..3 {
+            let mut bytes = u32::try_from(buffer.len() * 2).ok()?;
+            // SAFETY: both names are NUL-terminated and `bytes` is the buffer's size.
+            let status = unsafe {
+                RegGetValueW(
+                    root,
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    // Expanding (no RRF_NOEXPAND) returns REG_EXPAND_SZ as REG_SZ;
+                    // naming RRF_RT_REG_EXPAND_SZ here fails with ERROR_INVALID_PARAMETER.
+                    RRF_RT_REG_SZ,
+                    std::ptr::null_mut(),
+                    buffer.as_mut_ptr().cast(),
+                    &mut bytes,
+                )
+            };
+            match status {
+                ERROR_SUCCESS => {
+                    buffer.truncate(bytes as usize / 2);
+                    return Some(OsString::from_wide(until_nul(&buffer)));
+                }
+                ERROR_MORE_DATA => buffer.resize((bytes as usize).div_ceil(2) + 1, 0),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    [
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+        (HKEY_CURRENT_USER, "Environment"),
+    ]
+    .into_iter()
+    .filter_map(|(root, key)| read(root, key))
+    .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+    .collect()
+}
+
+/// The string before its terminator. An expanded value's reported size can run
+/// past it, and a NUL left in PATH makes every spawn fail ("nul byte found").
+#[cfg(any(windows, test))]
+fn until_nul(wide: &[u16]) -> &[u16] {
+    wide.iter()
+        .position(|&unit| unit == 0)
+        .map_or(wide, |end| &wide[..end])
+}
+
+/// What separates PATH entries when composing one for a child.
+#[cfg(not(windows))]
+pub const PATH_LIST_SEPARATOR: &str = ":";
+#[cfg(windows)]
+pub const PATH_LIST_SEPARATOR: &str = ";";
+
+/// Where `binary` lives, or None when this machine has no such tool. The path
+/// is returned as it sits on PATH; a caller that needs the real binary behind a
+/// symlink composes with `resolve_symlinks`.
+pub fn find_on_path(binary: &str) -> Option<PathBuf> {
+    search_in(&search_path()?, binary)
+}
+
+/// Like `find_on_path`, but on this process's PATH, which a bare `Command::new(binary)` searches.
+pub fn find_on_process_path(binary: &str) -> Option<PathBuf> {
+    search_from(
+        &std::env::var_os("PATH")?,
+        &std::env::current_dir().ok()?,
+        binary,
+    )
+}
+
+/// `search_in`, but with relative entries resolved against `cwd` as a bare command name would be.
+fn search_from(paths: &OsStr, cwd: &Path, binary: &str) -> Option<PathBuf> {
+    let dirs = std::env::split_paths(paths).map(|dir| cwd.join(dir));
+    search_in(&std::env::join_paths(dirs).ok()?, binary)
+}
+
+/// Where `binary` lives inside `dir`, trying the PATHEXT spellings a bare name lacks on Windows.
+pub fn find_in_dir(dir: &std::path::Path, binary: &str) -> Option<PathBuf> {
+    candidate_names(binary)
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Split from the PATH lookup so the search is testable without a probe.
+fn search_in(paths: &OsStr, binary: &str) -> Option<PathBuf> {
+    // A relative entry (`""`, meaning cwd, or `bin`) names no fixed directory —
+    // it resolves against whichever cwd is current, so it is never a place to
+    // pick up a binary.
+    std::env::split_paths(paths)
+        .filter(|dir| dir.is_absolute())
+        .flat_map(|dir| {
+            candidate_names(binary)
+                .into_iter()
+                .map(move |name| dir.join(name))
+        })
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Like execvp, pass over a non-executable file so a working binary later on PATH wins.
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+/// The filenames `binary` may have inside one PATH directory, in the order to
+/// try them.
+#[cfg(not(windows))]
+fn candidate_names(binary: &str) -> Vec<String> {
+    vec![binary.to_string()]
+}
+
+/// Windows executables carry a PATHEXT extension and npm CLIs ship `.cmd` shims, so try those.
+#[cfg(windows)]
+fn candidate_names(binary: &str) -> Vec<String> {
+    // Already extended (`bash.exe`): taken as written, the way cmd.exe does.
+    if std::path::Path::new(binary).extension().is_some() {
+        return vec![binary.to_string()];
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    let names: Vec<String> = pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| ext.starts_with('.'))
+        .map(|ext| format!("{binary}{}", ext.to_ascii_lowercase()))
+        .collect();
+    if names.is_empty() {
+        return [".com", ".exe", ".bat", ".cmd"]
+            .iter()
+            .map(|ext| format!("{binary}{ext}"))
+            .collect();
+    }
+    names
+}
+
+/// Hand the imported variables to a child process. Every `orx` child re-resolves
+/// its directories from its own environment and only app mode ever probes, so
+/// without this a supervisor spawned by the app would write to the default
+/// store while the app read the user's. PATH is excluded — callers set it
+/// themselves, some of them prepending this binary's own directory first.
+pub fn export_to(mut set: impl FnMut(&'static str, &OsString)) {
+    let Some(vars) = OVERRIDE.get() else {
+        return;
+    };
+    // In `IMPORTED` order: the adopted set is logged at startup, and a stable
+    // order keeps that line diffable across launches.
+    for key in IMPORTED.iter().filter(|key| **key != "PATH") {
+        if let Some(value) = vars.get(key) {
+            set(key, value);
+        }
+    }
+}
+
+/// What the Linux AppImage's AppRun and GTK hook point at the image (keep in step
+/// with linux/AppRun, which saves the session's values as `ORX_HOST_<name>`).
+const APPIMAGE_GTK_VARS: [&str; 12] = [
+    "GDK_BACKEND",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GI_TYPELIB_PATH",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GSETTINGS_SCHEMA_DIR",
+    "GTK_DATA_PREFIX",
+    "GTK_EXE_PREFIX",
+    "GTK_IM_MODULE_FILE",
+    "GTK_PATH",
+    "GTK_THEME",
+    "XDG_DATA_DIRS",
+];
+
+/// The session's own values (`None`: unset) of what AppRun set for the bundled GTK,
+/// for host programs, which fail on the image's schemas. Empty outside the AppImage.
+pub fn host_gui_env() -> Vec<(&'static str, Option<OsString>)> {
+    APPIMAGE_GTK_VARS
+        .iter()
+        .filter_map(|var| {
+            let saved = std::env::var_os(format!("ORX_HOST_{var}"))?;
+            let saved = saved.to_str()?;
+            // AppRun writes `=<value>` for a set variable and `-` for an unset one.
+            Some((*var, saved.strip_prefix('=').map(OsString::from)))
+        })
+        .collect()
+}
+
+/// [`host_gui_env`], applied to a command about to start a host program.
+pub fn restore_host_gui_env(command: &mut std::process::Command) {
+    for (var, value) in host_gui_env() {
+        match value {
+            Some(value) => command.env(var, value),
+            None => command.env_remove(var),
+        };
+    }
+}
+
+/// Install the probe's answer; the first call wins. Deliberately not
+/// `env::set_var` — app mode enters inside an already-running tokio runtime,
+/// where mutating the process environment races every live thread.
+#[cfg(all(desktop_app, unix))]
+pub fn set(vars: HashMap<&'static str, OsString>) {
+    let _ = OVERRIDE.set(vars);
+}
+
+/// Parse the probe's stdout: [`IMPORTED`]'s values in order, NUL-separated,
+/// fenced between two `marker`s.
+///
+/// Requiring PATH to hold an absolute directory is what rejects a garbage or
+/// empty capture — including the literal `%s` left behind if the fence ever
+/// wraps the `printf` template rather than its output. Empty values mean the
+/// variable was unset in the shell and are dropped, so lookups fall through to
+/// the process environment.
+pub fn parse_probe(stdout: &str, marker: &str) -> Option<HashMap<&'static str, OsString>> {
+    let mut fences = stdout.split(marker);
+    // `split` always yields a first element; the *third* is what proves the
+    // closing fence arrived rather than the probe being cut short.
+    let payload = fences.nth(1)?;
+    fences.next()?;
+
+    let vars: HashMap<&'static str, OsString> = IMPORTED
+        .iter()
+        .zip(payload.split('\0'))
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (*key, OsString::from(value)))
+        .collect();
+    let path = vars.get("PATH")?;
+    std::env::split_paths(path)
+        .any(|dir| dir.is_absolute())
+        .then_some(vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn process_path_search_resolves_relative_entries_against_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = crate::local::git::TemporaryDirectory::new("orx-path").unwrap();
+        std::fs::create_dir(cwd.path().join("bin")).unwrap();
+        let wrapper = cwd.path().join("bin").join("orx-test-tool");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            search_from(OsStr::new("bin:/usr/bin"), cwd.path(), "orx-test-tool"),
+            Some(wrapper)
+        );
+        assert_eq!(search_in(OsStr::new("bin:/usr/bin"), "orx-test-tool"), None);
+    }
+
+    #[test]
+    fn a_registry_value_ends_at_its_first_nul() {
+        let wide: Vec<u16> = "C:\\bin\0stale\0\0".encode_utf16().collect();
+        assert_eq!(
+            until_nul(&wide),
+            "C:\\bin".encode_utf16().collect::<Vec<_>>()
+        );
+        let bare: Vec<u16> = "C:\\bin".encode_utf16().collect();
+        assert_eq!(until_nul(&bare), bare.as_slice());
+    }
+
+    const M: &str = "__ORX_ENV_abc123__";
+
+    /// `parse_probe` insists on one absolute PATH entry, and what counts as
+    /// absolute differs by platform.
+    #[cfg(windows)]
+    const PATH_VALUE: &str = r"C:\tools\bin;C:\Windows";
+    #[cfg(not(windows))]
+    const PATH_VALUE: &str = "/opt/homebrew/bin:/usr/bin";
+
+    fn fenced(payload: &str) -> String {
+        format!("nvm loaded\n{M}{payload}{M}")
+    }
+
+    /// What a bare `tool` is actually called on disk on each platform.
+    #[cfg(windows)]
+    const TOOL: &str = "tool.exe";
+    #[cfg(not(windows))]
+    const TOOL: &str = "tool";
+
+    #[test]
+    fn the_search_skips_relative_entries_and_takes_the_first_absolute_hit() {
+        let root = std::env::temp_dir().join(format!("orx-path-search-{}", std::process::id()));
+        let (early, late) = (root.join("early"), root.join("late"));
+        std::fs::create_dir_all(&early).expect("early");
+        std::fs::create_dir_all(&late).expect("late");
+        std::fs::write(early.join(TOOL), "").expect("early tool");
+        std::fs::write(late.join(TOOL), "").expect("late tool");
+        #[cfg(unix)]
+        for dir in [&early, &late] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join(TOOL), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let paths = std::env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("bin"),
+            early.clone(),
+            late.clone(),
+        ])
+        .expect("join");
+        assert_eq!(search_in(&paths, "tool"), Some(early.join(TOOL)));
+        assert_eq!(search_in(&paths, "absent"), None);
+
+        // A relative entry is rejected even when it does resolve: cargo runs
+        // tests from the package root, so `src/main.rs` is a real hit here.
+        let relative = std::env::join_paths([PathBuf::from("src")]).expect("join");
+        assert_eq!(search_in(&relative, "main.rs"), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(early.join(TOOL), std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert_eq!(search_in(&paths, "tool"), Some(late.join(TOOL)));
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The harnesses are all looked up by bare name, so an extensionless search
+    /// on Windows reports every one of them missing.
+    #[cfg(windows)]
+    #[test]
+    fn the_search_extends_a_bare_name_and_prefers_the_earlier_path_entry() {
+        let root = std::env::temp_dir().join(format!("orx-path-ext-{}", std::process::id()));
+        let (early, late) = (root.join("early"), root.join("late"));
+        std::fs::create_dir_all(&early).expect("early");
+        std::fs::create_dir_all(&late).expect("late");
+        // Only the later directory holds the `.exe`; the earlier one holds a
+        // `.cmd` shim, which PATHEXT orders after it.
+        std::fs::write(early.join("claude.cmd"), "").expect("shim");
+        std::fs::write(late.join("claude.exe"), "").expect("exe");
+
+        let paths = std::env::join_paths([early.clone(), late.clone()]).expect("join");
+        assert_eq!(search_in(&paths, "claude"), Some(early.join("claude.cmd")));
+        // An extension already on the name is taken as written, so the `.cmd`
+        // sitting earlier on PATH is not a candidate at all.
+        assert_eq!(
+            search_in(&paths, "claude.exe"),
+            Some(late.join("claude.exe"))
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reads_every_imported_variable() {
+        let vars = parse_probe(
+            &fenced(&format!(
+                "{PATH_VALUE}\0/data\0/cache\0/share\0/config\0/open.db\0/claude\0/secure\0/codex\0"
+            )),
+            M,
+        )
+        .unwrap();
+        assert_eq!(vars["PATH"], OsString::from(PATH_VALUE));
+        assert_eq!(vars["ORX_DATA_DIR"], OsString::from("/data"));
+        assert_eq!(vars["ORX_CACHE_DIR"], OsString::from("/cache"));
+        assert_eq!(vars["XDG_DATA_HOME"], OsString::from("/share"));
+        assert_eq!(vars["XDG_CONFIG_HOME"], OsString::from("/config"));
+        assert_eq!(vars["OPENCODE_DB"], OsString::from("/open.db"));
+        assert_eq!(vars["CLAUDE_CONFIG_DIR"], OsString::from("/claude"));
+        assert_eq!(
+            vars["CLAUDE_SECURESTORAGE_CONFIG_DIR"],
+            OsString::from("/secure")
+        );
+        assert_eq!(vars["CODEX_HOME"], OsString::from("/codex"));
+    }
+
+    #[test]
+    fn unset_variables_are_dropped_so_lookups_fall_through() {
+        let vars = parse_probe(&fenced(&format!("{PATH_VALUE}\0\0\0\0\0\0\0\0\0")), M).unwrap();
+        assert_eq!(vars["PATH"], OsString::from(PATH_VALUE));
+        assert!(!vars.contains_key("ORX_DATA_DIR"));
+        assert!(!vars.contains_key("OPENCODE_DB"));
+        assert!(!vars.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!vars.contains_key("CODEX_HOME"));
+        assert_eq!(vars.len(), 1);
+    }
+
+    #[test]
+    fn rejects_truncated_empty_or_pathless_output() {
+        assert!(parse_probe("", M).is_none());
+        assert!(parse_probe(&format!("{M}/usr/bin\0"), M).is_none());
+        assert!(parse_probe(&fenced("\0/data\0\0\0"), M).is_none());
+    }
+
+    #[test]
+    fn rejects_a_fence_wrapping_the_template_instead_of_its_output() {
+        let stdout = format!(r#"+ /bin/sh -c printf "{M}%s\0{M}" "$PATH""#);
+        assert!(parse_probe(&stdout, M).is_none());
+    }
+}

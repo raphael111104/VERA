@@ -1,0 +1,6 @@
+- name: Mark official release build
+  if: needs.plan.outputs.publishing == 'true'
+  shell: bash
+  run: |
+    echo "VERA_OFFICIAL_RELEASE_BUILD=1" >> "$GITHUB_ENV"
+    echo "VERA_RELEASE_REPOSITORY=https://github.com/${GITHUB_REPOSITORY}" >> "$GITHUB_ENV"

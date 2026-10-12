@@ -1,0 +1,544 @@
+//! Local implementations of project, experiment, run, and log commands.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use super::{CreateExperimentSpec, DescInput, ProjectEdit, Run, RunListing};
+use crate::error::{anyhow, Result};
+use crate::local::model::{LocalExperiment, LocalProject};
+use crate::store::Store;
+use crate::ExpRunArgs;
+
+/// The local-store plane. `project`/`experiment` carry the row the resolver
+/// already fetched (present for project-/experiment-keyed commands); `id` is the
+/// resolved project/experiment/run id for the run-keyed and re-lookup paths.
+pub struct LocalPlane {
+    pub(super) store: Store,
+    pub(super) project: Option<LocalProject>,
+    pub(super) experiment: Option<LocalExperiment>,
+    pub(super) id: String,
+}
+
+impl LocalPlane {
+    /// The resolved project row, or an error when called on a plane built by a
+    /// different keyed resolver.
+    fn project(&self) -> Result<&LocalProject> {
+        self.project
+            .as_ref()
+            .ok_or_else(|| anyhow!("internal: local plane missing its project row"))
+    }
+
+    /// The resolved experiment row, analogous to `project`.
+    fn experiment(&self) -> Result<&LocalExperiment> {
+        self.experiment
+            .as_ref()
+            .ok_or_else(|| anyhow!("internal: local plane missing its experiment row"))
+    }
+
+    /// Demo analytics label for a launch, keyed on the experiment's owning project.
+    pub(super) fn demo_run_label(&self) -> Option<&'static str> {
+        self.experiment
+            .as_ref()
+            .and_then(crate::local::demo::run_label)
+    }
+
+    pub async fn list_runs(&self) -> Result<RunListing> {
+        let store = &self.store;
+        let project_id = &self.id;
+        let titles: HashMap<String, String> = store
+            .list_experiments_by_project(project_id)?
+            .into_iter()
+            .map(|e| (e.id.clone(), e.display_name().to_string()))
+            .collect();
+
+        let runs = store.list_runs_by_project(project_id)?;
+        let runs: Vec<Run> = runs.iter().map(Run::from).collect();
+        Ok(RunListing { runs, titles })
+    }
+
+    pub async fn view_project(&self, all: bool) -> Result<()> {
+        let store = &self.store;
+        let project = self.project()?;
+        println!("{} (local)", project.name);
+        println!("  id:      {}", project.id);
+        println!("  repo:    {}", project.repo_path);
+        println!("  branch:  {} (baseline)", project.baseline_branch);
+        match project
+            .run_command
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+        {
+            Some(cmd) => println!("  command: {}", cmd),
+            None => println!(
+                "  command: — (not set — `orx project edit {} --run-command '<cmd>'`)",
+                project.id
+            ),
+        }
+
+        let experiments: Vec<_> = store
+            .list_experiments_by_project(&project.id)?
+            .into_iter()
+            .filter(|e| all || !e.archived)
+            .collect();
+        println!("\nExperiments");
+        if experiments.is_empty() {
+            println!("  (none)");
+        } else {
+            for e in &experiments {
+                let root = if e.parent_experiment_id.is_none() {
+                    " [root]"
+                } else {
+                    ""
+                };
+                println!(
+                    "  {}  {}{}{}  ({})",
+                    e.id,
+                    e.display_name(),
+                    root,
+                    if e.archived { " [archived]" } else { "" },
+                    e.branch_name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn edit_project(&self, edit: ProjectEdit) -> Result<()> {
+        let mut project = self.project()?.clone();
+        let name = edit.name;
+        let run_command = edit.run_command;
+        if name.is_none() && run_command.is_none() {
+            return Err(anyhow!(
+                "Nothing to change. Pass at least one of --name or --run-command."
+            ));
+        }
+        if let Some(name) = name {
+            if name.trim().is_empty() {
+                return Err(anyhow!("--name cannot be empty."));
+            }
+            project.name = name.trim().to_string();
+        }
+        if let Some(cmd) = run_command {
+            project.run_command = Some(cmd).filter(|c| !c.trim().is_empty());
+        }
+        self.store.update_local_project(&project)?;
+
+        println!("\u{2713} Project updated.");
+        println!("  id:      {}", project.id);
+        println!("  name:    {}", project.name);
+        match project.run_command.as_deref() {
+            Some(cmd) => println!("  command: {}", cmd),
+            None => println!("  command: — (empty)"),
+        }
+        Ok(())
+    }
+
+    // --- experiment -------------------------------------------------------
+
+    pub async fn experiment_status(&self, scheduler: bool) -> Result<()> {
+        let store = &self.store;
+        let exp = self.experiment()?;
+        println!("{}  ({})  [local]", exp.display_name(), exp.agent_status);
+        println!("  id:       {}", exp.id);
+        println!("  branch:   {}", exp.branch_name);
+        if exp.archived {
+            println!("  archived: yes");
+        }
+        match &exp.parent_experiment_id {
+            Some(parent_id) => match store.get_local_experiment(parent_id)? {
+                Some(parent) => {
+                    println!("  parent:   {} (branch {})", parent_id, parent.branch_name)
+                }
+                None => println!("  parent:   {}", parent_id),
+            },
+            None => println!("  parent:   — (root experiment)"),
+        }
+        let project = store.get_local_project(&exp.project_id)?;
+        let project_command = project.as_ref().and_then(|p| p.run_command.as_deref());
+        match crate::local::experiments::effective_run_command(exp, project_command) {
+            Some(cmd) if !exp.run_command.trim().is_empty() => println!("  command:  {cmd}"),
+            Some(cmd) => println!("  command:  {cmd} (project default)"),
+            None => println!(
+                "  command:  — (not set — `orx project edit {} --run-command '<cmd>'`)",
+                exp.project_id
+            ),
+        }
+
+        match store.latest_run_for_experiment(&exp.id)? {
+            Some(r) => {
+                let run = Run::from(&r);
+                let commit = run
+                    .commit_sha
+                    .as_deref()
+                    .map(|s| s.chars().take(7).collect::<String>())
+                    .unwrap_or_else(|| "—".to_string());
+                println!(
+                    "  last run: {} ({}, commit {}, ran {}, updated {})",
+                    run.id,
+                    run.status,
+                    commit,
+                    crate::output::format_duration(run.duration_secs),
+                    run.updated_display
+                );
+                if let Ok(backend) = crate::jobs::BackendDescriptor::parse(&r.backend_json) {
+                    if backend.kind == "slurm_job" {
+                        println!(
+                            "  requested time limit: {}",
+                            backend
+                                .timeout_secs
+                                .map(|s| format!("{s}s"))
+                                .unwrap_or_else(|| "unknown (older run or cluster default)".into())
+                        );
+                        if let Some(error) = backend.monitoring_error.as_deref() {
+                            println!("  {error}");
+                        }
+                        if scheduler {
+                            match backend.slurm_ref() {
+                                Ok((host, job_id)) => match tokio::time::timeout(
+                                    std::time::Duration::from_secs(15),
+                                    crate::jobs::slurm::diagnostics(host, job_id),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(details)) => println!("  scheduler: {details}"),
+                                    Ok(Err(error)) => println!("  scheduler: unknown ({error})"),
+                                    Err(_) => println!("  scheduler: unknown (query timed out)"),
+                                },
+                                Err(_) => println!("  scheduler: unknown (job not submitted)"),
+                            }
+                        }
+                    }
+                }
+                if let Some(detail) = run.failure_detail() {
+                    println!("  {detail}");
+                }
+                if let Some(sha) = &run.commit_sha {
+                    println!("  commit:   {}", sha);
+                }
+            }
+            None => println!("  last run: — (never run)"),
+        }
+        // A forced relaunch can leave an older run live; monitoring alerts send agents here.
+        for older in store.list_runs_by_experiment(&exp.id)?.iter().skip(1) {
+            if !matches!(older.status.as_str(), "starting" | "running") {
+                continue;
+            }
+            let error = crate::jobs::BackendDescriptor::parse(&older.backend_json)
+                .ok()
+                .and_then(|backend| backend.monitoring_error);
+            if let Some(error) = error {
+                println!("  older live run {}: {error}", older.id);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn experiment_desc(&self, set: Option<String>, stdin: bool) -> Result<()> {
+        let input = DescInput::resolve(set, stdin).await?;
+        let mut exp = self.experiment()?.clone();
+        match input {
+            DescInput::Set(description) => {
+                exp.description = Some(description);
+                self.store.update_local_experiment(&exp)?;
+                println!("\u{2713} Description saved.");
+            }
+            DescInput::Get => match exp.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                Some(d) => println!("{d}"),
+                None => eprintln!(
+                    "No description set. Add one with `orx exp desc {} --set \"…\"` \
+                     or pipe a file: `cat notes.md | orx exp desc {} --stdin`.",
+                    exp.id, exp.id
+                ),
+            },
+        }
+        Ok(())
+    }
+
+    pub async fn launch(&self, mut args: ExpRunArgs) -> Result<()> {
+        // Fill backend/flavor from the persisted default
+        // BEFORE the flag validations below, so e.g. `--host box1` with a default
+        // of `ssh` is a valid launch, and before `backend_label` is captured, so
+        // telemetry records the resolved backend.
+        crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
+        if args.backend.is_none() {
+            args.backend = Some("local".to_string());
+        }
+        crate::compute::validate_run_args(&args)?;
+        args.agent_origin = crate::agent_origin();
+        // Coarse backend label for analytics; the backend name is already an
+        // enum, never user data. Recorded before the (borrowing) dispatch below.
+        let backend_label = args.backend.clone();
+        let result = match crate::local::chat::trusted_up_port()? {
+            Some(port) => {
+                let summary = crate::commands::up::submit_run_via_up(port, &args).await?;
+                let backend = args.backend.as_deref().unwrap_or("local");
+                println!("\u{2713} {backend} run submitted by orx up.");
+                if let Some(job_id) = summary.job_id {
+                    let label = if backend == "local" { "dir" } else { "job" };
+                    println!("  {label}  {job_id}");
+                }
+                println!("  run  {}", summary.run_id);
+                println!(
+                    "{}",
+                    crate::invocation::follow_up(&summary.experiment_id, &summary.run_id)
+                );
+                Ok(())
+            }
+            None => match args.backend.as_deref() {
+                Some("hf") => crate::local::hf::launch_local_hf(&args).await,
+                Some("modal") => crate::local::modal::launch_local_modal(&args).await,
+                Some("k8s") => crate::local::k8s::launch_local_k8s(&args).await,
+                Some("ssh") => crate::local::ssh::launch_local_ssh(&args).await,
+                Some("slurm") => crate::local::slurm::launch_local_slurm(&args).await,
+                Some("ray") => crate::local::ray::launch_local_ray(&args).await,
+                Some("tinker" | "local") => crate::local::localrun::launch_local_run(&args).await,
+                Some(other) => Err(anyhow!(
+                    "Unknown --backend '{}'. Local experiments support: hf (Hugging Face Jobs), \
+                     modal (Modal serverless GPUs), k8s (your Kubernetes cluster), ssh (your own box), \
+                     slurm (your Slurm cluster), ray (a Ray Jobs cluster), \
+                     tinker (local controller with remote model compute), \
+                     local (this machine).",
+                    other
+                )),
+                None => Err(anyhow!(
+                    "No --backend given and no default compute target is set. \
+                     Configure a default compute target in VERA Settings, \
+                     or pass one per launch: \
+                     `--backend hf --flavor <flavor>` (e.g. --flavor a10g-small), \
+                     `--backend modal --flavor <flavor>` (e.g. --flavor a10g), \
+                     `--backend k8s` (runs the manifest committed on the branch — \
+                     default .orx/k8s.yaml, or --manifest <path>), \
+                     `--backend ssh --host <alias>` (an ~/.ssh/config alias), \
+                     `--backend slurm [--host <alias>] [--flavor h100:2]` (your Slurm cluster), \
+                     `--backend ray [--flavor gpu:1]` (a Ray Jobs cluster), \
+                     `--backend tinker` (a local controller using remote Tinker model compute), \
+                     or `--backend local` (a detached process on this machine)."
+                )),
+            },
+        };
+        // Key event, fired only on a successful launch. Coarse backend only.
+        // Validation above guarantees a known backend before either dispatch path.
+        if result.is_ok() {
+            let target = backend_label.as_deref().unwrap_or("unknown");
+            crate::telemetry::capture_experiment_started("run", true, Some(target));
+            // A launch out of the bundled demo is the clearest signal the demo
+            // converted into real work, so it is counted separately.
+            if let Some(label) = self.demo_run_label() {
+                crate::telemetry::capture_demo_experiment_started("run", label);
+                crate::telemetry::capture_first_action("demo", "run_experiment");
+            }
+        }
+        result
+    }
+
+    pub async fn cancel(&self) -> Result<()> {
+        let store = &self.store;
+        let exp = self.experiment()?;
+        let in_flight: Vec<_> = store
+            .list_runs_by_experiment(&exp.id)?
+            .into_iter()
+            .filter(|r| !crate::local::is_terminal(&r.status))
+            .collect();
+        if in_flight.is_empty() {
+            return Err(anyhow!("No run in flight for this experiment."));
+        }
+        let trusted_port = crate::local::chat::trusted_up_port()?;
+        for r in &in_flight {
+            match trusted_port {
+                Some(port) => crate::commands::up::cancel_run_via_up(port, &r.id).await?,
+                None => crate::commands::exp::request_local_run_cancel(store, &r.id)?,
+            }
+            println!("\u{2713} Cancel requested for run {}.", r.id);
+        }
+        Ok(())
+    }
+
+    pub async fn wait_experiment(&self, interval: Duration, deadline: Instant) -> Result<()> {
+        let store = &self.store;
+        let exp_id = &self.id;
+        let mut last_status: Option<String> = None;
+        loop {
+            match store.latest_run_for_experiment(exp_id)? {
+                None => {
+                    if last_status.is_none() {
+                        eprintln!("No run yet for this experiment — waiting for one to start…");
+                        last_status = Some(String::new());
+                    }
+                }
+                Some(r) => {
+                    if last_status.as_deref() != Some(r.status.as_str()) {
+                        eprintln!("{}  {}", r.id, r.status);
+                        last_status = Some(r.status.clone());
+                    }
+                    if crate::local::is_terminal(&r.status) {
+                        let run = Run::from(&r);
+                        println!("{} {}", run.id, run.status);
+                        if let Some(detail) = run.failure_detail() {
+                            eprintln!("{detail}");
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            sleep_until_or_timeout(interval, deadline).await?;
+        }
+    }
+
+    pub async fn wait_project(&self, interval: Duration, deadline: Instant) -> Result<()> {
+        let store = &self.store;
+        let project_id = &self.id;
+        let snapshot: HashMap<String, String> = store
+            .list_runs_by_project(project_id)?
+            .into_iter()
+            .map(|r| (r.id, r.status))
+            .collect();
+        let in_flight = snapshot
+            .values()
+            .filter(|s| !crate::local::is_terminal(s))
+            .count();
+
+        if in_flight == 0 {
+            eprintln!(
+                "No runs in flight in this project ({} run(s), all terminal).",
+                snapshot.len()
+            );
+            println!("drained: no runs in flight");
+            return Ok(());
+        }
+
+        eprintln!(
+            "Watching {} run(s) in project ({} in flight) — returning on the first completion…",
+            snapshot.len(),
+            in_flight
+        );
+
+        loop {
+            sleep_until_or_timeout(interval, deadline).await?;
+
+            let current = store.list_runs_by_project(project_id)?;
+            let mut completed: Vec<(String, Option<String>)> = Vec::new();
+            for r in &current {
+                if !crate::local::is_terminal(&r.status) {
+                    continue;
+                }
+                let line = match snapshot.get(&r.id) {
+                    Some(prev) if crate::local::is_terminal(prev) => continue,
+                    Some(prev) => format!("{} {} -> {}", r.id, prev, r.status),
+                    None => format!("{} {} (new)", r.id, r.status),
+                };
+                completed.push((line, Run::from(r).failure_detail()));
+            }
+            if !completed.is_empty() {
+                for (line, detail) in &completed {
+                    println!("{line}");
+                    if let Some(detail) = detail {
+                        eprintln!("{detail}");
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // --- create-experiment ------------------------------------------------
+
+    pub async fn create_experiment(&self, spec: CreateExperimentSpec) -> Result<()> {
+        let store = &self.store;
+        let project = self.project()?;
+        let CreateExperimentSpec {
+            title,
+            parent,
+            baseline,
+            description,
+            run_command,
+        } = spec;
+
+        let mut defaulted_to_root = false;
+        let parent_exp = match &parent {
+            Some(parent_id) => Some(store.get_local_experiment(parent_id)?.ok_or_else(|| {
+                anyhow!(
+                    "Parent experiment {} not found in the local store. \
+                     Choose an existing local experiment from `orx project view {}`, or omit --parent to branch off the project root.",
+                    parent_id, project.id
+                )
+            })?),
+            None if baseline => None,
+            None => {
+                let root = crate::local::experiments::project_root(store, &project.id)?;
+                defaulted_to_root = root.is_some();
+                root
+            }
+        };
+        let kind = if parent_exp.is_some() {
+            "child"
+        } else {
+            "baseline"
+        };
+
+        let experiment = crate::local::experiments::create_experiment(
+            store,
+            project,
+            parent_exp.as_ref(),
+            None,
+            Some(title),
+            description,
+            run_command,
+        )?;
+
+        if project.github_enabled() {
+            if let Err(error) = crate::local::git::spawn_branch_publication(
+                std::path::Path::new(&project.repo_path),
+                &experiment.branch_name,
+                &project.github_owner,
+                &project.github_repo,
+            ) {
+                eprintln!(
+                    "  warning: experiment created locally, but GitHub sync could not start: {error}"
+                );
+            }
+        }
+
+        println!("\u{2713} Created local {} experiment", kind);
+        if defaulted_to_root {
+            let root = parent_exp.as_ref().unwrap();
+            println!("  parent:  {} (project root, defaulted)", root.id);
+        }
+        if let Some(warning) = parent_exp
+            .as_ref()
+            .and_then(|p| crate::local::experiments::legacy_root_warning(project, p))
+        {
+            eprintln!("  {warning}");
+        }
+        println!("  id:      {}", experiment.id);
+        println!("  title:   {}", experiment.display_name());
+        println!("  slug:    {}", experiment.slug);
+        println!("  branch:  {}", experiment.branch_name);
+        if experiment.run_command.is_empty() {
+            println!(
+                "  command: — (none inherited — set one with `orx project edit {} --run-command '<cmd>'`)",
+                project.id
+            );
+        } else {
+            println!("  command: {}", experiment.run_command);
+        }
+        println!();
+        println!("To edit it, check out the branch in the project's local clone:");
+        println!("  cd {}", project.repo_path);
+        println!("  git checkout {}", experiment.branch_name);
+        println!("  # …edit, then…");
+        println!("  git commit -am \"<msg>\"");
+        Ok(())
+    }
+}
+
+async fn sleep_until_or_timeout(interval: Duration, deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(anyhow!("Timed out waiting for a run state change."));
+    }
+    let nap = interval.min(deadline.saturating_duration_since(Instant::now()));
+    tokio::time::sleep(nap).await;
+    if Instant::now() >= deadline {
+        return Err(anyhow!("Timed out waiting for a run state change."));
+    }
+    Ok(())
+}

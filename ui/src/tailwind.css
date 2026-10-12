@@ -1,0 +1,21 @@
+@layer theme, base, vendor, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "./theme.css";
+@import "./base.css";
+@import "@xyflow/react/dist/style.css" layer(vendor);
+@import "@xterm/xterm/css/xterm.css" layer(vendor);
+/* Must match rehype-katex's bundled version; skew breaks \boxed. */
+@import "katex/dist/katex.min.css" layer(vendor);
+@import "react-diff-view/style/index.css" layer(vendor);
+@import "./app.css";
+/* VERA workspace and startup styles. */
+@import "./vera.css";
+/* The desktop academic writing introduction has its own viewport layout. */
+@import "./vera-landing.css";
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+/* The macOS app, where the page runs under the titlebar's traffic lights. */
+@custom-variant mac-titlebar (&:where(.mac-titlebar *));
+/* The Windows app, where the page draws the caption buttons at the top-right. */
+@custom-variant win-titlebar (&:where(.win-titlebar *));
+@source "../index.html";
+@source ".";

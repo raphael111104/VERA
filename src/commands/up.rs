@@ -1,0 +1,9017 @@
+//! `orx up` — the local autoresearch dashboard server.
+//!
+//! One axum process on 127.0.0.1 serving three surfaces:
+//!   /            embedded SPA (rust-embed over ui/dist, index.html fallback)
+//!   /api/*       JSON over the local SQLite store + run-log files
+//!   /api/events  SSE: 500ms store + log-file diff loop (serve.rs idiom)
+//!
+//! Fully local: literature routes proxy public, token-free scholarly endpoints
+//! needed because the
+//! browser can't call api.alphaxiv.org cross-origin). The normal dashboard is
+//! loopback-only; the hidden persistent-host mode also requires a session bearer.
+
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::io::IsTerminal as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use base64::Engine as _;
+use futures::Stream;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::mpsc;
+
+use crate::commands::remote_host::{DashboardLock, DashboardLockMode, HostDescriptor, RemoteAuth};
+use crate::commands::up_remote::RemoteSessionStatus;
+use crate::error::{anyhow, Result};
+use crate::local;
+use crate::local::autonomy::Autonomy;
+use crate::local::chat::ChatHost;
+use crate::local::is_terminal;
+use crate::local::opencode::AgentHost;
+use crate::store::{
+    log_path, now_ms, SshHostTest, Store, StoredAgentSelection, StoredChatSession, StoredRun,
+};
+use crate::updates;
+use crate::workspace_state::{GlobalWorkspaceState, WorkspaceState};
+use crate::{browser, UpArgs};
+
+pub(crate) mod compute_settings;
+mod harness_setup;
+use compute_settings::*;
+
+pub async fn run(args: UpArgs) -> Result<()> {
+    updates::note_startup_image();
+    let port = args.port;
+    let persistent_host = args.remote_host;
+    let remote_auth = if persistent_host {
+        let callback = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        local::chat::set_up_auth_token(callback.clone());
+        Some(RemoteAuth::new(&callback))
+    } else {
+        None
+    };
+    let dashboard_lock = DashboardLock::acquire(
+        &crate::commands::remote_host::canonical_data_dir()?,
+        if persistent_host {
+            DashboardLockMode::Exclusive
+        } else {
+            DashboardLockMode::Shared
+        },
+    )?;
+    // Blocks only for a relaunched server, whose predecessor still holds the port.
+    updates::await_replaced_parent();
+    let backend_lock = tokio::task::spawn_blocking(updates::BackendLock::acquire)
+        .await
+        .ok()
+        .flatten();
+    // An install that finished while this process waited replaced the image it was started from.
+    if backend_lock.is_some() && updates::newer_exe_on_disk().await {
+        drop(backend_lock);
+        let err = updates::relaunch(port);
+        return Err(anyhow!("orx up: could not restart: {err}"));
+    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|error| anyhow!("Could not bind 127.0.0.1:{}: {}", port, error))?;
+    let actual_port = listener.local_addr()?.port();
+    // Open early so the schema exists before any request or agent spawn.
+    {
+        let store = Store::open()?;
+        local::chat::reconcile_unfinished_turns(&store)?;
+        for run in store.list_active_runs()? {
+            if store.get_local_experiment(&run.experiment_id)?.is_some() {
+                if let Err(err) = crate::commands::exp::spawn_detached_supervise(&run.id) {
+                    eprintln!("could not recover supervisor for run {}: {err}", run.id);
+                }
+            }
+        }
+    }
+
+    // Harnesses spawn lazily on the first message to one of their sessions;
+    // no eager agent bring-up. (--no-agent is now a no-op kept for compat.)
+    let agent = Arc::new(AgentHost::new(args.model.clone()));
+    let codex = Arc::new(local::codex::CodexHost::new());
+    let claude = Arc::new(local::claude::ClaudeHost::new());
+    claude.start_reaper();
+    codex.start_reaper();
+    let remote_instance_id = persistent_host.then(|| uuid::Uuid::new_v4().to_string());
+    let stopping = Arc::new(AtomicBool::new(false));
+    let state = AppState {
+        agent: agent.clone(),
+        chat: Arc::new(ChatHost::new(agent.clone(), codex.clone(), claude.clone())),
+        claude: claude.clone(),
+        harnesses: Arc::new(tokio::sync::Mutex::new(None)),
+        project_lifecycle: Arc::new(ProjectLifecycle::default()),
+        project_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        harness_fill_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        claude_catalog_queue: Arc::new(std::sync::Mutex::new(ClaudeCatalogQueue::default())),
+        data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        data_dir_gate: Arc::new(tokio::sync::Mutex::new(())),
+        remote_sessions: crate::commands::up_remote::RemoteSessionManager::new(),
+        remote_instance_id: remote_instance_id.clone(),
+        stopping: stopping.clone(),
+        dashboard_lock: Arc::new(std::sync::Mutex::new(Some(dashboard_lock))),
+        restart: Arc::new(tokio::sync::Notify::new()),
+    };
+    // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
+    state.chat.set_up_port(actual_port);
+    state.chat.resume_persisted_queues();
+    {
+        let chat = state.chat.clone();
+        let moving = state.data_dir_move_in_progress.clone();
+        let gate = state.data_dir_gate.clone();
+        tokio::spawn(async move {
+            let interval =
+                Duration::from_millis((crate::store::CHAT_TURN_LEASE_TTL_MS + 1_000) as u64);
+            loop {
+                tokio::time::sleep(interval).await;
+                if moving.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let _gate = gate.lock().await;
+                if moving.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                if let Err(err) = chat.reconcile_expired_turn_leases() {
+                    eprintln!("orx up: could not reconcile expired chat turns: {err}");
+                }
+            }
+        });
+    }
+
+    spawn_agent_preflight(state.clone());
+    // A fresh install's demo worktree takes ~15 sequential git spawns — build
+    // it while the onboarding screen is up instead of inside the confirm click.
+    // On Windows those spawns run at idle priority (see `demo::prewarm`) so
+    // they only take cores the catalog fill's probes leave free. The data-dir
+    // gate keeps it from racing a mid-flight directory move.
+    if !persistent_host {
+        let move_in_progress = state.data_dir_move_in_progress.clone();
+        let gate = state.data_dir_gate.clone();
+        tokio::task::spawn_blocking(move || local::demo::prewarm(move_in_progress, gate));
+    }
+    if !persistent_host {
+        let chat = state.chat.clone();
+        tokio::spawn(async move {
+            if let Err(err) = local::chat::delete_side_chats(&chat).await {
+                eprintln!("orx up: side chat cleanup: {err}");
+            }
+        });
+    }
+    // Deliver explicitly registered run wake-ups once their chat becomes idle.
+    tokio::spawn(local::chat::watch_runs(
+        state.chat.clone(),
+        state.data_dir_move_in_progress.clone(),
+        state.data_dir_gate.clone(),
+    ));
+    spawn_claude_auth_monitor(
+        state.chat.clone(),
+        claude.clone(),
+        state.harness_fill_in_flight.clone(),
+    );
+    spawn_background_tasks(remote_auth.is_none());
+    if !persistent_host && !args.desktop_app {
+        spawn_restart_when_idle(state.clone());
+    }
+    let live_events = state.chat.clone();
+    local::overleaf_live::set_event_sink(Box::new(move |name, data| {
+        live_events.emit_event(name, data)
+    }));
+
+    let app = router(state.clone(), remote_auth.clone());
+    let url = format!("http://127.0.0.1:{actual_port}");
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let control_server = if persistent_host {
+        Some(
+            crate::commands::remote_host::start_control_server(
+                HostDescriptor {
+                    instance_id: remote_instance_id.clone().expect("persistent instance id"),
+                    hostname: crate::commands::remote_host::hostname(),
+                    port: actual_port,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    dashboard_protocol: crate::commands::up_remote::DASHBOARD_PROTOCOL,
+                    control_protocol: crate::commands::remote_host::CONTROL_PROTOCOL,
+                },
+                remote_auth.clone().expect("persistent remote auth"),
+                state.chat.clone(),
+                stopping.clone(),
+                stop_tx,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    // In an SSH session the loopback URL only works on the remote box and there's
+    // no local browser to open — print forwarding guidance instead of the bare
+    // URL, and skip the (futile) browser-open. Otherwise, today's local flow.
+    if let Some(session) = crate::remote::detect_ssh_session() {
+        eprint!("{}", session.instructions(actual_port));
+    } else {
+        eprintln!("orx up: dashboard on {url}");
+        if let Some(warning) = crate::local::bash::missing_toolchain() {
+            eprintln!("orx up: warning: {warning}");
+        }
+        if !args.desktop_app && !persistent_host && std::io::stderr().is_terminal() {
+            if let Some(download_url) = crate::updates::desktop_app_download_url() {
+                eprintln!("orx up: the VERA desktop app opens these same projects: {download_url}");
+            }
+        }
+        if !args.no_browser {
+            browser::open_dashboard(&url, crate::telemetry::UpLaunchMode::of(&args));
+        }
+    }
+
+    // select! instead of graceful shutdown: open SSE streams never complete,
+    // so waiting on connections would hang Ctrl-C forever.
+    //
+    // We wait on SIGTERM/SIGHUP as well as SIGINT: when this server is started
+    // over SSH by `orx up --remote`, closing that tunnel (the launcher's Ctrl-C)
+    // delivers SIGHUP here as the channel tears down — without handling it the
+    // remote server would leak, staying bound to its port after the tunnel dies.
+    let restart = state.restart.clone();
+    let mut restarting = false;
+    let explicit_stop = if persistent_host {
+        tokio::select! {
+            r = axum::serve(listener, app) => {
+                r.map_err(|e| anyhow!("orx up: server error: {e}"))?;
+                false
+            }
+            changed = stop_rx.changed() => changed.is_ok() && *stop_rx.borrow(),
+            _ = restart.notified() => { restarting = true; false }
+            _ = persistent_shutdown_signal() => false,
+        }
+    } else {
+        tokio::select! {
+            r = axum::serve(listener, app) => r.map_err(|e| anyhow!("orx up: server error: {e}"))?,
+            _ = restart.notified() => restarting = true,
+            _ = shutdown_signal() => eprintln!("orx up: shutting down"),
+        }
+        false
+    };
+    if persistent_host {
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    if explicit_stop {
+        state.chat.interrupt_all().await;
+    }
+    state.remote_sessions.shutdown().await;
+    agent.shutdown().await;
+    codex.shutdown().await;
+    claude.shutdown().await;
+    if let Some(server) = control_server {
+        server.shutdown().await;
+    }
+    state.dashboard_lock.lock().unwrap().take();
+    if restarting {
+        drop(backend_lock);
+        if !updates::newer_exe_on_disk().await {
+            eprintln!("orx up: installing the update before restarting");
+            let failures = updates::failure_count();
+            if let Err(err) = updates::apply_now().await {
+                eprintln!("orx up: {err} Restarting on this version.");
+            }
+            // Unless the updater counted it or still will, back off (deferred again, or it
+            // never started), or the relaunch restarts straight back into this.
+            if !updates::newer_exe_on_disk().await
+                && updates::failure_count() == failures
+                && !updates::updater_running()
+            {
+                updates::record_attempt(false);
+            }
+        }
+        eprintln!("orx up: restarting");
+        let err = updates::relaunch(actual_port);
+        return Err(anyhow!("orx up: could not restart: {err}"));
+    }
+    Ok(())
+}
+
+/// The desktop app's quit. A stored permit covers a quit that lands before the
+/// server is waiting for one.
+static SHUTDOWN_REQUESTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(desktop_app)]
+pub(crate) fn request_shutdown() {
+    SHUTDOWN_REQUESTED.notify_one();
+}
+
+/// Resolves when the process is asked to stop: SIGINT everywhere; on Unix also
+/// SIGTERM and SIGHUP (SIGHUP is what an SSH tunnel delivers on disconnect, so
+/// a `--remote`-launched server exits with its tunnel instead of leaking); and
+/// [`request_shutdown`].
+async fn shutdown_signal() {
+    tokio::select! {
+        _ = SHUTDOWN_REQUESTED.notified() => {}
+        _ = os_shutdown_signal() => {}
+    }
+}
+
+async fn os_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+        // If a signal stream can't be installed, that arm simply never fires —
+        // fall back to whatever handlers do register rather than aborting.
+        async fn wait(s: &mut Option<Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+        let mut term = signal(SignalKind::terminate()).ok();
+        let mut hup = signal(SignalKind::hangup()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = wait(&mut term) => {}
+            _ = wait(&mut hup) => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn persistent_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+        async fn wait(signal: &mut Option<Signal>) {
+            match signal {
+                Some(signal) => {
+                    signal.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+        let mut term = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = wait(&mut term) => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    agent: Arc<AgentHost>,
+    chat: Arc<ChatHost>,
+    claude: Arc<local::claude::ClaudeHost>,
+    /// Harness detection cache — detection shells out to CLIs, so it's rate-
+    /// limited to once per TTL unless the UI asks for a refresh.
+    harnesses: Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>,
+    project_lifecycle: Arc<ProjectLifecycle>,
+    project_creation_lock: Arc<tokio::sync::Mutex<()>>,
+    publication_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Single-flight guard for the background catalog fill: without it every
+    /// expired read would start its own full detection sweep.
+    harness_fill_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    claude_catalog_queue: Arc<std::sync::Mutex<ClaudeCatalogQueue>>,
+    /// Set while a data-dir move is running. New chat turns and run launches
+    /// check it and refuse (409) so nothing starts writing the store mid-move —
+    /// closing the window between the move's in-flight check and its completion.
+    data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes wake-up store writes with a live data-directory move.
+    data_dir_gate: Arc<tokio::sync::Mutex<()>>,
+    remote_sessions: crate::commands::up_remote::RemoteSessionManager,
+    remote_instance_id: Option<String>,
+    stopping: Arc<AtomicBool>,
+    dashboard_lock: Arc<std::sync::Mutex<Option<DashboardLock>>>,
+    /// Fired by `POST /api/update/restart`; the serve loop relaunches on it.
+    restart: Arc<tokio::sync::Notify>,
+}
+
+async fn project_publication_lock(
+    state: &AppState,
+    project_id: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = state.publication_locks.lock().await;
+        locks
+            .entry(project_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
+}
+
+#[derive(Default)]
+struct ProjectLifecycle {
+    inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
+}
+
+#[derive(Default)]
+struct ProjectLifecycleState {
+    deleting: HashSet<String>,
+    admissions: HashMap<String, usize>,
+}
+
+struct ProjectAdmissionLease {
+    inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
+    project_id: String,
+}
+
+impl Drop for ProjectAdmissionLease {
+    fn drop(&mut self) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(count) = state.admissions.get_mut(&self.project_id) {
+            *count -= 1;
+            if *count == 0 {
+                state.admissions.remove(&self.project_id);
+            }
+        }
+    }
+}
+
+struct ProjectDeletionLease {
+    inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
+    project_id: String,
+}
+
+impl Drop for ProjectDeletionLease {
+    fn drop(&mut self) {
+        self.inner.lock().unwrap().deleting.remove(&self.project_id);
+    }
+}
+
+impl ProjectLifecycle {
+    fn admit(&self, project_id: &str) -> Option<ProjectAdmissionLease> {
+        let mut state = self.inner.lock().unwrap();
+        if state.deleting.contains(project_id) {
+            return None;
+        }
+        *state.admissions.entry(project_id.to_string()).or_default() += 1;
+        Some(ProjectAdmissionLease {
+            inner: self.inner.clone(),
+            project_id: project_id.to_string(),
+        })
+    }
+
+    fn begin_delete(&self, project_id: &str) -> Option<ProjectDeletionLease> {
+        let mut state = self.inner.lock().unwrap();
+        if state.deleting.contains(project_id)
+            || state
+                .admissions
+                .get("__project_create__")
+                .copied()
+                .unwrap_or_default()
+                > 0
+            || state
+                .admissions
+                .get(project_id)
+                .copied()
+                .unwrap_or_default()
+                > 0
+        {
+            return None;
+        }
+        state.deleting.insert(project_id.to_string());
+        Some(ProjectDeletionLease {
+            inner: self.inner.clone(),
+            project_id: project_id.to_string(),
+        })
+    }
+
+    fn operation_count(&self) -> usize {
+        let state = self.inner.lock().unwrap();
+        state.admissions.values().copied().sum::<usize>() + state.deleting.len()
+    }
+}
+
+fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
+    let app = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/onboarding/complete", post(complete_onboarding))
+        .route("/api/project-path/status", get(project_path_status))
+        .route("/api/project-path/pick", post(pick_project_folder))
+        .route("/api/git/install", post(install_git))
+        .route("/api/projects", get(list_projects).post(create_project))
+        .route(
+            "/api/projects/starter-prompts/prewarm",
+            post(prewarm_starter_prompts),
+        )
+        .route("/api/projects/activity", get(list_project_activity))
+        .route(
+            "/api/projects/{id}",
+            get(get_project)
+                .patch(update_project)
+                .delete(delete_project),
+        )
+        .route("/api/projects/{id}/open", post(open_project))
+        .route("/api/projects/{id}/git", get(project_git_status))
+        .route(
+            "/api/projects/{id}/starter-prompts",
+            get(project_starter_prompts),
+        )
+        .route("/api/projects/{id}/git/init", post(initialize_project_git))
+        .route("/api/projects/{id}/github", post(enable_project_github))
+        .route(
+            "/api/projects/{id}/github/disable",
+            post(disable_project_github),
+        )
+        .route("/api/projects/{id}/github/push", post(push_project_github))
+        .route("/api/github/account", get(github_account))
+        .route(
+            "/api/github/project-repo-preview",
+            get(github_project_repo_preview),
+        )
+        .route("/api/github/repo-access", get(github_repo_access))
+        .route("/api/projects/{id}/experiments", get(list_experiments))
+        .route("/api/projects/{id}/runs", get(list_project_runs))
+        .route("/api/papers/search", get(search_papers_api))
+        .route("/api/research/jobs", post(start_research_job))
+        .route(
+            "/api/research/folders",
+            get(get_research_folders).post(save_research_folder),
+        )
+        .route("/api/research/jobs/{id}", get(get_research_job))
+        .route("/api/research/jobs/{id}/cancel", post(cancel_research_job))
+        .route("/api/research/jobs/{id}/side", post(research_side_chat))
+        .route("/api/papers/resolve", get(resolve_paper_api))
+        .route("/api/compute/backends", get(compute_backends))
+        .route("/api/runs", post(create_run))
+        .route("/api/runs/{id}", get(get_run))
+        .route("/api/instances", get(list_instances))
+        .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/log", get(run_log))
+        .route("/api/runs/{id}/logs", get(run_logs))
+        .route("/api/runs/{id}/diff", get(run_diff))
+        .route("/api/experiments/{id}/diff", get(experiment_diff))
+        .route(
+            "/api/experiments/{id}/archive",
+            axum::routing::patch(set_experiment_archive),
+        )
+        .route("/api/experiments/{id}/commits", get(experiment_commits))
+        .route(
+            "/api/experiments/{id}/commits/{sha}/diff",
+            get(experiment_commit_diff),
+        )
+        .route("/api/projects/{id}/working-tree", get(project_working_tree))
+        .route("/api/projects/{id}/code-tree", get(project_code_tree))
+        .route(
+            "/api/projects/{id}/file",
+            get(project_file)
+                .put(write_project_file)
+                .patch(manage_project_file),
+        )
+        .route("/api/projects/{id}/file/raw", get(project_raw_file))
+        .route("/api/projects/{id}/file/open", post(open_project_file))
+        .route("/api/projects/{id}/file/reveal", post(reveal_project_file))
+        .route("/api/projects/{id}/file/latex", post(compile_project_latex))
+        .route("/api/latex/engine", get(latex_engine))
+        .route(
+            "/api/projects/{id}/file/overleaf",
+            get(overleaf_link)
+                .post(link_overleaf)
+                .delete(unlink_overleaf),
+        )
+        .route("/api/projects/{id}/file/overleaf/sync", post(sync_overleaf))
+        .route(
+            "/api/projects/{id}/file/overleaf/status",
+            get(overleaf_status),
+        )
+        .route(
+            "/api/projects/{id}/file/overleaf/upload",
+            get(overleaf_upload),
+        )
+        .route("/api/overleaf/settings", get(overleaf_settings))
+        .route(
+            "/api/overleaf/token",
+            post(set_overleaf_token).delete(delete_overleaf_token),
+        )
+        .route(
+            "/api/overleaf/session",
+            post(set_overleaf_session).delete(delete_overleaf_session),
+        )
+        .route(
+            "/api/overleaf/session/import",
+            post(import_overleaf_session),
+        )
+        .route(
+            "/api/projects/{id}/file/overleaf/live",
+            post(start_overleaf_live).delete(stop_overleaf_live),
+        )
+        .route("/api/files/abs", get(absolute_file))
+        .route("/api/files/abs/raw", get(absolute_raw_file))
+        .route(
+            "/api/settings/ssh/config",
+            get(ssh_config).put(save_ssh_config),
+        )
+        .route(
+            "/api/projects/{id}/files",
+            get(list_artifacts)
+                .patch(manage_artifact_file)
+                .delete(delete_artifact),
+        )
+        .route("/api/projects/{id}/files/file", get(serve_artifact))
+        .route("/api/projects/{id}/terminal", get(project_terminal))
+        .route("/api/events", get(events))
+        .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
+        .route(
+            "/api/settings/tinker",
+            get(tinker_settings).post(set_tinker_key),
+        )
+        .route(
+            "/api/settings/k8s",
+            get(k8s_settings).post(set_k8s_settings),
+        )
+        .route(
+            "/api/settings/modal",
+            get(modal_settings).post(set_modal_token),
+        )
+        .route("/api/settings/env", get(env_settings).post(set_env_var))
+        .route(
+            "/api/settings/env/{key}",
+            axum::routing::delete(delete_env_var),
+        )
+        .route(
+            "/api/settings/data-dir",
+            get(data_dir_settings).post(set_data_dir),
+        )
+        .route("/api/settings/data-dir/validate", post(validate_data_dir))
+        .route("/api/settings/data-dir/move", post(move_data_dir))
+        .route(
+            "/api/settings/git",
+            get(git_settings).post(set_git_settings),
+        )
+        .route(
+            "/api/settings/projects",
+            get(project_defaults).post(set_project_defaults),
+        )
+        .route(
+            "/api/settings/telemetry",
+            get(telemetry_settings).post(set_telemetry_settings),
+        )
+        .route("/api/telemetry/event", post(record_ui_event))
+        .route("/api/telemetry/locale", post(set_dashboard_locale))
+        .route(
+            "/api/settings/profile",
+            get(profile_settings).post(set_profile_settings),
+        )
+        .route("/api/update", get(update_status))
+        .route("/api/update/apply", post(apply_update))
+        .route("/api/update/restart", post(restart_after_update))
+        .route("/api/update/auto", post(set_auto_update))
+        .route("/api/update/install-cli", post(install_cli))
+        .route("/api/settings/ui-state", get(ui_state).post(set_ui_state))
+        .route(
+            "/api/projects/{id}/ui-state",
+            get(project_ui_state).post(set_project_ui_state),
+        )
+        .route(
+            "/api/settings/ssh",
+            get(ssh_settings).post(save_ssh_settings),
+        )
+        .route("/api/settings/ssh/default", post(save_ssh_default))
+        .route("/api/settings/ssh/master", get(ssh_master_status))
+        .route("/api/settings/ssh/preflight", post(ssh_preflight))
+        .route("/api/settings/ssh/connect", get(ssh_connect))
+        .route(
+            "/api/remote/sessions",
+            get(remote_sessions).post(create_remote_session),
+        )
+        .route("/api/remote/sessions/{id}", get(remote_session))
+        .route(
+            "/api/remote/sessions/{id}/reconnect",
+            post(reconnect_remote_session),
+        )
+        .route(
+            "/api/remote/sessions/{id}/disconnect",
+            post(disconnect_remote_session),
+        )
+        .route("/_orx/runtime", get(local_runtime))
+        .route(
+            "/api/settings/slurm",
+            get(slurm_settings).post(set_slurm_settings),
+        )
+        .route("/api/settings/slurm/preflight", post(slurm_preflight))
+        .route(
+            "/api/settings/ray",
+            get(ray_settings).post(set_ray_settings),
+        )
+        .route("/api/settings/ray/preflight", post(ray_preflight))
+        .route("/api/settings/compute", get(compute_settings))
+        .route("/api/settings/compute/default", post(set_compute_default))
+        .route("/api/settings/local", get(local_machine_settings))
+        .route("/api/settings/commands/run", get(run_settings_command))
+        .route(
+            "/api/settings/lit-sources",
+            get(lit_sources_settings).post(set_lit_sources_settings),
+        )
+        .route("/api/harnesses", get(list_harnesses))
+        .route("/api/harnesses/{id}/snapshot", get(harness_snapshot))
+        .route(
+            "/api/harnesses/setup/commands",
+            get(harness_setup::commands),
+        )
+        .route("/api/harnesses/setup", get(harness_setup::connect))
+        .route(
+            "/api/local-models",
+            get(list_local_models).post(connect_local_model),
+        )
+        .route("/api/local-models/discover", post(discover_local_models))
+        .route("/api/local-models/{id}/check", post(check_local_model))
+        .route(
+            "/api/local-models/{id}",
+            axum::routing::delete(remove_local_model),
+        )
+        .route("/api/skills", get(list_skills))
+        .route("/api/skills/{name}", get(get_skill))
+        .route(
+            "/api/user-skills",
+            get(list_user_skills)
+                .post(upload_user_skill)
+                .delete(delete_user_skill),
+        )
+        .route(
+            "/api/latex-templates",
+            get(list_latex_templates)
+                .post(upload_latex_template)
+                .delete(delete_latex_template),
+        )
+        .route(
+            "/api/chat/sessions",
+            get(list_chat_sessions).post(create_chat_session),
+        )
+        .route(
+            "/api/chat/sessions/{id}",
+            axum::routing::delete(delete_chat_session).patch(update_chat_session),
+        )
+        .route("/api/chat/sessions/{id}/messages", get(chat_messages))
+        .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
+        .route("/api/chat/sessions/{id}/message", post(send_chat_message))
+        .route("/api/chat/sessions/{id}/shell", post(run_shell_command))
+        .route(
+            "/api/chat/sessions/{id}/compact",
+            post(compact_chat_session),
+        )
+        .route("/api/chat/native-sessions", get(list_native_chats))
+        .route("/api/chat/native-sessions/import", post(import_native_chat))
+        .route(
+            "/api/chat/sessions/{id}/turns/{turnId}/recover",
+            post(recover_chat_turn),
+        )
+        .route("/api/chat/sessions/{id}/side", post(open_side_chat))
+        .route("/api/chat/sessions/{id}/fork", post(fork_chat_turn))
+        .route("/api/chat/sessions/{id}/branch", post(select_chat_branch))
+        .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
+        .route(
+            "/api/chat/sessions/{id}/queue/{itemId}",
+            axum::routing::delete(cancel_queued_chat).post(retry_queued_chat),
+        )
+        .route("/api/chat/sessions/{id}/respond", post(respond_chat))
+        // Internal: the `orx mcp-gate` permission bridge's long-poll (plan
+        // mode). Token-authenticated in the handler; blocks until the surfaced
+        // card is answered.
+        .route("/api/internal/permissions", post(bridge_permission))
+        .route("/api/chat/attachments/{name}", get(chat_attachment))
+        .route("/api/agent/status", get(agent_status))
+        .fallback(spa)
+        // Chat attachments (PDFs, images) ride as base64 in the send-message
+        // JSON body; the 2 MB axum default rejects any real paper. Cap it well
+        // above the client-side per-file limit so a full message still fits.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .with_state(state);
+    let app = app
+        .layer(middleware::from_fn(track_active))
+        .layer(middleware::from_fn(
+            crate::commands::up_remote::loopback_guard,
+        ));
+    match remote_auth {
+        Some(auth) => app.layer(middleware::from_fn_with_state(auth, require_remote_auth)),
+        None => app,
+    }
+}
+
+async fn require_remote_auth(
+    State(auth): State<RemoteAuth>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if remote_route_forbidden(path) {
+        return ApiError(
+            StatusCode::FORBIDDEN,
+            "This action is unavailable in an SSH workspace.".into(),
+        )
+        .into_response();
+    }
+    if path == "/api/internal/permissions" {
+        return next.run(request).await;
+    }
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|value| Sha256::digest(value.as_bytes()));
+    let session = provided
+        .as_ref()
+        .is_some_and(|digest| auth.matches_attachment(digest));
+    let callback = is_remote_callback_route(request.method(), path)
+        && provided
+            .as_ref()
+            .is_some_and(|digest| auth.matches_callback(digest));
+    if session || callback {
+        next.run(request).await
+    } else {
+        ApiError(
+            StatusCode::UNAUTHORIZED,
+            "Remote session authentication required.".into(),
+        )
+        .into_response()
+    }
+}
+
+fn remote_route_forbidden(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/project-path/pick"
+            | "/api/git/install"
+            | "/api/update"
+            | "/api/update/apply"
+            | "/api/update/restart"
+            | "/api/update/auto"
+            | "/api/update/install-cli"
+            | "/api/settings/data-dir"
+            | "/api/settings/data-dir/move"
+            | "/api/settings/commands/run"
+            | "/api/harnesses/setup"
+    ) || path.starts_with("/api/remote/")
+        || (path.starts_with("/api/projects/")
+            && (path.ends_with("/file/open") || path.ends_with("/file/reveal")))
+}
+
+fn is_remote_callback_route(method: &Method, path: &str) -> bool {
+    if method == Method::GET {
+        // `orx agent spawn`'s install preflight (read-only).
+        return path
+            .strip_prefix("/api/harnesses/")
+            .and_then(|path| path.strip_suffix("/snapshot"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    }
+    if method != Method::POST {
+        return false;
+    }
+    path == "/api/runs"
+        || path
+            .strip_prefix("/api/runs/")
+            .and_then(|path| path.strip_suffix("/cancel"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+// --- error plumbing -------------------------------------------------------
+
+/// JSON error responses: `{"error": "..."}` with an explicit status.
+struct ApiError(StatusCode, String);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+impl From<crate::error::Error> for ApiError {
+    fn from(err: crate::error::Error) -> Self {
+        Self(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    }
+}
+
+fn bad_request(err: impl std::fmt::Display) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, err.to_string())
+}
+
+fn not_found(what: &str) -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
+}
+
+type ApiResult = std::result::Result<Json<Value>, ApiError>;
+
+// --- wire types -----------------------------------------------------------
+
+/// The Run entity the API serves: StoredRun with `backend_json` parsed into an
+/// object and cancellation intent exposed for pending UI state.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiRun {
+    id: String,
+    experiment_id: String,
+    project_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_markdown: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
+    cancel_requested: bool,
+}
+
+impl From<&StoredRun> for ApiRun {
+    fn from(run: &StoredRun) -> Self {
+        Self {
+            id: run.id.clone(),
+            experiment_id: run.experiment_id.clone(),
+            project_id: run.project_id.clone(),
+            status: run.status.clone(),
+            backend: serde_json::from_str(&run.backend_json).ok(),
+            command: Some(run.command.clone()).filter(|c| !c.is_empty()),
+            commit_sha: run.commit_sha.clone(),
+            result_markdown: run.result_markdown.clone(),
+            created_at: run.created_at,
+            updated_at: run.updated_at,
+            ended_at: run.ended_at,
+            exit_code: run.exit_code,
+            cancel_requested: run.cancel_requested,
+        }
+    }
+}
+
+// --- basic routes ---------------------------------------------------------
+
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "dashboardProtocol": crate::commands::up_remote::DASHBOARD_PROTOCOL,
+        "instanceId": state.remote_instance_id,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteOnboardingReq {
+    harness: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    reasoning_level: Option<String>,
+    #[serde(default)]
+    research_areas: Vec<String>,
+    #[serde(default)]
+    other_area: Option<String>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    papers: Vec<crate::telemetry::ProfilePaper>,
+    #[serde(default)]
+    research_diagnosis: Option<crate::telemetry::ResearchDiagnosis>,
+}
+
+const RESEARCH_AREAS: [&str; 4] = ["AI/ML", "Biology", "Physics", "Other"];
+
+fn preferred_permission_mode(harness: &str, mode: Option<String>) -> Option<String> {
+    match mode.as_deref() {
+        Some("plan") => local::harness::effective_permission_id(harness, None),
+        _ => mode,
+    }
+}
+
+fn normalize_research_profile(
+    research_areas: Vec<String>,
+    other_area: Option<String>,
+    background: Option<String>,
+    papers: Vec<crate::telemetry::ProfilePaper>,
+) -> std::result::Result<crate::telemetry::ResearchProfile, ApiError> {
+    if research_areas.is_empty() {
+        return Err(bad_request("choose at least one research area"));
+    }
+    let mut normalized_areas = Vec::with_capacity(research_areas.len());
+    for area in research_areas {
+        let area = area.trim().to_string();
+        if !RESEARCH_AREAS.contains(&area.as_str()) {
+            return Err(bad_request(format!("unknown research area: {area}")));
+        }
+        if normalized_areas.contains(&area) {
+            return Err(bad_request(format!("duplicate research area: {area}")));
+        }
+        normalized_areas.push(area);
+    }
+    let other_area = other_area.filter(|value| !value.trim().is_empty());
+    let includes_other = normalized_areas.iter().any(|area| area == "Other");
+    if includes_other && other_area.is_none() {
+        return Err(bad_request(
+            "describe your research area when choosing Other",
+        ));
+    }
+    if !includes_other && other_area.is_some() {
+        return Err(bad_request(
+            "choose Other before describing another research area",
+        ));
+    }
+    Ok(crate::telemetry::ResearchProfile {
+        research_areas: normalized_areas,
+        other_area,
+        background: background.filter(|value| !value.trim().is_empty()),
+        papers,
+        research_diagnosis: None,
+    })
+}
+
+async fn complete_onboarding(
+    State(state): State<AppState>,
+    Json(req): Json<CompleteOnboardingReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    if !local::harness::is_chat_harness(&req.harness) {
+        return Err(bad_request(format!("unknown harness: {}", req.harness)));
+    }
+    let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+    let permission_mode = nonempty(req.permission_mode);
+    if permission_mode
+        .as_deref()
+        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+    {
+        return Err(bad_request("invalid permission mode for selected harness"));
+    }
+    let selection = local::demo::DemoSelection {
+        harness: req.harness,
+        model: nonempty(req.model),
+        permission_mode,
+        reasoning_level: nonempty(req.reasoning_level),
+    };
+    let mut profile = normalize_research_profile(
+        req.research_areas,
+        req.other_area,
+        req.background,
+        req.papers,
+    )?;
+    profile.research_diagnosis = validate_research_diagnosis(req.research_diagnosis)?;
+    let profile_for_event = profile.clone();
+    let completion = tokio::task::spawn_blocking(move || -> Result<_> {
+        crate::telemetry::set_profile(profile)
+            .map_err(|e| anyhow!("could not save research profile: {e}"))?;
+        let completion = local::demo::complete_onboarding(selection)?;
+        let store = Store::open()?;
+        store.set_preferred_agent(&StoredAgentSelection {
+            harness: completion.selection.harness.clone(),
+            model: completion.selection.model.clone(),
+            service_tier: None,
+            permission_mode: preferred_permission_mode(
+                &completion.selection.harness,
+                completion.selection.permission_mode.clone(),
+            ),
+            reasoning_level: completion.selection.reasoning_level.clone(),
+        })?;
+        store.set_onboarding_completed(true)?;
+        Ok(completion)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("demo seed task failed: {e}")))??;
+    if completion.newly_created {
+        crate::telemetry::capture_onboarding_completed();
+        crate::telemetry::capture_onboarding_research_profile(&profile_for_event);
+    }
+    Ok(Json(json!({
+        "project": project_json(&completion.project),
+        "selection": completion.selection,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SkillsQ {
+    harness: Option<String>,
+    /// The open project, so a built-in skill's instructions can account for it.
+    project: Option<String>,
+}
+
+/// Slash-skills the composer's `/` dropdown offers (expanded server-side): the
+/// built-in catalog, personal skills, and skills in the open project.
+async fn list_skills(Query(q): Query<SkillsQ>) -> ApiResult {
+    tokio::task::spawn_blocking(move || {
+        let importing = crate::local::user_skills::refresh_imports();
+        let project = q.project.as_deref().and_then(|id| {
+            Store::open().ok()?.get_local_project(id).ok().flatten()
+        });
+        let project_skills = project
+            .as_ref()
+            .map(|project| {
+                crate::local::user_skills::list_project_skills(
+                    std::path::Path::new(&project.repo_path),
+                    q.harness.as_deref(),
+                )
+            })
+            .unwrap_or_default();
+        let project_names: HashSet<_> = project_skills.iter().map(|skill| &skill.name).collect();
+        let mut skills: Vec<Value> = crate::local::skills::CATALOG
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "source": "builtin",
+                })
+            })
+            .collect();
+        for s in crate::local::user_skills::list_for_harness(q.harness.as_deref()) {
+            skills.push(json!({
+                "name": if project_names.contains(&s.name) { format!("{}@u", s.name) } else { s.name },
+                "description": s.description,
+                "source": "user",
+                "plugin": s.plugin,
+                "harness": q.harness,
+            }));
+        }
+        for s in project_skills {
+            skills.push(json!({
+                "name": format!("{}@p", s.name),
+                "description": s.description,
+                "source": "project",
+                "harness": q.harness,
+            }));
+        }
+        Json(json!({ "skills": skills, "importing": importing }))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!(e)))
+}
+
+async fn get_skill(Path(name): Path<String>, Query(q): Query<SkillsQ>) -> ApiResult {
+    if crate::local::user_skills::parse_selection(&name).is_none() {
+        return Err(bad_request("invalid skill name"));
+    }
+    let github_enabled = if let Some(project_id) = q.project.as_deref() {
+        Store::open()
+            .ok()
+            .and_then(|store| store.get_local_project(project_id).ok().flatten())
+            .is_some_and(|project| project.github_enabled())
+    } else {
+        false
+    };
+    if let Some(content) = crate::local::skills::instructions(&name, false, github_enabled) {
+        return Ok(Json(json!({ "name": name, "content": content })));
+    }
+    let skill_name = name.clone();
+    let project_repo = q
+        .project
+        .as_deref()
+        .and_then(|id| Store::open().ok()?.get_local_project(id).ok().flatten())
+        .map(|project| project.repo_path);
+    let content = tokio::task::spawn_blocking(move || {
+        crate::local::user_skills::content(
+            &skill_name,
+            q.harness.as_deref(),
+            project_repo.as_deref().map(std::path::Path::new),
+        )
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!(e)))?
+    .ok_or_else(|| not_found("skill"))?;
+    Ok(Json(json!({ "name": name, "content": content })))
+}
+
+// --- user skills --------------------------------------------------------------
+
+fn user_skill_json(s: &crate::local::user_skills::UserSkill) -> Value {
+    json!({
+        "name": s.name,
+        "origin": s.origin,
+        "bytes": s.bytes,
+        "updatedAt": s.updated_at,
+    })
+}
+
+/// Everything the Customize tab lists: uploads plus the skills mirrored from the
+/// coding agents installed on this machine.
+async fn list_user_skills() -> ApiResult {
+    tokio::task::spawn_blocking(|| {
+        let importing = crate::local::user_skills::refresh_imports();
+        let skills: Vec<Value> = crate::local::user_skills::list()
+            .iter()
+            .map(user_skill_json)
+            .collect();
+        Json(json!({ "skills": skills, "importing": importing }))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!(e)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadSkillReq {
+    /// Original upload filename — its extension picks `.zip` vs single file.
+    filename: String,
+    /// The file bytes, base64 (same convention as chat attachments).
+    content_base64: String,
+}
+
+async fn upload_user_skill(Json(req): Json<UploadSkillReq>) -> ApiResult {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(req.content_base64.trim())
+        .map_err(|e| bad_request(format!("invalid file data: {e}")))?;
+
+    let saved =
+        crate::local::user_skills::save_upload(&req.filename, &bytes).map_err(bad_request)?;
+
+    Ok(Json(json!({ "skill": user_skill_json(&saved) })))
+}
+
+#[derive(Deserialize)]
+struct DeleteByNameQ {
+    name: String,
+}
+
+async fn delete_user_skill(Query(q): Query<DeleteByNameQ>) -> ApiResult {
+    tokio::task::spawn_blocking(move || crate::local::user_skills::delete(&q.name))
+        .await
+        .map_err(|e| ApiError::from(anyhow!(e)))?
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn latex_template_json(t: &crate::local::latex_templates::LatexTemplate) -> Value {
+    json!({
+        "name": t.name,
+        "entry": t.entry,
+        "supportFiles": t.support_files,
+        "bytes": t.bytes,
+        "updatedAt": t.updated_at,
+    })
+}
+
+async fn list_latex_templates() -> ApiResult {
+    let templates: Vec<Value> = crate::local::latex_templates::list()
+        .iter()
+        .map(latex_template_json)
+        .collect();
+    Ok(Json(json!({ "templates": templates })))
+}
+
+async fn upload_latex_template(Json(req): Json<UploadSkillReq>) -> ApiResult {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(req.content_base64.trim())
+        .map_err(|e| bad_request(format!("invalid file data: {e}")))?;
+    let saved =
+        crate::local::latex_templates::save_upload(&req.filename, &bytes).map_err(bad_request)?;
+    Ok(Json(json!({ "template": latex_template_json(&saved) })))
+}
+
+async fn delete_latex_template(Query(q): Query<DeleteByNameQ>) -> ApiResult {
+    crate::local::latex_templates::delete(&q.name).map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Serialize a project for the UI, injecting the absolute artifacts directory
+/// so the dashboard can recognize artifact paths in chat links. `filesDir` is
+/// retained as a compatibility alias for older clients. Every project the UI
+/// receives must go through this — the SSE `project.updated` diff (fired on
+/// every visit, since `open_project` bumps `updated_at`) and `create_project`
+/// upsert into the same `projects` state as `list_projects`.
+fn project_json(p: &local::model::LocalProject) -> Value {
+    project_json_with_artifacts_dir(p, local::files::files_dir_display(p))
+}
+
+fn project_json_with_artifacts_dir(p: &local::model::LocalProject, artifacts_dir: String) -> Value {
+    // LocalProject is all String/Option/i64, so this can't realistically fail;
+    // fail loud rather than emit a malformed `null` project if it ever does.
+    let mut v = serde_json::to_value(p).expect("LocalProject serializes");
+    if let Value::Object(map) = &mut v {
+        let dir = Value::String(artifacts_dir);
+        map.insert("artifactsDir".into(), dir.clone());
+        map.insert("filesDir".into(), dir);
+        map.insert("path".into(), Value::String(p.repo_path.clone()));
+        map.insert("githubEnabled".into(), Value::Bool(p.github_enabled()));
+        map.insert(
+            "githubUrl".into(),
+            p.github_url().map(Value::String).unwrap_or(Value::Null),
+        );
+    }
+    v
+}
+
+async fn list_projects() -> ApiResult {
+    let projects = Store::open()?.list_local_projects()?;
+    let projects: Vec<Value> = projects.iter().map(project_json).collect();
+    Ok(Json(json!({ "projects": projects })))
+}
+
+async fn list_project_activity(State(state): State<AppState>) -> ApiResult {
+    let busy: HashSet<String> = state.chat.busy_sessions().await.into_iter().collect();
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>> {
+        let store = Store::open()?;
+        let mut active_agents = HashMap::<String, usize>::new();
+        for (session_id, project_id) in store.list_chat_session_project_ids()? {
+            // Side chats stay out of project agent counts.
+            if busy.contains(&session_id)
+                && store
+                    .get_chat_session(&session_id)?
+                    .is_some_and(|session| session.side_parent_session_id.is_none())
+            {
+                *active_agents.entry(project_id).or_default() += 1;
+            }
+        }
+        let activity = store
+            .list_project_activity_summaries()?
+            .into_iter()
+            .map(|summary| {
+                let active_agents = active_agents.get(&summary.project_id).copied().unwrap_or(0);
+                json!({
+                    "projectId": summary.project_id,
+                    "activeAgents": active_agents,
+                    "totalAgents": summary.total_agents,
+                    "runningExperiments": summary.running_experiments,
+                    "totalExperiments": summary.total_experiments,
+                    "lastMessageAt": summary.last_message_at,
+                    "lastActivityAt": summary.last_activity_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Json(json!({ "activity": activity })))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("project activity task failed: {error}")))?
+    .map_err(ApiError::from)
+}
+
+#[derive(Deserialize)]
+struct ProjectPathStatusQ {
+    path: Option<String>,
+}
+
+async fn install_git() -> ApiResult {
+    // Spawned, so a page reload mid-install cannot orphan the extractor.
+    tokio::spawn(local::portable_git::install())
+        .await
+        .map_err(|error| ApiError::from(anyhow!("Git install task failed: {error}")))?
+        // `:#` keeps the cause (DNS, TLS, proxy) behind the outer context.
+        .map_err(|error| {
+            eprintln!("orx up: Git install failed: {error:#}");
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        })?;
+    Ok(Json(json!({})))
+}
+
+async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>> {
+        let git_version = local::git::version();
+        let Some(path) = q.path.filter(|path| !path.trim().is_empty()) else {
+            return Ok(Json(json!({
+                "gitVersion": git_version,
+                "gitInstallable": cfg!(windows) && git_version.is_none(),
+                "resolvedPath": null,
+                "exists": null,
+                "directory": null,
+                "empty": null,
+                "initialized": null,
+                "gitState": null,
+            })));
+        };
+        let resolved = local::projects::expand_path(&path)?;
+        let exists = resolved.exists();
+        let directory = resolved.is_dir();
+        let empty = if directory {
+            Some(std::fs::read_dir(&resolved)?.next().is_none())
+        } else {
+            None
+        };
+        let git_state =
+            (git_version.is_some() && directory).then(|| local::git::repository_state(&resolved));
+        let initialized = git_state.is_some_and(local::git::RepositoryState::is_initialized);
+        let github_publication = initialized
+            .then(|| local::git::github_publication(&resolved))
+            .flatten();
+        Ok(Json(json!({
+            "gitVersion": git_version,
+            "resolvedPath": resolved.to_string_lossy(),
+            "exists": exists,
+            "directory": directory,
+            "empty": empty,
+            "initialized": initialized,
+            "gitState": git_state.map(local::git::RepositoryState::as_str),
+            "githubOwner": github_publication.as_ref().map(|(owner, _)| owner),
+            "githubRepo": github_publication.as_ref().map(|(_, repo)| repo),
+        })))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("project path task failed: {error}")))?
+    .map_err(bad_request)
+}
+
+async fn pick_project_folder() -> ApiResult {
+    let path = tokio::task::spawn_blocking(crate::folder_picker::pick_folder)
+        .await
+        .map_err(|error| ApiError::from(anyhow!("folder picker task failed: {error}")))?
+        .map_err(bad_request)?;
+    Ok(Json(json!({
+        "path": path.map(|path| path.to_string_lossy().into_owned()),
+    })))
+}
+
+// --- papers (new-project "from a paper" flow; proxies alphaXiv) ------------
+
+#[derive(Deserialize)]
+struct PaperSearchQ {
+    q: String,
+}
+
+async fn search_papers_api(Query(q): Query<PaperSearchQ>) -> ApiResult {
+    let query = q.q.trim();
+    if query.is_empty() {
+        return Ok(Json(json!({ "papers": [] })));
+    }
+    let papers = crate::client::search_papers_fast(query)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "papers": papers })))
+}
+
+async fn start_research_job(
+    State(state): State<AppState>,
+    Json(req): Json<local::research::Request>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    Ok(Json(local::research::start(state.chat.clone(), req).await?))
+}
+
+async fn get_research_folders() -> ApiResult {
+    Ok(Json(json!(Store::open()?.research_folders()?)))
+}
+
+async fn save_research_folder(
+    State(state): State<AppState>,
+    Json(folder): Json<crate::store::ResearchFolder>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    Ok(Json(json!(Store::open()?
+        .save_research_folder(folder)
+        .map_err(bad_request)?)))
+}
+
+async fn get_research_job(Path(id): Path<String>) -> ApiResult {
+    Ok(Json(local::research::read(&id)?))
+}
+
+async fn cancel_research_job(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(local::research::cancel(&state.chat, &id).await?))
+}
+
+async fn research_side_chat(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    let job = local::research::read(&id)?;
+    let parent = Store::open()?
+        .get_chat_session(job["rootSessionId"].as_str().unwrap_or_default())?
+        .ok_or_else(|| not_found("research chat"))?;
+    let session = state.chat.open_side_chat(&parent).await?;
+    Ok(Json(
+        json!({"session":local::chat::session_json(&session,false)}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct PaperResolveQ {
+    id: String,
+}
+
+async fn resolve_paper_api(Query(q): Query<PaperResolveQ>) -> ApiResult {
+    let id = super::paper::parse_paper_id(&q.id);
+    if id.is_empty() {
+        return Err(bad_request("paper id is required"));
+    }
+    let paper = crate::client::resolve_paper(&id)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "paper": paper })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateProjectReq {
+    creation_mode: Option<crate::telemetry::ProjectCreationMode>,
+    name: String,
+    path: String,
+    run_command: Option<String>,
+    paper_id: Option<String>,
+    clone_url: Option<String>,
+    #[serde(default)]
+    create_folder: bool,
+    #[serde(default)]
+    require_new_folder: bool,
+    #[serde(default)]
+    initialize_git: bool,
+    github_sync_enabled: Option<bool>,
+    /// UI locale, for the starter prompts warmed up in the background.
+    locale: Option<String>,
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    Json(req): Json<CreateProjectReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let create_admission = state
+        .project_lifecycle
+        .admit("__project_create__")
+        .ok_or_else(|| bad_request("project creation is unavailable"))?;
+    reject_if_moving(&state)?;
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(bad_request("name is required"));
+    }
+    let locale = req.locale.unwrap_or_else(|| "en".to_string());
+    let path = req.path;
+    let create_folder = req.create_folder;
+    let require_new_folder = req.require_new_folder;
+    let initialize_git = req.initialize_git;
+    let clone_url = req.clone_url.filter(|url| !url.trim().is_empty());
+    let paper_id = req
+        .paper_id
+        .map(|paper_id| paper_id.trim().to_string())
+        .filter(|paper_id| !paper_id.is_empty());
+    // A paper with no linked repository starts blank, seeded with its PDF — the
+    // only content such a project has, so a failed download fails the request.
+    let paper_pdf = match (paper_id.as_deref(), clone_url.as_deref()) {
+        (Some(id), None) => Some(
+            crate::client::fetch_paper_pdf(id)
+                .await
+                .map_err(bad_request)?,
+        ),
+        _ => None,
+    };
+    let github_sync_enabled = req
+        .github_sync_enabled
+        .unwrap_or_else(crate::config::github_for_new_projects);
+    let repo_size_kb = match clone_url.as_deref() {
+        Some(url) => local::github::public_repo_size_kb(url).await,
+        None => None,
+    };
+    let shallow_clone = local::github::should_shallow_clone(repo_size_kb);
+    let run_command = req.run_command;
+    let creation_guard = state.project_creation_lock.lock().await;
+    let result = tokio::task::spawn_blocking(move || -> Result<local::model::LocalProject> {
+        let store = Store::open()?;
+        let project = local::projects::create_project(
+            &store,
+            &name,
+            &path,
+            local::projects::CreateProjectOptions {
+                create_folder,
+                require_new_folder,
+                initialize_git,
+                clone_url,
+                shallow_clone,
+                run_command,
+                paper_id,
+                paper_pdf,
+            },
+        )?;
+        Ok(project)
+    })
+    .await
+    .map_err(|e| anyhow!("project task failed: {e}"))?;
+    let project = result.map_err(bad_request)?;
+    // Starter prompts take a model call; start it now so the empty chat that
+    // opens next usually finds them cached.
+    local::starter::warm(project.clone(), locale);
+    drop(creation_guard);
+    let _project_admission = state
+        .project_lifecycle
+        .admit(&project.id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    drop(create_admission);
+    let (project, github_publication_error) = if github_sync_enabled {
+        match push_project_for_sync(project.clone(), &state.chat).await {
+            Ok((project, _)) => (project, None),
+            Err(error) => {
+                let project = Store::open()?
+                    .get_local_project(&project.id)?
+                    .unwrap_or(project);
+                (project, Some(error.to_string()))
+            }
+        }
+    } else {
+        (project, None)
+    };
+    crate::telemetry::capture_project_created(true, req.creation_mode);
+    Ok(Json(json!({
+        "project": project_json(&project),
+        "githubPublicationError": github_publication_error,
+    })))
+}
+
+async fn get_project(Path(id): Path<String>) -> ApiResult {
+    let project = Store::open()?
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    Ok(Json(json!({ "project": project_json(&project) })))
+}
+
+fn project_git_json(
+    project: &local::model::LocalProject,
+    github_status: local::github::Status,
+) -> Value {
+    let path = std::path::Path::new(&project.repo_path);
+    let initialized = local::git::is_repository(path);
+    let branch = initialized
+        .then(|| local::git::require_current_branch(path).ok())
+        .flatten();
+    let clean = initialized
+        .then(|| local::git::is_clean(path).ok())
+        .flatten();
+    let remotes = if initialized {
+        local::git::remotes(path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, url)| json!({ "name": name, "url": url }))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let (name, email, name_source, email_source) = if initialized {
+        local::git::identity(path)
+    } else {
+        (None, None, None, None)
+    };
+    let sync_status = project.github_enabled().then(|| {
+        local::git::publication_sync_status(
+            path,
+            &project.baseline_branch,
+            &project.github_owner,
+            &project.github_repo,
+        )
+    });
+    json!({
+        "path": project.repo_path,
+        "gitVersion": local::git::version(),
+        "initialized": initialized,
+        "baselineBranch": project.baseline_branch,
+        "currentBranch": branch,
+        "clean": clean,
+        "remotes": remotes,
+        "identity": {
+            "name": name,
+            "email": email,
+            "nameSource": name_source,
+            "emailSource": email_source,
+        },
+        "github": {
+            "ghInstalled": github_status.installed,
+            "authenticated": github_status.authenticated,
+            "enabled": project.github_enabled(),
+            "owner": project.github_owner,
+            "repo": project.github_repo,
+            "url": project.github_url(),
+            "syncStatus": sync_status,
+        },
+    })
+}
+
+async fn project_git_status(Path(id): Path<String>) -> ApiResult {
+    let github_status = local::github::status().await;
+    tokio::task::spawn_blocking(move || {
+        let project = Store::open()?
+            .get_local_project(&id)?
+            .ok_or_else(|| anyhow!("project not found"))?;
+        Ok(Json(project_git_json(&project, github_status)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("git task failed: {error}")))?
+}
+
+async fn initialize_project_git(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
+    let _creation_guard = state.project_creation_lock.lock().await;
+    let github_status = local::github::status().await;
+    tokio::task::spawn_blocking(move || {
+        let store = Store::open()?;
+        let mut project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| anyhow!("project not found"))?;
+        let path = std::path::Path::new(&project.repo_path);
+        local::git::initialize_repository(path)?;
+        local::git::validate_project_repository(path)?;
+        project.baseline_branch = local::git::require_current_branch(path)?;
+        store.update_local_project(&project)?;
+        Ok(Json(project_git_json(&project, github_status)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("git task failed: {error}")))?
+}
+
+fn push_project(project: &local::model::LocalProject) -> Result<()> {
+    if !project.github_enabled() {
+        return Err(anyhow!(
+            "Enable GitHub syncing for this project before pushing."
+        ));
+    }
+    let path = std::path::Path::new(&project.repo_path);
+    local::git::add_github_remote(path, &project.github_owner, &project.github_repo)?;
+    local::git::push_all(
+        path,
+        &project.baseline_branch,
+        &project.github_owner,
+        &project.github_repo,
+    )
+}
+
+fn github_push_was_rejected(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("403")
+        || error.contains("permission denied")
+        || error.contains("write access")
+        || error.contains("archived")
+        || error.contains("read-only")
+        || error.contains("repository not found")
+        || error.contains("authentication failed")
+        || error.contains("could not read username")
+}
+
+async fn create_independent_project_repository(
+    mut project: local::model::LocalProject,
+    chat: &ChatHost,
+) -> Result<local::model::LocalProject> {
+    let store = Store::open()?;
+    let legacy = store
+        .list_chat_sessions_by_project(&project.id)?
+        .into_iter()
+        .map(|session| session.id)
+        .filter(|id| {
+            local::git::existing_session_worktree_path(&project, id)
+                != local::git::session_worktree_path(&project.id, id)
+        })
+        .collect::<Vec<_>>();
+    // `git worktree move` would pull a running turn's checkout out from under it.
+    chat.while_idle(&legacy, || {
+        local::git::migrate_legacy_project_worktrees(&project, &legacy)
+    })
+    .await?;
+    let source_repository = project
+        .has_github_repository()
+        .then(|| (project.github_owner.clone(), project.github_repo.clone()));
+    let reroot_shallow = local::git::prepare_shallow_repository_for_publication(
+        std::path::Path::new(&project.repo_path),
+    )?;
+    let (owner, repo) = local::github::create_project_repo(&project.slug).await?;
+    if reroot_shallow {
+        local::git::reroot_shallow_repository(
+            std::path::Path::new(&project.repo_path),
+            &project.baseline_branch,
+            source_repository.as_ref(),
+        )?;
+    }
+    project.github_owner = owner;
+    project.github_repo = repo;
+    project.github_sync_enabled = false;
+    store.update_local_project(&project)?;
+    Ok(project)
+}
+
+async fn push_project_for_sync(
+    mut project: local::model::LocalProject,
+    chat: &ChatHost,
+) -> Result<(local::model::LocalProject, local::github::Status)> {
+    let github_status = local::github::status().await;
+    if !github_status.installed {
+        return Err(anyhow!(
+            "GitHub CLI (`gh`) is required — install it from https://cli.github.com."
+        ));
+    }
+    if !github_status.authenticated {
+        return Err(anyhow!("Authenticate GitHub first with `gh auth login`."));
+    }
+
+    let mut using_existing_repository = project.has_github_repository();
+    if using_existing_repository {
+        let can_push = local::github::repo_meta(&project.github_owner, &project.github_repo)
+            .await?
+            .is_some_and(|meta| meta.can_push && !meta.archived);
+        if !can_push {
+            project = create_independent_project_repository(project, chat).await?;
+            using_existing_repository = false;
+        }
+    } else {
+        project = create_independent_project_repository(project, chat).await?;
+        using_existing_repository = false;
+    }
+
+    let push_once = |project: &local::model::LocalProject| {
+        let mut project = project.clone();
+        project.github_sync_enabled = true;
+        tokio::task::spawn_blocking(move || push_project(&project))
+    };
+    let first_push = push_once(&project)
+        .await
+        .map_err(|error| anyhow!("Git push task failed: {error}"))?;
+    if let Err(error) = first_push {
+        if !using_existing_repository || !github_push_was_rejected(&error.to_string()) {
+            return Err(error);
+        }
+        project = create_independent_project_repository(project, chat).await?;
+        push_once(&project)
+            .await
+            .map_err(|error| anyhow!("Git push task failed: {error}"))??;
+    }
+
+    project.github_sync_enabled = true;
+    Store::open()?.update_local_project(&project)?;
+    Ok((project, github_status))
+}
+
+async fn enable_project_github(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
+    let store = Store::open()?;
+    let project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    let (project, github_status) = push_project_for_sync(project, &state.chat)
+        .await
+        .map_err(bad_request)?;
+    let git_status = project_git_json(&project, github_status);
+    Ok(Json(
+        json!({ "project": project_json(&project), "git": git_status }),
+    ))
+}
+
+async fn disable_project_github(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
+    let store = Store::open()?;
+    let mut project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    project.github_sync_enabled = false;
+    store.update_local_project(&project)?;
+    let github_status = local::github::status().await;
+    Ok(Json(json!({
+        "project": project_json(&project),
+        "git": project_git_json(&project, github_status),
+    })))
+}
+
+async fn push_project_github(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
+    let project = Store::open()?
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    let project_for_push = project.clone();
+    let github_status = local::github::status().await;
+    let git_status = tokio::task::spawn_blocking(move || -> Result<Value> {
+        push_project(&project_for_push)?;
+        Ok(project_git_json(&project_for_push, github_status))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("git task failed: {error}")))?
+    .map_err(bad_request)?;
+    Ok(Json(
+        json!({ "project": project_json(&project), "git": git_status }),
+    ))
+}
+
+async fn github_account() -> ApiResult {
+    Ok(Json(
+        json!({ "login": local::github::viewer_login().await.ok() }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ProjectRepoPreviewQuery {
+    name: String,
+}
+
+async fn github_project_repo_preview(Query(q): Query<ProjectRepoPreviewQuery>) -> ApiResult {
+    let candidate = local::projects::project_slug_preview(&Store::open()?, q.name.trim())?;
+    let repo = local::github::available_project_repo_name(&candidate)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "repo": repo })))
+}
+
+#[derive(Deserialize)]
+struct RepoAccessQuery {
+    owner: String,
+    repo: String,
+}
+
+async fn github_repo_access(Query(q): Query<RepoAccessQuery>) -> ApiResult {
+    let owner = q.owner.trim();
+    let repo = q.repo.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return Err(bad_request("owner and repo are required"));
+    }
+    let meta = local::github::repo_meta(owner, repo)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({
+        "canPush": meta.is_some_and(|meta| meta.can_push && !meta.archived),
+    })))
+}
+
+/// Mark a project visited: bumps updated_at, which drives the recency sort
+/// and the SSE project.updated diff.
+async fn open_project(Path(id): Path<String>) -> ApiResult {
+    let store = Store::open()?;
+    store.touch_local_project(&id)?;
+    let project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    Ok(Json(json!({ "project": project_json(&project) })))
+}
+
+/// Present-vs-absent for PATCH fields: absent = leave, null = clear.
+fn double_option<'de, D>(d: D) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProjectReq {
+    name: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    run_command: Option<Option<String>>,
+}
+
+async fn update_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateProjectReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    if req.name.is_none() && req.run_command.is_none() {
+        return Err(bad_request(
+            "nothing to update: pass name and/or runCommand",
+        ));
+    }
+    let store = Store::open()?;
+    let mut project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    if let Some(name) = req.name {
+        if name.trim().is_empty() {
+            return Err(bad_request("name cannot be empty"));
+        }
+        project.name = name.trim().to_string();
+    }
+    if let Some(cmd) = req.run_command {
+        project.run_command = cmd.filter(|c| !c.trim().is_empty());
+    }
+    store.update_local_project(&project)?;
+    // Re-read: update bumps updated_at, which is also what fires the SSE
+    // project.updated diff.
+    let project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    Ok(Json(json!({ "project": project_json(&project) })))
+}
+
+/// Delete a project and everything hanging off it. Refuses while runs are in
+/// flight (deleting their rows would strand the supervisor mid-job) — but
+/// requests their cancellation, so a retry shortly after goes through. The
+/// registered repository folder is left untouched.
+async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _deleting_project = state
+        .project_lifecycle
+        .begin_delete(&id)
+        .ok_or_else(|| bad_request("project has an operation or deletion in progress"))?;
+    reject_if_moving(&state)?;
+    let store = Store::open()?;
+    let project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    let in_flight: Vec<_> = store
+        .list_runs_by_project(&id)?
+        .into_iter()
+        .filter(|r| !is_terminal(&r.status))
+        .collect();
+    if !in_flight.is_empty() {
+        let mut failures = Vec::new();
+        for run in &in_flight {
+            if let Err(err) = crate::commands::exp::request_local_run_cancel(&store, &run.id) {
+                failures.push(format!("{}: {err}", run.id));
+            }
+        }
+        if !failures.is_empty() {
+            let requested = in_flight.len() - failures.len();
+            return Err(bad_request(format!(
+                "{requested} run(s) cancellation requested; cancellation failed for {}",
+                failures.join(", ")
+            )));
+        }
+        return Err(bad_request(format!(
+            "{} run(s) still in flight — cancellation requested; retry once they stop",
+            in_flight.len()
+        )));
+    }
+    // Abort any in-flight chat turns before their rows disappear, and clean up
+    // each session's serve child + worktree (the rows cascade with the project).
+    let sessions = store.list_chat_sessions_by_project(&id)?;
+    let mut _session_deletions = Vec::with_capacity(sessions.len());
+    for session in &sessions {
+        _session_deletions.push(
+            state
+                .chat
+                .begin_session_delete(&session.id)
+                .ok_or_else(|| bad_request("a chat session deletion is already in progress"))?,
+        );
+    }
+    for session in &sessions {
+        state.chat.clear_queue(&session.id)?;
+        let _ = state.chat.interrupt(&session.id).await;
+        state.chat.opencode.kill_session(&session.id).await;
+        state.chat.codex.kill_session(&session.id).await;
+        state.chat.claude.forget_session(&session.id).await;
+    }
+    store.delete_local_project(&id)?;
+    for session in &sessions {
+        local::chat::cleanup_session_transcript_artifacts(&session.id);
+        local::chat::cleanup_session_worktree(&project, &session.id);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_experiments(Path(id): Path<String>) -> ApiResult {
+    let store = Store::open()?;
+    store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    let experiments = store.list_experiments_by_project(&id)?;
+    Ok(Json(json!({ "experiments": experiments })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveExperimentRequest {
+    direction: String,
+    archived: bool,
+}
+
+async fn set_experiment_archive(
+    Path(id): Path<String>,
+    Json(request): Json<ArchiveExperimentRequest>,
+) -> ApiResult {
+    let direction = match request.direction.as_str() {
+        "ancestors" => local::experiments::ArchiveDirection::Ancestors,
+        "descendants" => local::experiments::ArchiveDirection::Descendants,
+        "only" => local::experiments::ArchiveDirection::Only,
+        "region" => local::experiments::ArchiveDirection::Region,
+        "taskRegion" => local::experiments::ArchiveDirection::TaskRegion,
+        _ => {
+            return Err(bad_request(
+                "direction must be ancestors, descendants, only, region, or taskRegion",
+            ))
+        }
+    };
+    let mut store = Store::open()?;
+    if store.get_local_experiment(&id)?.is_none() {
+        return Err(not_found("experiment"));
+    }
+    let ids = local::experiments::set_archived(&mut store, &id, direction, request.archived)?;
+    Ok(Json(json!({ "ids": ids })))
+}
+
+async fn list_project_runs(Path(id): Path<String>) -> ApiResult {
+    let store = Store::open()?;
+    store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    let runs: Vec<ApiRun> = store
+        .list_runs_by_project(&id)?
+        .iter()
+        .map(ApiRun::from)
+        .collect();
+    Ok(Json(json!({ "runs": runs })))
+}
+
+async fn compute_backends() -> Json<Value> {
+    Json(json!({ "backends": crate::compute::capabilities() }))
+}
+
+/// Dashboard requests omit `chat_session_id`; forwarded agent CLI requests use
+/// it only for run attribution and wakeups.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRunReq {
+    invocation_context: Option<String>,
+    #[serde(default)]
+    telemetry_suppressed: bool,
+    experiment_id: String,
+    backend: Option<String>,
+    flavor: Option<String>,
+    host: Option<String>,
+    container: Option<String>,
+    #[serde(default)]
+    no_container: bool,
+    manifest: Option<String>,
+    image: Option<String>,
+    timeout: Option<String>,
+    #[serde(default)]
+    force: bool,
+    chat_session_id: Option<String>,
+    agent_origin: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateRunResponse {
+    run: ApiRun,
+}
+
+pub(crate) struct RunLaunchSummary {
+    pub run_id: String,
+    pub experiment_id: String,
+    pub job_id: Option<String>,
+}
+
+async fn decode_local_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    action: &str,
+) -> Result<T> {
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| anyhow!("orx up {action} response failed: {error}"))?;
+    if !status.is_success() {
+        let detail = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|error| error.trim().to_string())
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
+        if detail.is_empty() {
+            return Err(anyhow!("orx up could not {action}: HTTP {status}"));
+        }
+        if status.is_client_error() {
+            return Err(anyhow!("{detail}"));
+        }
+        return Err(anyhow!("orx up could not {action}: {detail}"));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| anyhow!("orx up returned an invalid {action} response: {error}"))
+}
+
+fn local_client() -> Result<reqwest::Client> {
+    crate::net::loopback_client()
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|error| anyhow!("Could not create the orx up client: {error}"))
+}
+
+fn authenticate_up_request(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var(local::chat::UP_AUTH_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+        .or_else(|| local::chat::up_auth_token().map(str::to_string))
+    {
+        Some(token) => builder.bearer_auth(token),
+        None => builder,
+    }
+}
+
+pub(crate) async fn submit_run_via_up(
+    port: u16,
+    args: &crate::ExpRunArgs,
+) -> Result<RunLaunchSummary> {
+    let request = CreateRunReq {
+        telemetry_suppressed: args.telemetry_suppressed
+            || !crate::telemetry::accounting_reports_enabled(),
+        invocation_context: args
+            .invocation_identity()?
+            .map(|identity| serde_json::to_string(&identity))
+            .transpose()?,
+        experiment_id: args.exp_id.clone(),
+        backend: args.backend.clone(),
+        flavor: args.flavor.clone(),
+        host: args.host.clone(),
+        container: args.container.clone(),
+        no_container: args.no_container,
+        manifest: args.manifest.clone(),
+        image: args.image.clone(),
+        timeout: args.timeout.clone(),
+        force: args.force,
+        chat_session_id: args.launching_chat_session(),
+        agent_origin: args.agent_origin.clone(),
+    };
+    let response =
+        authenticate_up_request(local_client()?.post(format!("http://127.0.0.1:{port}/api/runs")))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| anyhow!("Could not reach the trusted orx up process: {error}"))?;
+    let response: CreateRunResponse = decode_local_response(response, "start the run").await?;
+    let job_id = response
+        .run
+        .backend
+        .as_ref()
+        .and_then(|backend| backend.get("jobId"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(RunLaunchSummary {
+        run_id: response.run.id,
+        experiment_id: args.exp_id.clone(),
+        job_id,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct HarnessInstall {
+    pub name: String,
+    pub installed: bool,
+}
+
+/// `orx up`'s install evidence for `harness`, from its own PATH rather than the caller's.
+pub(crate) async fn harness_install_via_up(port: u16, harness: &str) -> Result<HarnessInstall> {
+    let response = authenticate_up_request(local_client()?.get(format!(
+        "http://127.0.0.1:{port}/api/harnesses/{harness}/snapshot"
+    )))
+    .timeout(Duration::from_secs(10))
+    .send()
+    .await
+    .map_err(|error| anyhow!("Could not reach the trusted orx up process: {error}"))?;
+    decode_local_response(response, "check the harness").await
+}
+
+pub(crate) async fn cancel_run_via_up(port: u16, run_id: &str) -> Result<()> {
+    let response = authenticate_up_request(
+        local_client()?.post(format!("http://127.0.0.1:{port}/api/runs/{run_id}/cancel")),
+    )
+    .send()
+    .await
+    .map_err(|error| anyhow!("Could not reach the trusted orx up process: {error}"))?;
+    let _: Value = decode_local_response(response, "cancel the run").await?;
+    Ok(())
+}
+
+async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    let store = Store::open()?;
+    let experiment = store
+        .get_local_experiment(&req.experiment_id)?
+        .ok_or_else(|| not_found("experiment"))?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&experiment.project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    let mut backend = req.backend;
+    let mut flavor = req.flavor;
+    // Dashboard callers may omit these; forwarded CLI requests arrive resolved.
+    local::apply_compute_default(&mut backend, &mut flavor);
+    let args = crate::ExpRunArgs {
+        invocation_context: req.invocation_context,
+        telemetry_suppressed: req.telemetry_suppressed,
+        exp_id: req.experiment_id,
+        backend: Some(backend.unwrap_or_else(|| "local".to_string())),
+        flavor,
+        host: req.host,
+        container: req.container,
+        no_container: req.no_container,
+        manifest: req.manifest,
+        image: req.image,
+        timeout: req.timeout,
+        force: req.force,
+        chat_session_id: req.chat_session_id,
+        agent_origin: req.agent_origin,
+        forwarded: true,
+    };
+    crate::compute::validate_run_args(&args).map_err(bad_request)?;
+    let run = crate::compute::submit(&args).await.map_err(bad_request)?;
+    Ok(Json(json!({ "run": ApiRun::from(&run) })))
+}
+
+fn backend_for_run(
+    run: &StoredRun,
+) -> std::result::Result<Box<dyn crate::compute::ComputeBackend>, ApiError> {
+    let descriptor =
+        crate::jobs::BackendDescriptor::parse(&run.backend_json).map_err(bad_request)?;
+    let id = descriptor
+        .kind
+        .strip_suffix("_job")
+        .unwrap_or(&descriptor.kind);
+    let id = if id == "k8s" { "k8s" } else { id };
+    crate::compute::backend(id).map_err(bad_request)
+}
+
+async fn get_run(Path(id): Path<String>) -> ApiResult {
+    let run = Store::open()?
+        .get_run(&id)?
+        .ok_or_else(|| not_found("run"))?;
+    let backend = backend_for_run(&run)?;
+    let run = backend.status(&run).await.map_err(bad_request)?;
+    if is_terminal(&run.status) {
+        backend.cleanup(&run).await.map_err(bad_request)?;
+    }
+    Ok(Json(json!({ "run": ApiRun::from(&run) })))
+}
+
+/// Newest-first cap for the cross-project instances list. Generous: the store
+/// is a local single-user SQLite db, so this only bounds pathological history.
+const INSTANCES_LIMIT: usize = 500;
+
+/// Every run across all projects (running first on the client), each tagged
+/// with its owning project's name — the "instances" view of compute the agents
+/// have spun up (Modal / HF / SSH / K8s), regardless of which project launched
+/// it. Includes finished runs as history; the client surfaces live ones first.
+async fn list_instances() -> ApiResult {
+    let store = Store::open()?;
+    let names: HashMap<String, String> = store
+        .list_local_projects()?
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect();
+    let mut instances: Vec<Value> = Vec::new();
+    for run in store.list_runs(INSTANCES_LIMIT)? {
+        // ApiRun is a plain serializable struct, so this can't realistically
+        // fail; propagate rather than emit a malformed row if it ever does.
+        let mut value = serde_json::to_value(ApiRun::from(&run))
+            .map_err(|e| anyhow!("serialize run {}: {e}", run.id))?;
+        if let (Some(obj), Some(name)) = (value.as_object_mut(), names.get(&run.project_id)) {
+            obj.insert("projectName".into(), json!(name));
+        }
+        instances.push(value);
+    }
+    Ok(Json(json!({ "instances": instances })))
+}
+
+async fn cancel_run(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let store = Store::open()?;
+    let run = local::local_run(&store, &id)?.ok_or_else(|| not_found("run"))?;
+    // A terminal run must not gain a stale cancel_requested flag.
+    if is_terminal(&run.status) {
+        return Ok(Json(json!({ "ok": true, "alreadyTerminal": true })));
+    }
+    let backend = backend_for_run(&run)?;
+    backend.cancel(&run).await.map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    cursor: Option<u64>,
+}
+
+async fn run_logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> ApiResult {
+    let run = Store::open()?
+        .get_run(&id)?
+        .ok_or_else(|| not_found("run"))?;
+    let batch = backend_for_run(&run)?
+        .logs(&run, crate::compute::LogCursor(q.cursor.unwrap_or(0)))
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!(batch)))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    offset: Option<u64>,
+}
+
+async fn run_log(Path(id): Path<String>, Query(q): Query<LogQuery>) -> ApiResult {
+    let store = Store::open()?;
+    store.get_run(&id)?.ok_or_else(|| not_found("run"))?;
+    let offset = q.offset.unwrap_or(0);
+    let chunk = read_log_from(&id, offset, 4_000_000);
+    let next_offset = offset + chunk.len() as u64;
+    Ok(Json(json!({
+        "dataBase64": base64::engine::general_purpose::STANDARD.encode(&chunk),
+        "nextOffset": next_offset,
+        "eof": next_offset >= log_size(&id),
+    })))
+}
+
+// --- diffs ------------------------------------------------------------------
+//
+// The UI diff component consumes the standard diff payload:
+// `{diff, truncated, bytesRead, byteLimit}` with the raw unified-diff text.
+// All of these shell out to git against the project's local clone, so they
+// run on the blocking pool.
+
+fn diff_json(d: local::git::DiffPayload) -> Value {
+    json!({
+        "diff": d.diff,
+        "truncated": d.truncated,
+        "bytesRead": d.bytes_read,
+        "byteLimit": local::git::MAX_DIFF_BYTES,
+    })
+}
+
+/// Off-worker helper for git-backed handlers.
+async fn blocking_api<F>(f: F) -> ApiResult
+where
+    F: FnOnce() -> std::result::Result<Json<Value>, ApiError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::from(anyhow!("git task failed: {e}")))?
+}
+
+/// Cumulative diff of a run's commit vs its experiment's parent branch. A root
+/// experiment on a distinct branch compares against the project's baseline.
+async fn run_diff(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let run = store.get_run(&id)?.ok_or_else(|| not_found("run"))?;
+        let sha = run
+            .commit_sha
+            .clone()
+            .ok_or_else(|| bad_request("run has no commit to diff"))?;
+        let exp = store
+            .get_local_experiment(&run.experiment_id)?
+            .ok_or_else(|| not_found("experiment"))?;
+        let project = store
+            .get_local_project(&exp.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let base = match exp.parent_experiment_id {
+            Some(parent_id) => {
+                store
+                    .get_local_experiment(&parent_id)?
+                    .ok_or_else(|| not_found("parent experiment"))?
+                    .branch_name
+            }
+            None => project.baseline_branch.clone(),
+        };
+        let repo = std::path::Path::new(&project.repo_path);
+        let payload = local::git::diff_range(repo, &base, &sha)?;
+        Ok(Json(diff_json(payload)))
+    })
+    .await
+}
+
+/// Cumulative committed diff of an experiment branch vs its parent branch.
+async fn experiment_diff(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let exp = store
+            .get_local_experiment(&id)?
+            .ok_or_else(|| not_found("experiment"))?;
+        let project = store
+            .get_local_project(&exp.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let base = match &exp.parent_experiment_id {
+            Some(parent_id) => {
+                store
+                    .get_local_experiment(parent_id)?
+                    .ok_or_else(|| not_found("parent experiment"))?
+                    .branch_name
+            }
+            None => project.baseline_branch.clone(),
+        };
+        let repo = std::path::Path::new(&project.repo_path);
+        Ok(Json(diff_json(local::git::diff_range(
+            repo,
+            &base,
+            &exp.branch_name,
+        )?)))
+    })
+    .await
+}
+
+/// Commits on the experiment branch: child experiments list `parent..branch`,
+/// the baseline lists the branch's recent history.
+async fn experiment_commits(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let exp = store
+            .get_local_experiment(&id)?
+            .ok_or_else(|| not_found("experiment"))?;
+        let project = store
+            .get_local_project(&exp.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let repo = std::path::Path::new(&project.repo_path);
+        let commits = match &exp.parent_experiment_id {
+            Some(pid) => {
+                let parent = store
+                    .get_local_experiment(pid)?
+                    .ok_or_else(|| not_found("parent experiment"))?;
+                local::git::list_commits_between(repo, &parent.branch_name, &exp.branch_name, 100)?
+            }
+            None if exp.branch_name != project.baseline_branch => local::git::list_commits_between(
+                repo,
+                &project.baseline_branch,
+                &exp.branch_name,
+                100,
+            )?,
+            None => local::git::list_commits(repo, &exp.branch_name, 25)?,
+        };
+        let commits: Vec<Value> = commits
+            .iter()
+            .map(|c| json!({ "sha": c.sha, "subject": c.subject, "committedAt": c.committed_at }))
+            .collect();
+        Ok(Json(json!({ "commits": commits })))
+    })
+    .await
+}
+
+async fn experiment_commit_diff(Path((id, sha)): Path<(String, String)>) -> ApiResult {
+    if !sha.chars().all(|c| c.is_ascii_hexdigit()) || sha.len() < 7 || sha.len() > 64 {
+        return Err(bad_request("invalid commit sha"));
+    }
+    blocking_api(move || {
+        let store = Store::open()?;
+        let exp = store
+            .get_local_experiment(&id)?
+            .ok_or_else(|| not_found("experiment"))?;
+        let project = store
+            .get_local_project(&exp.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let repo = std::path::Path::new(&project.repo_path);
+        let payload = local::git::commit_diff(repo, &sha)?;
+        Ok(Json(diff_json(payload)))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrewarmStarterPromptsReq {
+    name: String,
+    paper_id: Option<String>,
+    /// An existing folder the project will be created from.
+    path: Option<String>,
+    locale: Option<String>,
+}
+
+/// Start generating starter prompts for a project the user is still naming in
+/// the new-project form, so they are cached before the project exists.
+async fn prewarm_starter_prompts(Json(req): Json<PrewarmStarterPromptsReq>) -> ApiResult {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(bad_request("name is required"));
+    }
+    let paper_id = req
+        .paper_id
+        .as_deref()
+        .map(super::paper::parse_paper_id)
+        .filter(|id| !id.is_empty());
+    let path = req
+        .path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    local::starter::prewarm(
+        name,
+        paper_id,
+        path,
+        req.locale.unwrap_or_else(|| "en".to_string()),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct StarterPromptsQuery {
+    /// Chat harness whose one-shot child writes the prompts; the composer's
+    /// current pick. Unknown or missing = no prompts.
+    harness: Option<String>,
+    /// The composer's model, so the child runs on what the chat will use.
+    model: Option<String>,
+    /// UI locale the prompts are written in.
+    locale: Option<String>,
+}
+
+/// Four starter prompts for the empty chat, written by a model that has read
+/// the project (paper, README, code). Slow on a cache miss — one headless
+/// model call — so the UI shows a placeholder while it waits. A blank project
+/// is flagged instead so the UI shows its pre-written prompts.
+async fn project_starter_prompts(
+    Path(id): Path<String>,
+    Query(q): Query<StarterPromptsQuery>,
+) -> ApiResult {
+    let (project, experiment_count) = tokio::task::spawn_blocking(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let experiment_count = store.list_experiments_by_project(&project.id)?.len();
+        Ok::<_, ApiError>((project, experiment_count))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("starter task failed: {e}")))??;
+    let harness = q
+        .harness
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| local::harness::is_chat_harness(h));
+    // Past "getting started" or no chat harness named: nothing to offer
+    // (empty), as opposed to a harness that could not answer (null).
+    let Some(harness) = harness.filter(|_| experiment_count == 0) else {
+        return Ok(Json(json!({ "prompts": [], "blank": false })));
+    };
+    let locale = q.locale.as_deref().unwrap_or("en");
+    let agent = local::starter::Agent {
+        harness: harness.to_string(),
+        model: q
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(String::from),
+    };
+    let (prompts, blank) = match local::starter::prompts(&project, &agent, locale).await {
+        local::starter::Starter::Blank => (Some(Vec::new()), true),
+        local::starter::Starter::Generated(prompts) => (prompts, false),
+    };
+    Ok(Json(json!({ "prompts": prompts, "blank": blank })))
+}
+
+/// Live uncommitted changes in the project's clone (the agent's working
+/// tree), mapped back to the experiment whose branch is checked out.
+async fn project_working_tree(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let repo = std::path::Path::new(&project.repo_path);
+        let (branch, payload) = local::git::working_tree_diff(repo)?;
+        let experiment_id = match &branch {
+            Some(b) => store
+                .list_experiments_by_project(&project.id)?
+                .into_iter()
+                .find(|e| &e.branch_name == b)
+                .map(|e| e.id),
+            None => None,
+        };
+        Ok(Json(json!({
+            "branch": branch,
+            "experimentId": experiment_id,
+            "diff": payload.diff,
+            "truncated": payload.truncated,
+        })))
+    })
+    .await
+}
+
+/// Live view of one chat session's private worktree — what the agent has
+/// changed, before any run exists. Unlike `project_working_tree` (clone-scoped,
+/// diffed against HEAD), the session worktree starts detached on the baseline
+/// tip and the agent commits to experiment branches, so "what it changed" is
+/// the working tree diffed against the merge-base of the baseline and HEAD; a
+/// bare HEAD diff would hide every committed edit. Read-only throughout: no
+/// index-touching (`git add -N`) that would mutate the agent's checkout.
+///
+/// A never-started session (worktree is lazy) or a pruned worktree degrades to
+/// `resolve_checkout_root`'s clone fallback; we report `{ exists: false }`
+/// rather than pass off the clone's contents as the session's work.
+async fn session_worktree(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, root_kind) = resolve_checkout_root(&store, &project, Some(&id))?;
+        if root_kind != "worktree" {
+            return Ok(Json(json!({ "exists": false })));
+        }
+        let branch = local::git::current_branch(&root);
+        // Diff against the merge-base of the baseline tip and HEAD — the fork
+        // point of the agent's work. Every step that can't resolve (unrelated
+        // histories, unborn HEAD) falls back to HEAD, so
+        // the diff degrades to "uncommitted only" rather than erroring.
+        let baseline = &project.baseline_branch;
+        let base =
+            local::git::merge_base(&root, baseline, "HEAD")?.unwrap_or_else(|| "HEAD".to_string());
+        let files = local::git::changed_files(&root, &base)?;
+        let payload = local::git::working_tree_diff_against(&root, Some(&base))?;
+        Ok(Json(json!({
+            "exists": true,
+            "branch": branch,
+            "baselineBranch": baseline,
+            "baseSha": base,
+            "files": files,
+            "diff": diff_json(payload),
+        })))
+    })
+    .await
+}
+
+/// Cap on file bytes served to the viewer.
+const FILE_READ_LIMIT: u64 = 512_000;
+
+/// Resolve which on-disk checkout answers a file/code request for a project.
+///
+/// The chat session's worktree is where the agent actually works, so it can
+/// hold files the hub clone's checkout never sees. When `session_id` is given
+/// it must be this project's session (the authorization boundary, which also
+/// pins the worktree dir to a store-issued id); a missing worktree (pruned, or
+/// never created) degrades to the clone rather than erroring, but any other
+/// worktree failure is reported, not papered over. Returns the canonicalized
+/// root and whether it is the `"worktree"` or the `"clone"`.
+fn resolve_checkout_root(
+    store: &Store,
+    project: &local::model::LocalProject,
+    session_id: Option<&str>,
+) -> std::result::Result<(std::path::PathBuf, &'static str), ApiError> {
+    let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
+    let worktree = match session_id {
+        Some(s) => {
+            let session = store
+                .get_chat_session(s)?
+                .filter(|sess| sess.project_id == project.id)
+                .ok_or_else(|| not_found("chat session"))?;
+            let dir = local::git::existing_session_worktree_path(project, &session.id);
+            match crate::paths::canonicalize(&dir) {
+                Ok(p) => Some(p),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(ApiError::from(anyhow!("session worktree unavailable: {e}"))),
+            }
+        }
+        None => None,
+    };
+    match worktree {
+        Some(r) => Ok((r, "worktree")),
+        None => Ok((
+            crate::paths::canonicalize(&project.repo_path)
+                .map_err(|e| ApiError::from(anyhow!("repo clone unavailable: {e}")))?,
+            "clone",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeTreeQuery {
+    /// Branch to list the committed tree of; absent lists a live checkout.
+    r#ref: Option<String>,
+    /// Chat session whose worktree to list (the live view the Worktree tab's
+    /// Files pane wants). Absent falls back to the hub clone's checkout.
+    /// Mutually exclusive with `ref` — a committed tree has no live worktree.
+    session_id: Option<String>,
+}
+
+/// Cap on entries returned by the code-tree listing.
+const CODE_TREE_LIMIT: usize = 20_000;
+
+/// Flat file listing for the UI code browser. With `ref`: the committed tree
+/// of that branch (local ref first, then origin's), independent of any
+/// checkout. Without: the hub clone's checkout via `git ls-files`, so
+/// gitignored trees are excluded and untracked-but-new files are included.
+/// Paths are repo-relative; the client builds the nested tree.
+async fn project_code_tree(Path(id): Path<String>, Query(q): Query<CodeTreeQuery>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let ref_name = q.r#ref.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let session_id = q
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if ref_name.is_some() && session_id.is_some() {
+            return Err(bad_request("ref and sessionId are mutually exclusive"));
+        }
+        // Branch refs live in the shared object DB — any checkout resolves them;
+        // for a live listing the session's worktree is the live view when given
+        // (its untracked files the clone never sees), else the hub clone.
+        let (root, root_kind) = resolve_checkout_root(&store, &project, session_id)?;
+        let path = ref_name
+            .is_none()
+            .then(|| root.to_string_lossy().into_owned());
+        let (root_kind, branch, mut entries) = match ref_name {
+            Some(name) => {
+                let sha = local::git::resolve_branch_commit(&root, name)?
+                    .ok_or_else(|| not_found("branch"))?;
+                let entries = local::git::list_tree_files(&root, &sha)?;
+                ("branch", Some(name.to_string()), entries)
+            }
+            None => {
+                let branch = local::git::current_branch(&root);
+                let entries = local::git::list_worktree_files(&root)?;
+                (root_kind, branch, entries)
+            }
+        };
+        entries.sort();
+        // During a merge conflict `ls-files --cached` emits an unmerged path
+        // once per stage — collapse to one entry (they'd be duplicate keys).
+        entries.dedup();
+        let truncated = entries.len() > CODE_TREE_LIMIT;
+        entries.truncate(CODE_TREE_LIMIT);
+        Ok(Json(json!({
+            "root": root_kind,
+            "path": path,
+            "branch": branch,
+            "entries": entries,
+            "truncated": truncated,
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectFileQuery {
+    path: String,
+    /// Chat session whose worktree holds the file. Absent (or the worktree
+    /// already pruned) falls back to the hub clone. Ignored when `ref` is given.
+    session_id: Option<String>,
+    /// Branch to read the committed file from, instead of a live checkout.
+    r#ref: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectFileResponse {
+    path: String,
+    content: String,
+    truncated: bool,
+    binary: bool,
+    not_found: bool,
+    root: &'static str,
+    presentation: local::files::FilePresentation,
+    version: Option<String>,
+}
+
+impl ProjectFileResponse {
+    fn missing(
+        path: String,
+        root: &'static str,
+        presentation: local::files::FilePresentation,
+    ) -> Self {
+        Self {
+            path,
+            content: String::new(),
+            truncated: false,
+            binary: false,
+            not_found: true,
+            root,
+            presentation,
+            version: None,
+        }
+    }
+
+    fn non_text(
+        path: String,
+        root: &'static str,
+        presentation: local::files::FilePresentation,
+    ) -> Self {
+        Self {
+            path,
+            content: String::new(),
+            truncated: false,
+            binary: true,
+            not_found: false,
+            root,
+            presentation,
+            version: None,
+        }
+    }
+
+    fn text(
+        path: String,
+        root: &'static str,
+        content: String,
+        truncated: bool,
+        binary: bool,
+        presentation: local::files::FilePresentation,
+        version: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            content,
+            truncated,
+            binary,
+            not_found: false,
+            root,
+            presentation,
+            version,
+        }
+    }
+}
+
+fn file_version(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn file_version_on_disk(path: &std::path::Path) -> std::result::Result<String, ApiError> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| ApiError::from(anyhow!("save failed: {error}")))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| ApiError::from(anyhow!("save failed: {error}")))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validated_project_file_path(
+    path: &str,
+) -> std::result::Result<(String, std::path::PathBuf), ApiError> {
+    let rel = path.trim().trim_start_matches("./").to_string();
+    if rel.is_empty() || rel.len() > 1024 {
+        return Err(bad_request("invalid path"));
+    }
+    let rel_path = std::path::PathBuf::from(&rel);
+    let traversal = rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)));
+    if traversal {
+        return Err(bad_request("path must be repo-relative"));
+    }
+    Ok((rel, rel_path))
+}
+
+fn decode_project_file_text(bytes: Vec<u8>, truncated: bool) -> (String, bool) {
+    if bytes.contains(&0) {
+        return (String::new(), true);
+    }
+    match String::from_utf8(bytes) {
+        Ok(content) => (content, false),
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid_up_to = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid_up_to);
+            (String::from_utf8(bytes).unwrap_or_default(), false)
+        }
+        Err(_) => (String::new(), true),
+    }
+}
+
+/// One file for the UI file viewer. With `ref`: the committed content on that
+/// branch (a streamed, capped `git cat-file` read), independent of any
+/// checkout. Without: the project's checkout — the chat session's worktree
+/// when `sessionId` is given, else the hub clone. Path is repo-relative;
+/// traversal outside the checkout is rejected. The response's `root` says
+/// which source actually answered, so the UI can flag fallback.
+async fn project_file(
+    Path(id): Path<String>,
+    Query(q): Query<ProjectFileQuery>,
+) -> std::result::Result<Json<ProjectFileResponse>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let (rel, rel_path) = validated_project_file_path(&q.path)?;
+
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let presentation = local::files::presentation_for_path(&rel);
+        let ref_name = q.r#ref.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(name) = ref_name {
+            let (root, _) = resolve_checkout_root(&store, &project, None)?;
+            let sha = local::git::resolve_branch_commit(&root, name)?
+                .ok_or_else(|| not_found("branch"))?;
+            if !matches!(
+                presentation,
+                local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+            ) {
+                return if local::git::file_size_at(&root, &sha, &rel)?.is_some() {
+                    Ok(Json(ProjectFileResponse::non_text(
+                        rel,
+                        "branch",
+                        presentation,
+                    )))
+                } else {
+                    Ok(Json(ProjectFileResponse::missing(
+                        rel,
+                        "branch",
+                        presentation,
+                    )))
+                };
+            }
+            // Streamed + capped: a committed multi-GB blob must not become a
+            // multi-GB allocation. Missing path is an exit-code check inside
+            // the helper (`cat-file -e`) — no error-message parsing.
+            return match local::git::file_bytes_at_capped(&root, &sha, &rel, FILE_READ_LIMIT)? {
+                Some((bytes, truncated)) => {
+                    let (content, binary) = decode_project_file_text(bytes, truncated);
+                    let presentation = if binary {
+                        local::files::FilePresentation::Download
+                    } else {
+                        local::files::FilePresentation::Text
+                    };
+                    Ok(Json(ProjectFileResponse::text(
+                        rel,
+                        "branch",
+                        content,
+                        truncated,
+                        binary,
+                        presentation,
+                        None,
+                    )))
+                }
+                None => Ok(Json(ProjectFileResponse::missing(
+                    rel,
+                    "branch",
+                    presentation,
+                ))),
+            };
+        }
+        let (root, root_kind) = resolve_checkout_root(&store, &project, q.session_id.as_deref())?;
+        // Canonicalize so symlinks can't escape the checkout.
+        let full = match crate::paths::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    rel,
+                    root_kind,
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        if !matches!(
+            presentation,
+            local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+        ) {
+            return Ok(Json(ProjectFileResponse::non_text(
+                rel,
+                root_kind,
+                presentation,
+            )));
+        }
+        let file = match std::fs::File::open(&full) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    rel,
+                    root_kind,
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        let mut buf = Vec::new();
+        std::io::Read::take(file, FILE_READ_LIMIT + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+        let truncated = buf.len() as u64 > FILE_READ_LIMIT;
+        buf.truncate(FILE_READ_LIMIT as usize);
+        let (content, binary) = decode_project_file_text(buf, truncated);
+        let version = (!truncated && !binary).then(|| file_version(content.as_bytes()));
+        let presentation = if binary {
+            local::files::FilePresentation::Download
+        } else {
+            local::files::FilePresentation::Text
+        };
+        Ok(Json(ProjectFileResponse::text(
+            rel,
+            root_kind,
+            content,
+            truncated,
+            binary,
+            presentation,
+            version,
+        )))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
+}
+
+/// Upper bound on a single save — generous room to grow past the read cap while
+/// still bounding one write.
+const FILE_WRITE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// True when a repo-relative path steps into the `.git` metadata dir — writing
+/// there (`config`, `hooks/*`) is an arbitrary-command vector. Case-insensitive
+/// so `.GIT` can't slip past on macOS/Windows.
+fn touches_git_dir(rel_path: &std::path::Path) -> bool {
+    rel_path.components().any(
+        |c| matches!(c, std::path::Component::Normal(name) if name.eq_ignore_ascii_case(".git")),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteProjectFileReq {
+    path: String,
+    content: String,
+    /// Chat session whose worktree owns the file; absent writes the hub clone.
+    session_id: Option<String>,
+    /// Exact version returned by the read endpoint. Older clients may omit it.
+    expected_version: Option<String>,
+}
+
+enum WriteProjectFileOutcome {
+    Saved(Value),
+    Conflict {
+        current_version: Option<String>,
+        exists: bool,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FileAction {
+    Rename,
+    Duplicate,
+    Delete,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManageFileReq {
+    path: String,
+    action: FileAction,
+    new_name: Option<String>,
+    session_id: Option<String>,
+}
+
+fn validated_file_name(name: Option<&str>) -> std::result::Result<&str, ApiError> {
+    let name = name.map(str::trim).filter(|name| !name.is_empty());
+    match name {
+        Some(name)
+            if name != "." && name != ".." && name.len() <= 255 && !name.contains(['/', '\\']) =>
+        {
+            Ok(name)
+        }
+        _ => Err(bad_request("invalid file name")),
+    }
+}
+
+fn duplicate_file_name(name: &str, number: usize) -> String {
+    let suffix = if number == 1 {
+        " copy".to_string()
+    } else {
+        format!(" copy {number}")
+    };
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => format!("{stem}{suffix}.{extension}"),
+        _ => format!("{name}{suffix}"),
+    }
+}
+
+/// API paths are `/`-separated; a Windows `PathBuf` would send backslashes back.
+#[cfg(windows)]
+fn api_rel_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn api_rel_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn manage_local_file(
+    root: &std::path::Path,
+    rel: &str,
+    action: FileAction,
+    new_name: Option<&str>,
+    protect_git_dir: bool,
+) -> std::result::Result<String, ApiError> {
+    let (rel, rel_path) = validated_project_file_path(rel)?;
+    if protect_git_dir && touches_git_dir(&rel_path) {
+        return Err(bad_request("cannot manage files under .git"));
+    }
+    let root = crate::paths::canonicalize(root)
+        .map_err(|e| ApiError::from(anyhow!("file root unavailable: {e}")))?;
+    let source = root.join(&rel_path);
+    let resolved = crate::paths::canonicalize(&source).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => not_found("file"),
+        _ => ApiError::from(anyhow!("file unavailable: {e}")),
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err(bad_request("path escapes file root"));
+    }
+    if protect_git_dir && resolved.strip_prefix(&root).is_ok_and(touches_git_dir) {
+        return Err(bad_request("cannot manage files under .git"));
+    }
+    if resolved.is_dir() {
+        return Err(bad_request("path is a directory"));
+    }
+
+    let parent = source.parent().ok_or_else(|| bad_request("invalid path"))?;
+    let parent = crate::paths::canonicalize(parent)
+        .map_err(|e| ApiError::from(anyhow!("parent directory unavailable: {e}")))?;
+    if !parent.starts_with(&root) {
+        return Err(bad_request("path escapes file root"));
+    }
+    if matches!(action, FileAction::Delete) {
+        std::fs::remove_file(&source).map_err(|e| ApiError::from(anyhow!("delete failed: {e}")))?;
+        return Ok(rel);
+    }
+
+    if matches!(action, FileAction::Duplicate)
+        && std::fs::symlink_metadata(&source)
+            .map_err(|e| ApiError::from(anyhow!("file unavailable: {e}")))?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(bad_request("cannot duplicate a symbolic link"));
+    }
+    let old_name = rel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| bad_request("invalid file name"))?;
+    let destination_name = match action {
+        FileAction::Rename => validated_file_name(new_name)?.to_string(),
+        FileAction::Duplicate => {
+            let mut number = 1;
+            loop {
+                let candidate = duplicate_file_name(old_name, number);
+                match std::fs::symlink_metadata(parent.join(&candidate)) {
+                    Ok(_) => number += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break candidate,
+                    Err(error) => {
+                        return Err(ApiError::from(anyhow!(
+                            "could not choose a copy name: {error}"
+                        )))
+                    }
+                }
+            }
+        }
+        FileAction::Delete => unreachable!(),
+    };
+    let destination_rel = rel_path.with_file_name(&destination_name);
+    if protect_git_dir && touches_git_dir(&destination_rel) {
+        return Err(bad_request("cannot manage files under .git"));
+    }
+    if destination_rel == rel_path {
+        return Ok(rel);
+    }
+    let destination = parent.join(&destination_name);
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(bad_request("a file with that name already exists"));
+        }
+        Ok(_) => match crate::paths::canonicalize(&destination) {
+            Ok(path) if path == resolved => {}
+            Ok(_) | Err(_) => return Err(bad_request("a file with that name already exists")),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ApiError::from(anyhow!("destination unavailable: {error}"))),
+    }
+    match action {
+        FileAction::Rename => std::fs::rename(&source, &destination)
+            .map_err(|e| ApiError::from(anyhow!("rename failed: {e}")))?,
+        FileAction::Duplicate => {
+            std::fs::copy(&source, &destination)
+                .map_err(|e| ApiError::from(anyhow!("copy failed: {e}")))?;
+        }
+        FileAction::Delete => unreachable!(),
+    }
+    Ok(api_rel_path(&destination_rel))
+}
+
+async fn manage_project_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ManageFileReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, root_kind) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        if req.session_id.is_some() && root_kind == "clone" {
+            return Err(bad_request(
+                "this session's worktree is no longer available — reload the files",
+            ));
+        }
+        let path = manage_local_file(&root, &req.path, req.action, req.new_name.as_deref(), true)?;
+        Ok(Json(json!({ "ok": true, "path": path })))
+    })
+    .await
+}
+
+/// Overwrite an existing text file in the project's live checkout with edited
+/// content. Only the worktree/clone is writable — committed branch trees have no
+/// `ref` path here and stay read-only. Traversal and symlink escapes are
+/// rejected by canonicalizing the target and confirming it stays under the root.
+async fn write_project_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<WriteProjectFileReq>,
+) -> std::result::Result<Response, ApiError> {
+    reject_if_moving(&state)?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let (rel, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot edit files under .git"));
+        }
+        if req.content.len() as u64 > FILE_WRITE_LIMIT {
+            return Err(bad_request("file too large to save"));
+        }
+        if !matches!(
+            local::files::presentation_for_path(&rel),
+            local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+        ) {
+            return Err(bad_request("not an editable text file"));
+        }
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, root_kind) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        // A session write that fell back to the clone means the worktree was
+        // pruned mid-edit — refuse rather than silently write another checkout.
+        if req.session_id.is_some() && root_kind == "clone" {
+            return Err(bad_request(
+                "this session's worktree is no longer available — reload the file",
+            ));
+        }
+        // Canonicalize the existing target so a symlinked path can't escape the
+        // checkout; a missing file means the editor's copy is stale.
+        let full = match crate::paths::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if req.expected_version.is_some() {
+                    return Ok(WriteProjectFileOutcome::Conflict {
+                        current_version: None,
+                        exists: false,
+                    });
+                }
+                return Err(not_found("file"));
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("save failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        // ponytail: external writers do not share a lock; add platform file coordination if this race becomes observable.
+        if let Some(expected) = req.expected_version.as_deref() {
+            let current = file_version_on_disk(&full)?;
+            if current != expected {
+                return Ok(WriteProjectFileOutcome::Conflict {
+                    current_version: Some(current),
+                    exists: true,
+                });
+            }
+        }
+        std::fs::write(&full, req.content.as_bytes())
+            .map_err(|e| ApiError::from(anyhow!("save failed: {e}")))?;
+        // The live channel polls on a tick; a save through the dashboard is
+        // told at once so a collaborator sees it without the wait.
+        local::overleaf_live::nudge(&full);
+        Ok(WriteProjectFileOutcome::Saved(json!({
+            "ok": true,
+            "root": root_kind,
+            "bytesWritten": req.content.len(),
+            "version": file_version(req.content.as_bytes()),
+        })))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))??;
+
+    Ok(match outcome {
+        WriteProjectFileOutcome::Saved(value) => Json(value).into_response(),
+        WriteProjectFileOutcome::Conflict {
+            current_version,
+            exists,
+        } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "file changed on disk",
+                "code": "fileChanged",
+                "currentVersion": current_version,
+                "exists": exists,
+            })),
+        )
+            .into_response(),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenProjectFileReq {
+    path: String,
+    session_id: Option<String>,
+}
+
+/// Canonical path of a checkout-relative file, confined to the checkout root.
+fn confined_checkout_file(
+    id: &str,
+    req: &OpenProjectFileReq,
+    verb: &str,
+) -> Result<std::path::PathBuf, ApiError> {
+    let (_, rel_path) = validated_project_file_path(&req.path)?;
+    if touches_git_dir(&rel_path) {
+        return Err(bad_request(format!("cannot {verb} files under .git")));
+    }
+    let store = Store::open()?;
+    let project = store
+        .get_local_project(id)?
+        .ok_or_else(|| not_found("project"))?;
+    let (root, _) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+    let full = match crate::paths::canonicalize(root.join(&rel_path)) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found("file")),
+        Err(e) => return Err(ApiError::from(anyhow!("{verb} failed: {e}"))),
+    };
+    if !full.starts_with(&root) {
+        return Err(bad_request("path escapes repository"));
+    }
+    Ok(full)
+}
+
+/// Open a checkout file in the machine's default app for its type (the user's
+/// editor for source files). Resolves the same worktree/clone the reader uses
+/// and confirms the file is inside it before handing the path to the OS opener.
+async fn open_project_file(
+    Path(id): Path<String>,
+    Json(req): Json<OpenProjectFileReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let full = confined_checkout_file(&id, &req, "open")?;
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        crate::editors::open_in_default_app(&full)
+            .map_err(|e| ApiError::from(anyhow!("could not open file: {e}")))?;
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+/// Reveal a checkout file in the OS file manager; unlike open, directories are allowed.
+async fn reveal_project_file(
+    Path(id): Path<String>,
+    Json(req): Json<OpenProjectFileReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let full = if req.path == "." {
+            let store = Store::open()?;
+            let project = store
+                .get_local_project(&id)?
+                .ok_or_else(|| not_found("project"))?;
+            resolve_checkout_root(&store, &project, req.session_id.as_deref())?.0
+        } else {
+            confined_checkout_file(&id, &req, "reveal")?
+        };
+        crate::editors::reveal_in_file_manager(&full)
+            .map_err(|e| ApiError::from(anyhow!("could not reveal file: {e}")))?;
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+/// Whether this machine can compile at all, so the dashboard can render a real
+/// document by default and fall back to its approximate preview when it cannot.
+async fn latex_engine() -> ApiResult {
+    blocking_api(move || {
+        let engine = local::latex::find_engine();
+        Ok(Json(json!({
+            "engine": engine,
+            "hint": engine.is_none().then(local::latex::install_hint),
+            "installCommand": engine.is_none().then(local::latex::install_command).flatten(),
+        })))
+    })
+    .await
+}
+
+// --- overleaf ------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverleafFileQ {
+    path: String,
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverleafFileReq {
+    path: String,
+    session_id: Option<String>,
+    /// Only on link: the project URL the user pasted.
+    #[serde(default)]
+    project: Option<String>,
+    /// Only on sync: how the user settled files both sides changed, keyed by
+    /// the checkout-relative path the panel showed them.
+    #[serde(default)]
+    resolve: std::collections::BTreeMap<String, String>,
+    /// Only on live: open the channel again after Overleaf refused it.
+    #[serde(default)]
+    retry: bool,
+}
+
+fn overleaf_link_json(link: Option<&crate::store::OverleafLink>) -> Value {
+    let Some(link) = link else {
+        return Value::Null;
+    };
+    let project = link.project();
+    json!({
+        "projectId": project.id,
+        "host": project.live_host(),
+        "url": project.web_url(),
+    })
+}
+
+fn overleaf_state_json(link: Option<&crate::store::OverleafLink>) -> Value {
+    json!({
+        "hasToken": local::overleaf::token().is_some(),
+        "hasSession": local::overleaf_live::session().is_some(),
+        "link": overleaf_link_json(link),
+    })
+}
+
+async fn overleaf_settings() -> ApiResult {
+    blocking_api(move || {
+        Ok(Json(json!({
+            "hasToken": local::overleaf::token().is_some(),
+            "hasSession": local::overleaf_live::session().is_some(),
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct SetOverleafTokenReq {
+    token: String,
+}
+
+/// Stored as given: the bridge is the only thing that can say whether a token
+/// works, and it needs a project to say it about. `link_overleaf` is where a
+/// bad token surfaces.
+async fn set_overleaf_token(Json(req): Json<SetOverleafTokenReq>) -> ApiResult {
+    blocking_api(move || {
+        let token = req.token.trim().to_string();
+        if token.is_empty() {
+            return Err(bad_request("token is required"));
+        }
+        // A newline would add a second field to the credential line the helper
+        // feeds git.
+        if token
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || !c.is_ascii())
+        {
+            return Err(bad_request(
+                "That does not look like an Overleaf token — it has spaces, line breaks, or characters a token does not contain. Copy it again from Overleaf's Account Settings.",
+            ));
+        }
+        local::overleaf::set_token(&token)?;
+        Ok(Json(json!({ "hasToken": true })))
+    })
+    .await
+}
+
+async fn delete_overleaf_token() -> ApiResult {
+    blocking_api(move || {
+        local::overleaf::clear_token()?;
+        Ok(Json(json!({ "hasToken": false })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct SetOverleafSessionReq {
+    session: String,
+    /// The Overleaf site the cookie is for: the paper's linked host when the
+    /// panel asks, www.overleaf.com from Settings.
+    #[serde(default)]
+    host: Option<String>,
+}
+
+/// The browser session cookie the live channel signs in with. Like the token,
+/// only a connection can say whether it works; `start_overleaf_live` is where
+/// a stale one surfaces.
+async fn set_overleaf_session(Json(req): Json<SetOverleafSessionReq>) -> ApiResult {
+    blocking_api(move || {
+        let host = req.host.as_deref().unwrap_or(local::overleaf::CLOUD_HOST);
+        local::overleaf_live::set_session(host, &req.session).map_err(bad_request)?;
+        Ok(Json(json!({ "hasSession": true })))
+    })
+    .await
+}
+
+async fn delete_overleaf_session() -> ApiResult {
+    blocking_api(move || {
+        local::overleaf_live::clear_session()?;
+        Ok(Json(json!({ "hasSession": false })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ImportOverleafSessionReq {
+    /// The site to find a cookie for; the paper's linked host, or the cloud.
+    #[serde(default)]
+    host: Option<String>,
+}
+
+/// Read the session cookie from a signed-in browser on this machine, so the
+/// user need not paste it. Reading a Chromium store asks the Keychain for its
+/// key, which is the one prompt the user sees; a store with no Overleaf cookie
+/// is a 400 that tells them to sign in there or paste instead.
+async fn import_overleaf_session(Json(req): Json<ImportOverleafSessionReq>) -> ApiResult {
+    blocking_api(move || {
+        let host = req
+            .host
+            .as_deref()
+            .unwrap_or(local::overleaf::CLOUD_HOST)
+            .to_string();
+        if !local::browser_cookies::SUPPORTED {
+            return Err(bad_request(
+                "Importing from a browser works on macOS only. Paste the cookie instead.",
+            ));
+        }
+        let imported = local::browser_cookies::import_session(&host)
+            .map_err(bad_request)?
+            .ok_or_else(|| {
+                bad_request(
+                    "No Overleaf session was found in a browser on this machine. Sign in to Overleaf in your browser, or paste the cookie.",
+                )
+            })?;
+        local::overleaf_live::set_session(&host, &imported.cookie).map_err(bad_request)?;
+        Ok(Json(json!({ "hasSession": true, "source": imported.source })))
+    })
+    .await
+}
+
+fn overleaf_live_json(key: &str, status: Option<local::overleaf_live::Status>) -> Value {
+    json!({
+        "key": key,
+        "status": status.map(|status| status.json()),
+    })
+}
+
+/// The live session a paper tab would use. Building it is also the
+/// permission check: a paper that is not linked, or a path that is not a
+/// paper, gets the same 400 the sync would.
+struct LiveTarget {
+    project: local::overleaf::Project,
+    /// The paper's folder, canonical, as `resolve_project_tex` hands it out.
+    dir: std::path::PathBuf,
+    scope: local::overleaf_live::Scope,
+}
+
+impl LiveTarget {
+    fn key(&self) -> String {
+        local::overleaf_live::key_for(&self.project, &self.dir, &self.scope)
+    }
+}
+
+/// The paper's folder — the Overleaf project's root, on disk.
+fn paper_dir(full: &std::path::Path) -> std::result::Result<&std::path::Path, ApiError> {
+    full.parent()
+        .ok_or_else(|| ApiError::from(anyhow!("{} has no parent directory", full.display())))
+}
+
+fn overleaf_live_target(
+    id: &str,
+    path: &str,
+    session_id: Option<&str>,
+) -> std::result::Result<LiveTarget, ApiError> {
+    let (rel, _, full) = resolve_project_tex(id, path, session_id)?;
+    let link = Store::open()?
+        .overleaf_link(id, &rel)?
+        .ok_or_else(|| bad_request("This paper is not linked to an Overleaf project yet."))?;
+    let dir = paper_dir(&full)?.to_path_buf();
+    Ok(LiveTarget {
+        project: link.project(),
+        dir,
+        scope: local::overleaf_live::Scope {
+            project_id: id.to_string(),
+            session_id: session_id.map(str::to_string),
+            folder: local::overleaf::folder_of(&rel),
+        },
+    })
+}
+
+/// Open the live channel for this paper, or keep it open: the tab calls this
+/// again while it stays on the file, and a session nobody asks after closes.
+async fn start_overleaf_live(
+    Path(id): Path<String>,
+    Json(req): Json<OverleafFileReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let target = overleaf_live_target(&id, &req.path, req.session_id.as_deref())?;
+        let (host, cookie) = local::overleaf_live::session()
+            .ok_or_else(|| bad_request("Add an Overleaf session cookie in Settings first."))?;
+        // The cookie signs in to one site; it goes nowhere else.
+        if host != target.project.live_host() {
+            return Err(bad_request(format!(
+                "The saved session cookie is for {host}, but this paper is linked to a project on {}. Add one for that site.",
+                target.project.live_host()
+            )));
+        }
+        let config = local::overleaf_live::Config {
+            project: target.project,
+            dir: target.dir,
+            cookie,
+            scope: target.scope,
+        };
+        let (key, status) = local::overleaf_live::start(config, req.retry);
+        Ok(Json(overleaf_live_json(&key, Some(status))))
+    })
+    .await
+}
+
+async fn stop_overleaf_live(Path(id): Path<String>, Query(q): Query<OverleafFileQ>) -> ApiResult {
+    blocking_api(move || {
+        let key = overleaf_live_target(&id, &q.path, q.session_id.as_deref())?.key();
+        local::overleaf_live::stop(&key);
+        Ok(Json(overleaf_live_json(&key, None)))
+    })
+    .await
+}
+
+async fn overleaf_link(Path(id): Path<String>, Query(q): Query<OverleafFileQ>) -> ApiResult {
+    blocking_api(move || {
+        let (rel, ..) = resolve_project_tex(&id, &q.path, q.session_id.as_deref())?;
+        let store = Store::open()?;
+        let link = store.overleaf_link(&id, &rel)?;
+        Ok(Json(overleaf_state_json(link.as_ref())))
+    })
+    .await
+}
+
+/// Link this `.tex` to an Overleaf project, proving the account can reach it
+/// before the link is stored — so a plan without Git integration is reported
+/// here, once, rather than on every later push.
+async fn link_overleaf(Path(id): Path<String>, Json(req): Json<OverleafFileReq>) -> ApiResult {
+    blocking_api(move || {
+        let (rel, _, full) = resolve_project_tex(&id, &req.path, req.session_id.as_deref())?;
+        let token = local::overleaf::token()
+            .ok_or_else(|| bad_request("Add an Overleaf Git authentication token first."))?;
+        let raw = req.project.unwrap_or_default();
+        let project = local::overleaf::parse_project(&raw).map_err(bad_request)?;
+        local::overleaf::probe(&project, &token).map_err(|e| bad_request(e.to_string()))?;
+        let store = Store::open()?;
+        let link = crate::store::OverleafLink {
+            overleaf_project_id: project.id,
+            host: project.host,
+            head: String::new(),
+            baseline: Default::default(),
+            root: String::new(),
+        };
+        store.set_overleaf_link(&id, &rel, &link)?;
+        // Relinked: nothing may keep writing the folder on the old project's
+        // behalf, and what was agreed with it says nothing about the new one.
+        local::overleaf_live::stop_dir(paper_dir(&full)?);
+        Ok(Json(overleaf_state_json(Some(&link))))
+    })
+    .await
+}
+
+/// Validates the path but does not resolve it: unlinking a paper that has since
+/// been deleted or renamed must still work, or the link would outlive any way
+/// to remove it.
+async fn unlink_overleaf(Path(id): Path<String>, Query(q): Query<OverleafFileQ>) -> ApiResult {
+    blocking_api(move || {
+        let (rel, _) = validated_project_file_path(&q.path)?;
+        // An unlinked folder must stop following; the target only resolves
+        // while the paper still exists, which is the only time it could be.
+        if let Ok(target) = overleaf_live_target(&id, &rel, q.session_id.as_deref()) {
+            local::overleaf_live::stop_dir(&target.dir);
+        }
+        let store = Store::open()?;
+        store.clear_overleaf_link(&id, &rel)?;
+        Ok(Json(overleaf_state_json(None)))
+    })
+    .await
+}
+
+/// Bring the paper and the linked Overleaf project into step, both ways. Like a
+/// failed compile, a refusal is the answer the user came for, so it comes back
+/// as a 400 carrying Overleaf's own words.
+async fn sync_overleaf(Path(id): Path<String>, Json(req): Json<OverleafFileReq>) -> ApiResult {
+    blocking_api(move || {
+        let (rel, root, full) = resolve_project_tex(&id, &req.path, req.session_id.as_deref())?;
+        let (token, link) = linked(&id, &rel)?;
+        let root = root.to_string_lossy().to_string();
+        // An agreement reached against another checkout says nothing about this
+        // one: starting from none makes every difference a conflict, which is
+        // the safe direction when we cannot tell who moved.
+        let baseline = if link.root == root {
+            link.baseline.clone()
+        } else {
+            Default::default()
+        };
+        let project = link.project();
+        let folder = local::overleaf::folder_of(&rel);
+        let mut resolutions = std::collections::BTreeMap::new();
+        for (path, how) in &req.resolve {
+            let how = match how.as_str() {
+                "take-overleaf" => local::overleaf::Resolution::TakeOverleaf,
+                "keep-local" => local::overleaf::Resolution::KeepLocal,
+                other => return Err(bad_request(format!("unknown resolution {other:?}"))),
+            };
+            if let Some(path) = local::overleaf::from_checkout(folder.as_deref(), path) {
+                resolutions.insert(path, how);
+            }
+        }
+        // The live channel writes the same files; it waits while the sync
+        // does, then starts again from what the sync agreed on.
+        // Held so the channel is let go even if the sync unwinds; a folder
+        // left paused would look live while syncing nothing.
+        let paused = local::overleaf_live::pause(paper_dir(&full)?);
+        let outcome = local::overleaf::collect(&full).and_then(|payload| {
+            local::overleaf::sync(&payload, &project, &token, &baseline, &resolutions)
+        });
+        if let Ok(outcome) = &outcome {
+            paused.synced(&outcome.baseline);
+        }
+        drop(paused);
+        let outcome = outcome.map_err(|e| bad_request(e.to_string()))?;
+        let store = Store::open()?;
+        store.set_overleaf_link(
+            &id,
+            &rel,
+            &crate::store::OverleafLink {
+                head: outcome.head.clone(),
+                baseline: outcome.baseline.clone(),
+                root,
+                ..link
+            },
+        )?;
+        Ok(Json(json!({
+            "ok": true,
+            "pulled": local::overleaf::to_checkout(folder.as_deref(), &outcome.pulled),
+            "pushed": local::overleaf::to_checkout(folder.as_deref(), &outcome.pushed),
+            "conflicts": local::overleaf::to_checkout(folder.as_deref(), &outcome.conflicts),
+            "note": outcome.note,
+        })))
+    })
+    .await
+}
+
+/// Whether Overleaf has moved since the last sync — one `ls-remote`, no clone,
+/// so a linked paper can be watched while its tab is open without a transfer
+/// every time.
+async fn overleaf_status(Path(id): Path<String>, Query(q): Query<OverleafFileQ>) -> ApiResult {
+    blocking_api(move || {
+        let (rel, ..) = resolve_project_tex(&id, &q.path, q.session_id.as_deref())?;
+        let (token, link) = linked(&id, &rel)?;
+        let head = local::overleaf::remote_head(&link.project(), &token)
+            .map_err(|e| bad_request(e.to_string()))?;
+        Ok(Json(json!({ "remoteChanged": head != link.head })))
+    })
+    .await
+}
+
+/// The token and link a sync needs, or the 400 that says which is missing.
+fn linked(
+    id: &str,
+    path: &str,
+) -> std::result::Result<(String, crate::store::OverleafLink), ApiError> {
+    let token = local::overleaf::token()
+        .ok_or_else(|| bad_request("Add an Overleaf Git authentication token first."))?;
+    let link = Store::open()?
+        .overleaf_link(id, path)?
+        .ok_or_else(|| bad_request("This paper is not linked to an Overleaf project yet."))?;
+    Ok((token, link))
+}
+
+/// The no-plan path: a page that posts the paper straight into a new Overleaf
+/// project. Served rather than built in the browser because the files it
+/// carries are read from the checkout, and returned as HTML because Overleaf
+/// takes them as a form POST.
+async fn overleaf_upload(Path(id): Path<String>, Query(q): Query<OverleafFileQ>) -> Response {
+    let built = tokio::task::spawn_blocking(move || {
+        let (_, _, full) = resolve_project_tex(&id, &q.path, q.session_id.as_deref())
+            .map_err(|e| anyhow!("{}", e.1))?;
+        let payload = local::overleaf::collect(&full)?;
+        local::overleaf::upload_form_html(&payload)
+    })
+    .await;
+    match built {
+        Ok(Ok(html)) => Html(html).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<!doctype html><meta charset=\"utf-8\"><p>{}</p>",
+                local::overleaf::escape(&e.to_string())
+            )),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(format!("<!doctype html><meta charset=\"utf-8\"><p>{e}</p>")),
+        )
+            .into_response(),
+    }
+}
+
+/// Resolve a checkout `.tex` to (normalized repo-relative path, checkout root,
+/// canonical file). Confines the path exactly like `open_project_file`, and
+/// refuses a session whose worktree is gone for the same reason
+/// `write_project_file` does: both compiling and syncing act on the file the
+/// user is actually editing.
+fn resolve_project_tex(
+    id: &str,
+    path: &str,
+    session_id: Option<&str>,
+) -> std::result::Result<(String, std::path::PathBuf, std::path::PathBuf), ApiError> {
+    let (rel, rel_path) = validated_project_file_path(path)?;
+    if touches_git_dir(&rel_path) {
+        return Err(bad_request("cannot read files under .git"));
+    }
+    if !rel.to_ascii_lowercase().ends_with(".tex") {
+        return Err(bad_request("not a .tex file"));
+    }
+    let store = Store::open()?;
+    let project = store
+        .get_local_project(id)?
+        .ok_or_else(|| not_found("project"))?;
+    let (root, root_kind) = resolve_checkout_root(&store, &project, session_id)?;
+    if session_id.is_some() && root_kind == "clone" {
+        return Err(bad_request(
+            "this session's worktree is no longer available — reload the file",
+        ));
+    }
+    let full = match crate::paths::canonicalize(root.join(&rel_path)) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found("file")),
+        Err(e) => return Err(ApiError::from(anyhow!("could not read the file: {e}"))),
+    };
+    if !full.starts_with(&root) {
+        return Err(bad_request("path escapes repository"));
+    }
+    if full.is_dir() {
+        return Err(bad_request("path is a directory"));
+    }
+    Ok((rel, root, full))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompileLatexReq {
+    path: String,
+    session_id: Option<String>,
+}
+
+/// Compile a checkout `.tex` file to a PDF beside it with the machine's own
+/// LaTeX engine, so the dashboard's approximate preview has an exact
+/// counterpart. Resolves and confines the path exactly like `open_project_file`;
+/// a compile failure is a 200 carrying the log, not an error — the log is the
+/// answer the user came for.
+async fn compile_project_latex(
+    Path(id): Path<String>,
+    Json(req): Json<CompileLatexReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let (_, root, full) = resolve_project_tex(&id, &req.path, req.session_id.as_deref())?;
+        // Asked here rather than inside `compile` so a machine that cannot build
+        // *this* document gets a 400 with the install hint instead of a 500.
+        if let Some(hint) = local::latex::missing_toolchain(&full) {
+            return Err(bad_request(hint));
+        }
+        let result = local::latex::compile(&full)?;
+        let pdf_path = match result.pdf.as_deref() {
+            Some(pdf) => {
+                Some(api_rel_path(pdf.strip_prefix(&root).map_err(|_| {
+                    anyhow!("compiled PDF landed outside the checkout")
+                })?))
+            }
+            None => None,
+        };
+        Ok(Json(json!({
+            "ok": pdf_path.is_some(),
+            "pdfPath": pdf_path,
+            "engine": result.engine,
+            "note": result.note,
+            "hadErrors": result.had_errors,
+            "log": result.log,
+        })))
+    })
+    .await
+}
+
+enum RawProjectFileSource {
+    Disk(std::fs::File),
+    Git {
+        repo: std::path::PathBuf,
+        spec: String,
+        size: u64,
+    },
+}
+
+/// Byte-exact checkout file for browser-native media previews. It resolves the
+/// same worktree/clone/branch source as `project_file`, but streams instead of
+/// decoding or buffering the file in the API process.
+async fn project_raw_file(
+    Path(id): Path<String>,
+    Query(q): Query<ProjectFileQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let source = tokio::task::spawn_blocking(move || {
+        let (rel, rel_path) = validated_project_file_path(&q.path)?;
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let ref_name = q.r#ref.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(name) = ref_name {
+            let (root, _) = resolve_checkout_root(&store, &project, None)?;
+            let sha = local::git::resolve_branch_commit(&root, name)?
+                .ok_or_else(|| not_found("branch"))?;
+            let size =
+                local::git::file_size_at(&root, &sha, &rel)?.ok_or_else(|| not_found("file"))?;
+            // `rel` is right here: git never follows a symlink in a tree, it
+            // serves the blob at that path.
+            return Ok((
+                rel.clone(),
+                RawProjectFileSource::Git {
+                    repo: root,
+                    spec: format!("{sha}:{rel}"),
+                    size,
+                },
+            ));
+        }
+
+        let (root, _) = resolve_checkout_root(&store, &project, q.session_id.as_deref())?;
+        let full = crate::paths::canonicalize(root.join(rel_path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                not_found("file")
+            } else {
+                ApiError::from(anyhow!("read failed: {e}"))
+            }
+        })?;
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        let file =
+            std::fs::File::open(&full).map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+        // The resolved path, not `rel`: an in-repo symlink named `logo.png` must
+        // not make `.env`'s bytes an image.
+        Ok((
+            full.to_string_lossy().into_owned(),
+            RawProjectFileSource::Disk(file),
+        ))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))??;
+
+    let (type_path, source) = source;
+    let presentation = local::files::presentation_for_path(&type_path);
+    match source {
+        RawProjectFileSource::Disk(file) => crate::commands::file_serve::disk_response(
+            &type_path,
+            file,
+            presentation,
+            &method,
+            &headers,
+            "no-cache",
+        )
+        .await
+        .map_err(ApiError::from),
+        RawProjectFileSource::Git { repo, spec, size } => {
+            crate::commands::file_serve::git_response(
+                &type_path,
+                repo,
+                spec,
+                size,
+                presentation,
+                &method,
+                &headers,
+            )
+            .await
+            .map_err(ApiError::from)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AbsoluteFileQuery {
+    path: String,
+}
+
+/// Validate an absolute-path request and resolve a leading `~`/`~/` to the home
+/// dir (the shell never expands it for us, and agents inline `~/…` paths). The
+/// display string stays as typed — it's what the tab shows and what the agent
+/// wrote; only the returned `PathBuf` is home-expanded. `~otheruser` is left
+/// alone and simply fails the absolute check. The bind is loopback-only and the
+/// server runs as the user, so any file the user could read is fair game — this
+/// only rejects malformed input, not location.
+fn validated_absolute_file_path(
+    path: &str,
+) -> std::result::Result<(String, std::path::PathBuf), ApiError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.len() > 4096 {
+        return Err(bad_request("invalid path"));
+    }
+    let resolved = match trimmed.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => dirs::home_dir()
+            .ok_or_else(|| bad_request("no home directory"))?
+            .join(rest.trim_start_matches('/')),
+        _ => std::path::PathBuf::from(trimmed),
+    };
+    if !resolved.is_absolute() {
+        return Err(bad_request("path must be absolute"));
+    }
+    Ok((trimmed.to_string(), resolved))
+}
+
+/// One file by absolute path, for the UI file viewer — the escape hatch for a
+/// file an agent references that lives outside the project's checkout and
+/// artifacts (e.g. `/Users/me/.ssh/config`). Same decoded/capped body shape as
+/// `project_file`; `root: "abs"`. Loopback-only and no auth, so it reads
+/// whatever the user running `orx up` can read — matching how the raw variant
+/// and the OS-open endpoint already expose the local disk.
+async fn absolute_file(
+    Query(q): Query<AbsoluteFileQuery>,
+) -> std::result::Result<Json<ProjectFileResponse>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let (display, abs) = validated_absolute_file_path(&q.path)?;
+        let presentation = local::files::presentation_for_path(&display);
+        let full = match crate::paths::canonicalize(&abs) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    display,
+                    "abs",
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        if !matches!(
+            presentation,
+            local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+        ) {
+            return Ok(Json(ProjectFileResponse::non_text(
+                display,
+                "abs",
+                presentation,
+            )));
+        }
+        let file = match std::fs::File::open(&full) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    display,
+                    "abs",
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        let mut buf = Vec::new();
+        std::io::Read::take(file, FILE_READ_LIMIT + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+        let truncated = buf.len() as u64 > FILE_READ_LIMIT;
+        buf.truncate(FILE_READ_LIMIT as usize);
+        let (content, binary) = decode_project_file_text(buf, truncated);
+        let presentation = if binary {
+            local::files::FilePresentation::Download
+        } else {
+            local::files::FilePresentation::Text
+        };
+        Ok(Json(ProjectFileResponse::text(
+            display,
+            "abs",
+            content,
+            truncated,
+            binary,
+            presentation,
+            None,
+        )))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
+}
+
+/// Byte-exact absolute-path file for browser-native media previews and
+/// downloads — the streamed counterpart to `absolute_file`, mirroring
+/// `project_raw_file` for arbitrary on-disk paths.
+async fn absolute_raw_file(
+    Query(q): Query<AbsoluteFileQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let (type_path, file) = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(String, std::fs::File), ApiError> {
+            let (_, abs) = validated_absolute_file_path(&q.path)?;
+            let full = crate::paths::canonicalize(&abs).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    not_found("file")
+                } else {
+                    ApiError::from(anyhow!("read failed: {e}"))
+                }
+            })?;
+            if full.is_dir() {
+                return Err(bad_request("path is a directory"));
+            }
+            let file = std::fs::File::open(&full)
+                .map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+            // The resolved path: a symlink must not let the requested name
+            // dictate the type of another file's contents.
+            Ok((full.to_string_lossy().into_owned(), file))
+        },
+    )
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))??;
+    let presentation = local::files::presentation_for_path(&type_path);
+    crate::commands::file_serve::disk_response(
+        &type_path,
+        file,
+        presentation,
+        &method,
+        &headers,
+        "no-cache",
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
+// --- project artifacts ----------------------------------------------------
+
+/// Listing of the project's artifacts dir — the filesystem is the source of
+/// truth; this scans it fresh on every call (and creates it if missing).
+async fn list_artifacts(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let listing = local::files::list(&project)?;
+        Ok(Json(json!(listing)))
+    })
+    .await
+}
+
+async fn manage_artifact_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ManageFileReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let root = local::files::ensure_dir(&project)?;
+        let path = manage_local_file(&root, &req.path, req.action, req.new_name.as_deref(), false)?;
+        Ok(Json(json!({ "ok": true, "path": path })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ArtifactPathQuery {
+    path: String,
+}
+
+/// Delete a file or folder in the artifacts dir, by relative path.
+async fn delete_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ArtifactPathQuery>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        local::files::delete_entry(&project, &q.path)?;
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+/// Raw artifact bytes, by directory-relative path. `no-cache`: the same path can
+/// be rewritten in place on disk.
+async fn serve_artifact(
+    Path(id): Path<String>,
+    Query(q): Query<ArtifactPathQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let (type_path, file) = tokio::task::spawn_blocking(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let path = local::files::file_path(&project, &q.path).map_err(|_| not_found("file"))?;
+        let file = std::fs::File::open(&path).map_err(|_| not_found("file"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| ApiError::from(anyhow!("stat failed: {e}")))?;
+        if !metadata.is_file() {
+            return Err(not_found("file"));
+        }
+        // `file_path` canonicalized: type the response by what it resolved to.
+        Ok((path.to_string_lossy().into_owned(), file))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))??;
+    let presentation = local::files::presentation_for_path(&type_path);
+    crate::commands::file_serve::disk_response(
+        &type_path,
+        file,
+        presentation,
+        &method,
+        &headers,
+        "no-cache",
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
+/// Keep update checks and telemetry delivery running for long-lived dashboards.
+fn spawn_background_tasks(check_updates: bool) {
+    if check_updates {
+        tokio::spawn(async {
+            loop {
+                updates::periodic_update_pass().await;
+                tokio::time::sleep(updates::PERIODIC_CHECK_INTERVAL).await;
+            }
+        });
+    }
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            crate::telemetry::retry_outbox();
+        }
+    });
+}
+
+/// Requests and terminals in flight, which an automatic restart would cut off.
+static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// An automatic restart is checking for idleness; new requests wait it out.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+struct Active;
+
+impl Active {
+    fn new() -> Self {
+        ACTIVE.fetch_add(1, Ordering::SeqCst);
+        Active
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) async fn track_active(request: axum::extract::Request, next: Next) -> Response {
+    // The dashboard holds its event stream open for as long as it is open.
+    if request.uri().path() == "/api/events" {
+        return next.run(request).await;
+    }
+    // Count first, then check: paired with the drain's set-then-count, one side always sees the other.
+    let active = loop {
+        let active = Active::new();
+        if !DRAINING.load(Ordering::SeqCst) {
+            break active;
+        }
+        drop(active);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    next.run(request).await.map(|body| {
+        axum::body::Body::new(ActiveBody {
+            body,
+            _active: active,
+        })
+    })
+}
+
+/// A response body that stays `Active` until hyper has sent or dropped it, so a
+/// file still streaming after its handler returned isn't cut off by a restart.
+struct ActiveBody {
+    body: axum::body::Body,
+    _active: Active,
+}
+
+impl axum::body::HttpBody for ActiveBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// Relaunch into an update installed underneath this server once that interrupts nothing,
+/// so a long-lived `orx up` stops launching runs and building sandboxes with old code.
+fn spawn_restart_when_idle(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(UPDATE_SAMPLE_INTERVAL).await;
+            let status = updates::status();
+            // The cache can claim an install the exec target doesn't have; never restart in a loop.
+            if !(status.auto_update
+                && status.restart_required
+                && (updates::deferred_update_due() || updates::newer_exe_on_disk().await))
+            {
+                continue;
+            }
+            if begin_restart(&state, 0).await {
+                state.restart.notify_one();
+                return;
+            }
+        }
+    });
+}
+
+/// Serializes restart attempts; true once one committed, after which nothing reopens admission.
+static RESTART_COMMITTED: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+
+/// Stop admitting work and commit to a restart if nothing is in flight beyond
+/// `own_requests` (the caller's). Returns false, and admits again, otherwise.
+async fn begin_restart(state: &AppState, own_requests: usize) -> bool {
+    let mut committed = RESTART_COMMITTED.lock().await;
+    if *committed {
+        return true;
+    }
+    DRAINING.store(true, Ordering::SeqCst);
+    if ACTIVE.load(Ordering::SeqCst) <= own_requests
+        && !state.data_dir_move_in_progress.load(Ordering::SeqCst)
+        && state.remote_sessions.list().await.iter().all(|session| {
+            matches!(
+                session.status,
+                RemoteSessionStatus::Disconnected
+                    | RemoteSessionStatus::NeedsInstall
+                    | RemoteSessionStatus::NeedsUpdate
+            )
+        })
+        && state.chat.stop_admitting_if_idle().await
+    {
+        *committed = true;
+        return true;
+    }
+    DRAINING.store(false, Ordering::SeqCst);
+    false
+}
+
+/// Startup summary of detected coding agents. Never blocks. It goes through
+/// the same locked cache path as `/api/harnesses`, so the dashboard's first
+/// call serves the preflight result instead of launching a second sweep.
+fn spawn_agent_preflight(state: AppState) {
+    tokio::spawn(async move {
+        let payload = harnesses_payload(&state, &HarnessQuery::default()).await;
+        let line: Vec<String> = payload["harnesses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| {
+                let name = h["name"].as_str().unwrap_or("agent");
+                if h["agentReady"].as_bool() == Some(true) {
+                    match h["account"].as_str() {
+                        Some(acct) => format!("{name} ✓ ({acct})"),
+                        None => format!("{name} ✓"),
+                    }
+                } else if h["installBroken"].as_bool() == Some(true) {
+                    format!("{name} — installed but failed to run")
+                } else if h["catalogPending"].as_bool() == Some(true) {
+                    format!("{name} — checking…")
+                } else if h["installed"].as_bool() == Some(true) {
+                    format!(
+                        "{name} — {}",
+                        h["agentNote"].as_str().unwrap_or("not ready")
+                    )
+                } else {
+                    format!("{name} — not installed")
+                }
+            })
+            .collect();
+        eprintln!("orx up: agents: {}", line.join(" · "));
+        // The provisional pass can't vouch for readiness — this detached task
+        // waits out the catalog fill before deciding there's really nothing
+        // usable, so the warning reflects the settled answer.
+        let mut settled = payload;
+        for _ in 0..45 {
+            if !payload_is_provisional(&settled) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            settled = harnesses_payload(&state, &HarnessQuery::default()).await;
+        }
+        let any_ready = settled["harnesses"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|h| h["agentReady"].as_bool() == Some(true)));
+        // Still provisional after 45s means the fill never converged — stay
+        // silent rather than guess "nothing ready" from clamped entries.
+        if !payload_is_provisional(&settled) && !any_ready {
+            eprintln!(
+                "orx up: warning: no coding agent ready — install Claude Code, Codex, OpenCode, Cursor or Antigravity, then connect a local model or sign in."
+            );
+        }
+    });
+}
+
+/// A signed-out harness is the only state that needs polling. Normal turns and
+/// healthy idle sessions do no auth work; this loop merely notices a login the
+/// user completed separately and wakes the UI immediately. The cache is left
+/// alone: served payloads get the live auth snapshot overlaid on the way out,
+/// the ready-claude gate re-detects a promoted login, and a wholesale clear
+/// here used to discard in-flight catalog fills on every flap.
+fn spawn_claude_auth_monitor(
+    chat: Arc<ChatHost>,
+    claude: Arc<local::claude::ClaudeHost>,
+    fill_in_flight: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(5);
+        let mut observed_generation = claude.auth_snapshot().generation;
+        loop {
+            tokio::time::sleep(delay).await;
+            let before = claude.auth_snapshot();
+            if before.generation != observed_generation {
+                observed_generation = before.generation;
+                if claude.claim_auth_announcement(before.generation) {
+                    chat.emit_event(
+                        "harness.auth",
+                        json!({ "harness": "claude-code", "authState": before.state }),
+                    );
+                }
+            }
+            if fill_in_flight.load(std::sync::atomic::Ordering::Acquire)
+                || before.runtime_rejected
+                || matches!(
+                    before.state,
+                    local::harness::HarnessAuthState::Ready
+                        | local::harness::HarnessAuthState::Unsupported
+                ) && !before.auth_check_failed
+            {
+                delay = Duration::from_secs(5);
+                continue;
+            }
+            let probe = local::harness::claude::current_auth_state().await;
+            let changed = claude.observe_auth_probe(&probe);
+            let after = claude.auth_snapshot();
+            if after.generation != observed_generation {
+                observed_generation = after.generation;
+                if claude.claim_auth_announcement(after.generation) {
+                    chat.emit_event(
+                        "harness.auth",
+                        json!({ "harness": "claude-code", "authState": after.state }),
+                    );
+                }
+            } else if changed {
+                chat.emit_event("harness.catalog", json!({}));
+            }
+            delay = if after.auth_check_failed {
+                (delay * 2).min(Duration::from_secs(60))
+            } else {
+                Duration::from_secs(5)
+            };
+        }
+    });
+}
+
+// --- env var settings -------------------------------------------------------
+
+/// Everything in the compatible local environment file, values masked. `inProcessEnv` flags
+/// keys that are also set in orx up's own environment (which wins at runtime).
+fn env_settings_json() -> Value {
+    let vars: Vec<Value> = crate::config::list_synced_env()
+        .iter()
+        .map(|(key, value)| {
+            json!({
+                "key": key,
+                "maskedValue": mask_token(value),
+                "inProcessEnv": std::env::var_os(key).is_some(),
+            })
+        })
+        .collect();
+    json!({ "vars": vars })
+}
+
+async fn env_settings() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(env_settings_json())))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("env task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetEnvVarReq {
+    key: String,
+    value: String,
+}
+
+fn valid_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with(|c: char| c.is_ascii_digit())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+async fn set_env_var(Json(req): Json<SetEnvVarReq>) -> ApiResult {
+    let key = req.key.trim().to_string();
+    let value = req.value.trim().to_string();
+    if !valid_env_key(&key) {
+        return Err(bad_request(
+            "key must be letters, digits or _, not starting with a digit",
+        ));
+    }
+    if crate::local::shell_env::IMPORTED.contains(&key.as_str()) {
+        return Err(bad_request(format!(
+            "{key} is reserved by VERA. To change it, set {key} in your shell and restart VERA."
+        )));
+    }
+    if value.is_empty() {
+        return Err(bad_request("value is required"));
+    }
+    tokio::task::spawn_blocking(move || {
+        crate::config::write_synced_env_var(&key, &value)?;
+        Ok(Json(env_settings_json()))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("env task failed: {e}")))?
+}
+
+async fn delete_env_var(Path(key): Path<String>) -> ApiResult {
+    if !valid_env_key(&key) {
+        return Err(bad_request("invalid key"));
+    }
+    tokio::task::spawn_blocking(move || {
+        crate::config::remove_synced_env_var(&key)?;
+        Ok(Json(env_settings_json()))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("env task failed: {e}")))?
+}
+
+// --- data directory ---------------------------------------------------------
+
+/// Current data-dir state for the Storage settings card: where it resolves,
+/// whether that's the default, the path we'd fall back to, and *why* it resolves
+/// where it does (so the UI can lock the field when `$ORX_DATA_DIR` forces it).
+fn data_dir_json() -> Value {
+    use crate::store::DataDirSource;
+    let current = crate::store::data_dir();
+    let default = crate::store::default_data_dir();
+    let source = crate::store::data_dir_source();
+    json!({
+        "current": current.to_string_lossy(),
+        "defaultPath": default.to_string_lossy(),
+        // "On the fallback chain" = no explicit choice (env pin or saved config).
+        // Env can happen to equal the default path but is still a forced override.
+        "isDefault": matches!(source, DataDirSource::Xdg | DataDirSource::Default),
+        // env | config | xdg | default — env means a forced override (read-only).
+        "source": source,
+    })
+}
+
+async fn data_dir_settings() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(data_dir_json())))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("data-dir task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct DataDirReq {
+    path: String,
+}
+
+/// Reject a mutation when `$ORX_DATA_DIR` is forcing the path — the config value
+/// would be shadowed, so honoring the request would silently do nothing.
+fn ensure_not_env_forced() -> std::result::Result<(), ApiError> {
+    if crate::store::data_dir_source() == crate::store::DataDirSource::Env {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "The data directory is pinned by the ORX_DATA_DIR environment \
+             variable, which overrides this setting. Unset it to choose a path here."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Pre-flight a candidate path for a **move** without committing: absolute? empty
+/// target? room? Returns `{ ok, error?, treeBytes, freeBytes?, sameFilesystem }`.
+async fn validate_data_dir(Json(req): Json<DataDirReq>) -> ApiResult {
+    use crate::local::datadir::TargetIntent;
+    let path = req.path.trim().to_string();
+    if path.is_empty() {
+        return Err(bad_request("path is required"));
+    }
+    tokio::task::spawn_blocking(move || {
+        match crate::local::datadir::validate_target(
+            std::path::Path::new(&path),
+            TargetIntent::Move,
+        ) {
+            Ok(report) => Ok(Json(json!({
+                "ok": true,
+                "treeBytes": report.tree_bytes,
+                "freeBytes": report.free_bytes,
+                "sameFilesystem": report.same_filesystem,
+            }))),
+            Err(e) => Ok(Json(json!({ "ok": false, "error": e.to_string() }))),
+        }
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("validate task failed: {e}")))?
+}
+
+/// Set the data dir *without moving* — for onboarding on an empty install, or
+/// reconnecting to an already-populated location (a second machine, after config
+/// loss). The UI routes here only when the current dir has nothing to migrate;
+/// otherwise it calls `/move`. Uses `TargetIntent::Set`, which (unlike `Move`)
+/// permits a populated existing dir since nothing is copied.
+async fn set_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq>) -> ApiResult {
+    use crate::local::datadir::TargetIntent;
+    reject_if_moving(&state)?;
+    ensure_not_env_forced()?;
+    let path = req.path.trim().to_string();
+    if path.is_empty() {
+        return Err(bad_request("path is required"));
+    }
+    // Validate before persisting so we never store a bad path.
+    let validate_path = path.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::local::datadir::validate_target(
+            std::path::Path::new(&validate_path),
+            TargetIntent::Set,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("validate task failed: {e}")))?
+    .map_err(bad_request)?;
+
+    let lock_path = std::path::PathBuf::from(&path);
+    let persistent_host = state.remote_instance_id.is_some();
+    let next_lock = tokio::task::spawn_blocking(move || {
+        DashboardLock::acquire(
+            &lock_path,
+            if persistent_host {
+                DashboardLockMode::Exclusive
+            } else {
+                DashboardLockMode::Shared
+            },
+        )
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("dashboard lock task failed: {e}")))?
+    .map_err(|error| ApiError(StatusCode::CONFLICT, error.to_string()))?;
+
+    state.chat.shutdown_harnesses().await;
+    tokio::task::spawn_blocking(move || crate::config::set_settings_data_dir(Some(path)))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("settings task failed: {e}")))??;
+    *state.dashboard_lock.lock().unwrap() = Some(next_lock);
+    state.chat.shutdown_harnesses().await;
+    Ok(Json(data_dir_json()))
+}
+
+/// Relocate the data dir to `path`, streaming `datadir.move.*` progress events
+/// over `/api/events`. Returns 202 immediately; the UI watches the SSE stream.
+///
+/// Concurrency safety: sets `data_dir_move_in_progress` *first*, then refuses
+/// (409) if a run or chat turn is already active. The substantive store-mutating
+/// handlers (`send`/`launch`, project/experiment/chat CRUD, file delete,
+/// `set_data_dir`) check the flag on entry and back off, so once the move is
+/// underway nothing new writes the store. Even the residual races don't lose
+/// data: a request that passed its own flag check in the tiny window before this
+/// one set the flag — or an unguarded incidental write (an `open_project`
+/// timestamp touch, an `ssh_preflight` test row) — lands in the *old* dir, but
+/// the cross-filesystem path never deletes it (it's returned as `oldPathLeft`),
+/// so the write is preserved there; only the atomic same-filesystem rename
+/// consumes the old dir, and that path has no copy window.
+async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq>) -> Response {
+    use crate::local::datadir::TargetIntent;
+    use std::sync::atomic::Ordering;
+
+    if let Err(e) = ensure_not_env_forced() {
+        return e.into_response();
+    }
+    let path = req.path.trim().to_string();
+    if path.is_empty() {
+        return bad_request("path is required").into_response();
+    }
+
+    // Claim the move slot first (compare-exchange): only one move at a time, and
+    // once claimed, new turns/launches see the flag and back off.
+    if state
+        .data_dir_move_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return ApiError(
+            StatusCode::CONFLICT,
+            "A data-directory move is already in progress.".into(),
+        )
+        .into_response();
+    }
+
+    // Helper to release the slot on any early return.
+    let release = |state: &AppState| {
+        state
+            .data_dir_move_in_progress
+            .store(false, Ordering::SeqCst);
+    };
+
+    let data_dir_guard = state.data_dir_gate.clone().lock_owned().await;
+    let source_data_dir = crate::store::data_dir();
+    let move_token = uuid::Uuid::new_v4().to_string();
+    let (move_store, move_lock) = match Store::open().and_then(|store| {
+        let lock = store.acquire_data_dir_move_lock()?;
+        Ok((store, lock))
+    }) {
+        Ok(claim) => claim,
+        Err(_) => {
+            release(&state);
+            return ApiError(
+                StatusCode::CONFLICT,
+                "Another dashboard is moving the data directory.".into(),
+            )
+            .into_response();
+        }
+    };
+    let move_claimed = move_store.claim_data_dir_move(&move_token).unwrap_or(false);
+    if !move_claimed {
+        release(&state);
+        return ApiError(
+            StatusCode::CONFLICT,
+            "Can't move while another dashboard has an active chat turn or storage move.".into(),
+        )
+        .into_response();
+    }
+
+    let release_move_claim = |token: &str| {
+        if let Ok(store) = Store::open() {
+            let _ = store.release_data_dir_move(token);
+        }
+    };
+
+    // In-flight guard: block if a chat turn or a run is active right now. (The
+    // flag we just set prevents *new* ones from starting past this point.)
+    let busy = state.chat.busy_sessions().await;
+    let active_runs = tokio::task::spawn_blocking(active_run_count)
+        .await
+        .unwrap_or(0);
+    let active_operations = state.project_lifecycle.operation_count();
+    if !busy.is_empty() || active_runs > 0 || active_operations > 0 {
+        release_move_claim(&move_token);
+        release(&state);
+        return ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "Can't move while work is in progress ({} active chat turn(s), \
+                 {active_runs} active run(s), {active_operations} project operation(s)). \
+                 Finish or stop them, then retry.",
+                busy.len()
+            ),
+        )
+        .into_response();
+    }
+
+    // Validate before kicking off the background move.
+    let vpath = path.clone();
+    let validated = tokio::task::spawn_blocking(move || {
+        crate::local::datadir::validate_target(std::path::Path::new(&vpath), TargetIntent::Move)
+    })
+    .await;
+    match validated {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            release_move_claim(&move_token);
+            release(&state);
+            return bad_request(e).into_response();
+        }
+        Err(e) => {
+            release_move_claim(&move_token);
+            release(&state);
+            return ApiError::from(anyhow!("validate task failed: {e}")).into_response();
+        }
+    }
+
+    let lock_target = std::path::PathBuf::from(&path);
+    let persistent_host = state.remote_instance_id.is_some();
+    let next_lock = match tokio::task::spawn_blocking(move || {
+        DashboardLock::acquire(
+            &lock_target,
+            if persistent_host {
+                DashboardLockMode::Exclusive
+            } else {
+                DashboardLockMode::Shared
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(lock)) => lock,
+        Ok(Err(error)) => {
+            release_move_claim(&move_token);
+            release(&state);
+            return ApiError(StatusCode::CONFLICT, error.to_string()).into_response();
+        }
+        Err(error) => {
+            release_move_claim(&move_token);
+            release(&state);
+            return ApiError::from(anyhow!("dashboard lock task failed: {error}")).into_response();
+        }
+    };
+
+    let chat = state.chat.clone();
+    // Provider-native SQLite/session stores now live inside this directory.
+    // Close every idle harness child before the filesystem begins moving it.
+    chat.shutdown_harnesses().await;
+
+    // Spawn the move on a blocking task (it does synchronous FS work); forward
+    // throttled progress onto the SSE broadcast, clear the flag when done.
+    let flag = state.data_dir_move_in_progress.clone();
+    let dashboard_lock = state.dashboard_lock.clone();
+    let target = std::path::PathBuf::from(path);
+    tokio::spawn(async move {
+        let _data_dir_guard = data_dir_guard;
+        let _move_lock = move_lock;
+        use crate::local::datadir::MoveProgress;
+        let chat_for_progress = chat.clone();
+        // Throttle: forward at most one progress event per ~120ms of copy, but
+        // always emit phase edges (copied==0 or ==total) so the first/last tick
+        // of every phase gets through.
+        let last = std::sync::Mutex::new(0i64);
+        let on_progress = move |p: MoveProgress| {
+            let now = crate::store::now_ms();
+            let mut guard = last.lock().unwrap();
+            let is_edge = p.copied_bytes == 0 || p.copied_bytes >= p.total_bytes;
+            if is_edge || now - *guard >= 120 {
+                *guard = now;
+                chat_for_progress.emit_event("datadir.move.progress", json!(p));
+            }
+        };
+        let target_for_move = target.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::local::datadir::move_data_dir(target_for_move, on_progress)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(outcome)) => {
+                *dashboard_lock.lock().unwrap() = Some(next_lock);
+                // Close any child spawned while a cross-filesystem copy ran.
+                chat.shutdown_harnesses().await;
+                chat.emit_event("datadir.move.done", json!(outcome));
+            }
+            Ok(Err(e)) => chat.emit_event("datadir.move.error", json!({ "error": e.to_string() })),
+            Err(e) => chat.emit_event(
+                "datadir.move.error",
+                json!({ "error": format!("move task panicked: {e}") }),
+            ),
+        }
+        // A cross-filesystem copy retains the source DB, while a rename removes
+        // it. Avoid reopening a removed source path and recreating it.
+        if source_data_dir.exists() {
+            if let Ok(store) = Store::open_at(source_data_dir) {
+                let _ = store.release_data_dir_move(&move_token);
+            }
+        }
+        if let Ok(store) = Store::open() {
+            let _ = store.release_data_dir_move(&move_token);
+        }
+        flag.store(false, Ordering::SeqCst);
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response()
+}
+
+/// Count runs currently in an active state (`starting`/`running`), for the
+/// data-dir move's in-flight guard. SQL-side and unbounded (see
+/// `Store::count_active_runs`).
+fn active_run_count() -> usize {
+    Store::open()
+        .and_then(|s| s.count_active_runs())
+        .unwrap_or(0)
+}
+
+/// Refuse an operation that would write the store while a data-dir move is in
+/// progress — the move relies on nothing new touching the old dir mid-flight.
+fn reject_if_moving(state: &AppState) -> std::result::Result<(), ApiError> {
+    if state
+        .data_dir_move_in_progress
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "A data-directory move is in progress. Try again once it finishes.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_if_stopping(state: &AppState) -> std::result::Result<(), ApiError> {
+    if state.stopping.load(Ordering::SeqCst) {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The persistent VERA host is stopping.".into(),
+        ));
+    }
+    Ok(())
+}
+
+// --- git settings -----------------------------------------------------------
+
+fn git_out(args: &[&str]) -> Option<String> {
+    let out = local::git::git_command().args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+fn git_settings_json(github_status: local::github::Status) -> Value {
+    json!({
+        "gitVersion": git_out(&["--version"]),
+        "userName": git_out(&["config", "--global", "user.name"]),
+        "userEmail": git_out(&["config", "--global", "user.email"]),
+        "ghInstalled": github_status.installed,
+        "githubAuthenticated": github_status.authenticated,
+    })
+}
+
+fn project_defaults_json(github_status: local::github::Status) -> Value {
+    json!({
+        "githubForNewProjects": crate::config::github_for_new_projects(),
+        "githubDefaultPromptSeen": crate::config::github_default_prompt_seen(),
+        "ghInstalled": github_status.installed,
+        "githubAuthenticated": github_status.authenticated,
+    })
+}
+
+async fn project_defaults() -> ApiResult {
+    Ok(Json(project_defaults_json(local::github::status().await)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetProjectDefaultsReq {
+    github_for_new_projects: bool,
+    #[serde(default)]
+    github_default_prompt_seen: Option<bool>,
+}
+
+async fn set_project_defaults(Json(req): Json<SetProjectDefaultsReq>) -> ApiResult {
+    let github_status = local::github::status().await;
+    if req.github_for_new_projects && !github_status.authenticated {
+        return Err(bad_request(
+            "Connect GitHub before enabling it by default for new projects.",
+        ));
+    }
+    crate::config::set_github_for_new_projects(req.github_for_new_projects)?;
+    if let Some(seen) = req.github_default_prompt_seen {
+        crate::config::set_github_default_prompt_seen(seen)?;
+    }
+    Ok(Json(project_defaults_json(github_status)))
+}
+
+async fn git_settings() -> ApiResult {
+    let github_status = local::github::status().await;
+    tokio::task::spawn_blocking(move || Ok(Json(git_settings_json(github_status))))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("git task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetGitSettingsReq {
+    user_name: Option<String>,
+    user_email: Option<String>,
+}
+
+async fn set_git_settings(Json(req): Json<SetGitSettingsReq>) -> ApiResult {
+    let name = req.user_name.map(|s| s.trim().to_string());
+    let email = req.user_email.map(|s| s.trim().to_string());
+    if name.as_deref().is_none_or(str::is_empty) && email.as_deref().is_none_or(str::is_empty) {
+        return Err(bad_request(
+            "nothing to update: pass userName and/or userEmail",
+        ));
+    }
+    let github_status = local::github::status().await;
+    tokio::task::spawn_blocking(move || {
+        for (key, value) in [("user.name", name), ("user.email", email)] {
+            if let Some(v) = value.filter(|v| !v.is_empty()) {
+                let ok = local::git::git_command()
+                    .args(["config", "--global", key, &v])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(bad_request(format!("git config --global {key} failed")));
+                }
+            }
+        }
+        Ok(Json(git_settings_json(github_status)))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("git task failed: {e}")))?
+}
+
+// --- telemetry settings -----------------------------------------------------
+
+/// Effective eligibility plus the saved preference controlled by the switch.
+fn telemetry_settings_json() -> Value {
+    let preference_enabled = crate::telemetry::preference_enabled();
+    match crate::telemetry::effective_disabled_reason() {
+        None => {
+            json!({ "enabled": true, "preferenceEnabled": preference_enabled, "locked": false, "reason": null })
+        }
+        Some(r) => {
+            let reason = r.as_str();
+            let locked = !matches!(r, crate::telemetry::DisabledReason::Persisted);
+            json!({ "enabled": false, "preferenceEnabled": preference_enabled, "locked": locked, "reason": reason })
+        }
+    }
+}
+
+async fn telemetry_settings() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(telemetry_settings_json())))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("telemetry task failed: {e}")))?
+}
+
+/// A product event raised by the UI rather than by a command. Every field is
+/// matched against a fixed allowlist in `telemetry`, so this local endpoint
+/// cannot emit arbitrary telemetry.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UiEventReq {
+    name: String,
+    #[serde(default)]
+    choice: Option<String>,
+    #[serde(default)]
+    step: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    experiment: Option<String>,
+    #[serde(default)]
+    slot: Option<u8>,
+    #[serde(default)]
+    surface: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+async fn record_ui_event(Json(req): Json<UiEventReq>) -> ApiResult {
+    match req.name.as_str() {
+        "demo_welcome_choice" => {
+            if let Some(choice) = req.choice.as_deref() {
+                crate::telemetry::capture_demo_welcome_choice(choice);
+            }
+        }
+        "onboarding_step_viewed" => {
+            if let Some(step) = req.step.as_deref() {
+                crate::telemetry::capture_onboarding_step_viewed(step);
+            }
+        }
+        "demo_experiment_started" => {
+            if let (Some(kind), Some(experiment)) = (req.kind.as_deref(), req.experiment.as_deref())
+            {
+                crate::telemetry::capture_demo_experiment_started(kind, experiment);
+            }
+        }
+        "project_starter_clicked" => {
+            if let Some(slot) = req.slot {
+                crate::telemetry::capture_project_starter_clicked(slot);
+            }
+        }
+        "first_action" => {
+            if let (Some(surface), Some(action)) = (req.surface.as_deref(), req.action.as_deref()) {
+                crate::telemetry::capture_first_action(surface, action);
+            }
+        }
+        _ => return Ok(Json(json!({ "ok": false }))),
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SetTelemetryReq {
+    enabled: bool,
+}
+
+async fn set_telemetry_settings(Json(req): Json<SetTelemetryReq>) -> ApiResult {
+    let enabled = req.enabled;
+    crate::telemetry::record_consent(enabled).await;
+    tokio::task::spawn_blocking(move || {
+        crate::telemetry::set_persisted_disabled(!enabled)
+            .map_err(|e| ApiError::from(anyhow!("could not save telemetry setting: {e}")))?;
+        Ok(Json(telemetry_settings_json()))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("telemetry task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetLocaleReq {
+    locale: String,
+}
+
+async fn set_dashboard_locale(Json(SetLocaleReq { locale }): Json<SetLocaleReq>) -> ApiResult {
+    // Attached to every later batch, so a value the server rejects would drop them all.
+    let valid = (2..=16).contains(&locale.len())
+        && locale
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !valid {
+        return Err(bad_request(format!("invalid locale: {locale:?}")));
+    }
+    tokio::task::spawn_blocking(move || {
+        crate::telemetry::set_dashboard_locale(&locale)
+            .map_err(|e| ApiError::from(anyhow!("could not save the dashboard locale: {e}")))?;
+        Ok(Json(json!({ "locale": locale })))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("locale task failed: {e}")))?
+}
+
+// --- updates -----------------------------------------------------------------
+
+async fn update_status() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(json!(updates::status()))))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("update status task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetAutoUpdateReq {
+    enabled: bool,
+}
+
+async fn set_auto_update(Json(req): Json<SetAutoUpdateReq>) -> ApiResult {
+    let enabled = req.enabled;
+    tokio::task::spawn_blocking(move || {
+        crate::config::set_auto_update_enabled(enabled)
+            .map_err(|e| ApiError::from(anyhow!("could not save the auto-update setting: {e}")))?;
+        Ok(Json(json!(updates::status())))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("auto-update task failed: {e}")))?
+}
+
+/// Apply an update now, for the user who doesn't want to wait for the next
+/// periodic pass. Runs the same detached updater, so it can't race one already
+/// in flight — the updater's file lock settles that.
+async fn apply_update() -> ApiResult {
+    updates::apply_now().await?;
+    Ok(Json(json!(updates::status())))
+}
+
+/// Relaunch into the copy the updater already installed. Answers first, then
+/// restarts, so the dashboard learns the request landed before the connection
+/// drops; it reloads once the new server is up.
+async fn restart_after_update(State(state): State<AppState>) -> ApiResult {
+    let status = tokio::task::spawn_blocking(updates::status)
+        .await
+        .map_err(|e| ApiError::from(anyhow!("update status task failed: {e}")))?;
+    let Some(version) = status.installed_version else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "no newer orx is installed to restart into".into(),
+        ));
+    };
+    // A dashboard poll landing alongside the click is not work worth refusing over.
+    let mut began = false;
+    for _ in 0..10 {
+        began = begin_restart(&state, 1).await;
+        if began {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !began {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "VERA is busy: a chat turn, queued message, approval, open terminal, \
+             remote session, or request is still in progress. Try again once it finishes."
+                .into(),
+        ));
+    }
+    let restart = state.restart.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        restart.notify_one();
+    });
+    Ok(Json(json!({ "restarting": true, "version": version })))
+}
+
+#[derive(Deserialize)]
+struct InstallCliReq {
+    /// Replace an `orx` that is already on PATH. The card only sends this after
+    /// showing the user what it would displace.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Link the app's `orx` onto the user's PATH (Settings → Updates).
+async fn install_cli(Json(req): Json<InstallCliReq>) -> ApiResult {
+    let installed =
+        tokio::task::spawn_blocking(move || crate::commands::install_cli::install(req.force))
+            .await
+            .map_err(|e| ApiError::from(anyhow!("install-cli task failed: {e}")))??;
+    Ok(Json(json!({
+        "link": installed.link.to_string_lossy(),
+        "dir": installed.link.parent().unwrap_or(&installed.link).to_string_lossy(),
+        "target": installed.target.to_string_lossy(),
+        "onPath": installed.on_path,
+        "alreadyCurrent": installed.already_current,
+    })))
+}
+
+fn profile_settings_json() -> Value {
+    json!(crate::telemetry::load_profile())
+}
+
+async fn profile_settings() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(profile_settings_json())))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("profile task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetProfileReq {
+    #[serde(default)]
+    research_areas: Vec<String>,
+    #[serde(default)]
+    other_area: Option<String>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    papers: Vec<crate::telemetry::ProfilePaper>,
+    #[serde(default)]
+    research_diagnosis: Option<crate::telemetry::ResearchDiagnosis>,
+}
+
+fn validate_research_diagnosis(
+    diagnosis: Option<crate::telemetry::ResearchDiagnosis>,
+) -> std::result::Result<Option<crate::telemetry::ResearchDiagnosis>, ApiError> {
+    if diagnosis.as_ref().is_some_and(|value| !value.is_valid()) {
+        return Err(bad_request("invalid or incomplete research diagnosis"));
+    }
+    Ok(diagnosis)
+}
+
+fn profile_settings_update(
+    req: SetProfileReq,
+    current: crate::telemetry::ResearchProfile,
+) -> std::result::Result<crate::telemetry::ResearchProfile, ApiError> {
+    // Older settings clients omit this field; preserve the saved self-assessment.
+    let diagnosis =
+        validate_research_diagnosis(req.research_diagnosis)?.or(current.research_diagnosis);
+    if req.research_areas.is_empty() {
+        Ok(crate::telemetry::ResearchProfile {
+            research_areas: current.research_areas,
+            other_area: current.other_area,
+            background: req.background.filter(|value| !value.trim().is_empty()),
+            papers: req.papers,
+            research_diagnosis: diagnosis,
+        })
+    } else {
+        let mut profile = normalize_research_profile(
+            req.research_areas,
+            req.other_area,
+            req.background,
+            req.papers,
+        )?;
+        profile.research_diagnosis = diagnosis;
+        Ok(profile)
+    }
+}
+
+async fn set_profile_settings(Json(req): Json<SetProfileReq>) -> ApiResult {
+    let profile = profile_settings_update(req, crate::telemetry::load_profile())?;
+    tokio::task::spawn_blocking(move || {
+        crate::telemetry::set_profile(profile)
+            .map_err(|e| ApiError::from(anyhow!("could not save profile: {e}")))?;
+        Ok(Json(profile_settings_json()))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("profile task failed: {e}")))?
+}
+
+async fn ui_state() -> ApiResult {
+    tokio::task::spawn_blocking(|| -> Result<Json<Value>> {
+        Ok(Json(json!(Store::open()?.ui_state()?)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("UI state task failed: {error}")))?
+    .map_err(ApiError::from)
+}
+
+async fn project_ui_state(Path(id): Path<String>) -> ApiResult {
+    tokio::task::spawn_blocking(move || -> ApiResult {
+        let store = Store::open()?;
+        store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        Ok(Json(json!(store.project_workspace_state(&id)?)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("workspace task failed: {error}")))?
+}
+
+async fn set_project_ui_state(
+    Path(id): Path<String>,
+    Json(workspace): Json<WorkspaceState>,
+) -> ApiResult {
+    workspace.validate().map_err(bad_request)?;
+    tokio::task::spawn_blocking(move || -> ApiResult {
+        if !Store::open()?.set_project_workspace_state(&id, &workspace)? {
+            return Err(not_found("project"));
+        }
+        Ok(Json(json!(workspace)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("workspace task failed: {error}")))?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetUiStateReq {
+    #[serde(default)]
+    tour_completed: Option<bool>,
+    #[serde(default)]
+    preferred_agent: Option<StoredAgentSelectionReq>,
+    workspace: Option<GlobalWorkspaceState>,
+    preferred_autonomy: Option<Autonomy>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAgentSelectionReq {
+    harness: String,
+    model: Option<String>,
+    service_tier: Option<String>,
+    permission_mode: Option<String>,
+    reasoning_level: Option<String>,
+}
+
+async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
+    if let Some(workspace) = &req.workspace {
+        workspace.validate().map_err(bad_request)?;
+    }
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>> {
+        let store = Store::open()?;
+        let selection = req
+            .preferred_agent
+            .map(|selection| {
+                if !local::harness::is_chat_harness(&selection.harness) {
+                    return Err(anyhow!("unknown harness: {}", selection.harness));
+                }
+                let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+                let permission_mode = nonempty(selection.permission_mode);
+                let service_tier = nonempty(selection.service_tier);
+                if permission_mode.as_deref().is_some_and(|mode| {
+                    local::harness::permission_mode_for(&selection.harness, mode).is_none()
+                }) {
+                    return Err(anyhow!("invalid permission mode for selected harness"));
+                }
+                if service_tier.as_deref().is_some_and(|tier| {
+                    local::harness::service_tier_for(&selection.harness, tier).is_none()
+                }) {
+                    return Err(anyhow!("invalid speed for selected harness"));
+                }
+                Ok(StoredAgentSelection {
+                    harness: selection.harness.clone(),
+                    model: nonempty(selection.model),
+                    service_tier,
+                    permission_mode: preferred_permission_mode(&selection.harness, permission_mode),
+                    reasoning_level: nonempty(selection.reasoning_level),
+                })
+            })
+            .transpose()?;
+        if let Some(completed) = req.tour_completed {
+            store.set_tour_completed(completed)?;
+        }
+        if let Some(selection) = selection {
+            store.set_preferred_agent(&selection)?;
+        }
+        if let Some(autonomy) = req.preferred_autonomy {
+            store.set_preferred_autonomy(autonomy)?;
+        }
+        if let Some(workspace) = req.workspace {
+            store.set_global_workspace_state(&workspace)?;
+        }
+        Ok(Json(json!(store.ui_state()?)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("UI state task failed: {error}")))?
+    .map_err(bad_request)
+}
+
+/// The lit-source toggles as booleans (enabled = not in the disabled set).
+fn lit_sources_json() -> Value {
+    let disabled = crate::config::disabled_lit_sources();
+    let enabled = |name: &str| !disabled.iter().any(|d| d == name);
+    json!({
+        "alphaxiv": enabled(crate::LitSource::Alphaxiv.as_str()),
+        "openalex": enabled(crate::LitSource::Openalex.as_str()),
+        "biorxiv": enabled(crate::LitSource::Biorxiv.as_str()),
+        "pubmed": enabled(crate::LitSource::Pubmed.as_str()),
+    })
+}
+
+async fn lit_sources_settings() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(lit_sources_json())))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("lit-sources task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetLitSourcesReq {
+    alphaxiv: bool,
+    openalex: bool,
+    biorxiv: bool,
+    pubmed: bool,
+}
+
+async fn set_lit_sources_settings(Json(req): Json<SetLitSourcesReq>) -> ApiResult {
+    tokio::task::spawn_blocking(move || {
+        let mut disabled = Vec::new();
+        for (enabled, source) in [
+            (req.alphaxiv, crate::LitSource::Alphaxiv),
+            (req.openalex, crate::LitSource::Openalex),
+            (req.biorxiv, crate::LitSource::Biorxiv),
+            (req.pubmed, crate::LitSource::Pubmed),
+        ] {
+            if !enabled {
+                disabled.push(source.as_str().to_string());
+            }
+        }
+        crate::telemetry::set_disabled_lit_sources(disabled)
+            .map_err(|e| ApiError::from(anyhow!("could not save literature sources: {e}")))?;
+        Ok(Json(lit_sources_json()))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("lit-sources task failed: {e}")))?
+}
+
+// --- ssh hosts ----------------------------------------------------------------
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SshConnectBackend {
+    Ssh,
+    Slurm,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SshConnectReq {
+    pub(crate) host: String,
+    pub(crate) backend: SshConnectBackend,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum SshTerminalInput {
+    Resize { cols: u16, rows: u16 },
+}
+
+enum PtyEvent {
+    Output(Vec<u8>),
+    Eof,
+    Exit(std::result::Result<portable_pty::ExitStatus, String>),
+}
+
+struct PtySession {
+    master: Box<dyn MasterPty + Send>,
+    input: std::sync::mpsc::Sender<Vec<u8>>,
+    events: mpsc::Receiver<PtyEvent>,
+    kill: std::sync::mpsc::Sender<()>,
+}
+
+struct PtyChildGuard {
+    kill: std::sync::mpsc::Sender<()>,
+    running: bool,
+}
+
+impl Drop for PtyChildGuard {
+    fn drop(&mut self) {
+        if self.running {
+            let _ = self.kill.send(());
+        }
+    }
+}
+
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    origin == format!("http://{host}") || origin == format!("https://{host}")
+}
+
+fn ssh_connect_failure(host: &str, error: String) -> SshHostTest {
+    SshHostTest {
+        host: host.to_string(),
+        reachable: false,
+        tools_found: false,
+        missing_tools: Vec::new(),
+        error: Some(error),
+        tested_at: now_ms(),
+    }
+}
+
+async fn send_ssh_connect_error(
+    socket: &mut WebSocket,
+    host: &str,
+    backend: SshConnectBackend,
+    error: String,
+) {
+    if matches!(backend, SshConnectBackend::Ssh) {
+        record_ssh_host_test(&ssh_connect_failure(host, error.clone())).await;
+    }
+    let _ = socket
+        .send(Message::Text(
+            json!({ "type": "error", "error": error })
+                .to_string()
+                .into(),
+        ))
+        .await;
+    close_socket(socket).await;
+}
+
+pub(crate) async fn ssh_connect(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    Query(req): Query<SshConnectReq>,
+) -> Response {
+    let target = crate::jobs::ssh::SshTarget::alias(req.host.trim());
+    ssh_connect_to_target(headers, ws, req, target).await
+}
+
+pub(crate) async fn ssh_connect_to_target(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    req: SshConnectReq,
+    target: crate::jobs::ssh::SshTarget,
+) -> Response {
+    if !same_origin(&headers) {
+        return ApiError(StatusCode::FORBIDDEN, "SSH terminal origin rejected".into())
+            .into_response();
+    }
+    let host = req.host.trim().to_string();
+    if host.is_empty() {
+        return bad_request("host is required").into_response();
+    }
+    let active = Active::new();
+    ws.on_upgrade(move |socket| async move {
+        let _active = active;
+        ssh_connect_socket(socket, host, req.backend, target).await
+    })
+}
+
+const DEFAULT_PTY_SIZE: PtySize = PtySize {
+    rows: 24,
+    cols: 80,
+    pixel_width: 0,
+    pixel_height: 0,
+};
+
+fn start_pty(program: &str, args: Vec<String>) -> Result<PtySession> {
+    start_pty_with_env(program, args, &[], DEFAULT_PTY_SIZE, None)
+}
+
+fn start_pty_with_env(
+    program: &str,
+    args: Vec<String>,
+    env: &[(&str, std::ffi::OsString)],
+    size: PtySize,
+    cwd: Option<&std::path::Path>,
+) -> Result<PtySession> {
+    use std::io::{Read as _, Write as _};
+
+    let pair = native_pty_system().openpty(size)?;
+    let mut command = CommandBuilder::new(program);
+    command.args(args);
+    // App mode never puts the imported shell env into the process env, so a
+    // child sees launchd's PATH and config dirs unless they are exported here.
+    if let Some(path) = local::shell_env::search_path() {
+        command.env("PATH", path);
+    }
+    local::shell_env::export_to(|key, value| command.env(key, value));
+    for (key, value) in local::shell_env::host_gui_env() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        }
+    }
+    command.env("TERM", "xterm-256color");
+    command.env_remove("NO_COLOR");
+    command.env_remove("FORCE_COLOR");
+    if let Some(cwd) = cwd {
+        command.cwd(cwd);
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    if program == "ssh" {
+        command.env("ORX_SSH_PROBE", "1");
+    }
+    let mut child = pair.slave.spawn_command(command)?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader()?;
+    let mut writer = pair.master.take_writer()?;
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (kill_tx, kill_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel(64);
+
+    let output_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx
+                        .blocking_send(PtyEvent::Output(buf[..n].to_vec()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = output_tx.blocking_send(PtyEvent::Eof);
+    });
+    std::thread::spawn(move || {
+        while let Ok(bytes) = input_rx.recv() {
+            if writer
+                .write_all(&bytes)
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = event_tx.blocking_send(PtyEvent::Exit(Ok(status)));
+                return;
+            }
+            Err(error) => {
+                let _ = event_tx.blocking_send(PtyEvent::Exit(Err(error.to_string())));
+                return;
+            }
+            Ok(None) => {}
+        }
+        match kill_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let status = child
+                    .kill()
+                    .and_then(|_| child.wait())
+                    .map_err(|error| error.to_string());
+                let _ = event_tx.blocking_send(PtyEvent::Exit(status));
+                return;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    });
+
+    Ok(PtySession {
+        master: pair.master,
+        input: input_tx,
+        events: event_rx,
+        kill: kill_tx,
+    })
+}
+
+async fn ssh_connect_socket(
+    mut socket: WebSocket,
+    host: String,
+    backend: SshConnectBackend,
+    target: crate::jobs::ssh::SshTarget,
+) {
+    let connection = match crate::jobs::ssh::interactive_args(&target, None).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            send_ssh_connect_error(&mut socket, &host, backend, error.to_string()).await;
+            return;
+        }
+    };
+    let args = connection.args.clone();
+    let session = match tokio::task::spawn_blocking(move || start_pty("ssh", args)).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => {
+            send_ssh_connect_error(&mut socket, &host, backend, error.to_string()).await;
+            return;
+        }
+        Err(error) => {
+            send_ssh_connect_error(
+                &mut socket,
+                &host,
+                backend,
+                format!("SSH terminal task failed: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+    let mut size = DEFAULT_PTY_SIZE;
+    let Some(status) = relay_pty(&mut socket, session, None, &mut size, None).await else {
+        return;
+    };
+
+    match status {
+        Ok(status) if status.success() => {
+            if let Some(warning) = crate::jobs::ssh::setup_connection_sharing(&target).await {
+                let _ = socket
+                    .send(Message::Binary(
+                        format!("\r\norx: warning: {warning}\r\n")
+                            .into_bytes()
+                            .into(),
+                    ))
+                    .await;
+            }
+        }
+        Ok(status) => {
+            send_ssh_connect_error(
+                &mut socket,
+                &host,
+                backend,
+                format!("ssh {host} exited with code {}", status.exit_code()),
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            send_ssh_connect_error(&mut socket, &host, backend, error).await;
+            return;
+        }
+    }
+
+    drop(connection);
+    let (backend_name, result, ssh_test) = match backend {
+        SshConnectBackend::Ssh => {
+            let test = probe_ssh_host_preflight(host.clone()).await;
+            let result = json!(&test);
+            ("ssh", result, Some(test))
+        }
+        SshConnectBackend::Slurm => {
+            let result = crate::jobs::slurm::preflight(&host).await;
+            ("slurm", slurm_preflight_value(&result), None)
+        }
+    };
+    if socket
+        .send(Message::Text(
+            json!({ "type": "complete", "backend": backend_name, "result": result })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_ok()
+    {
+        if let Some(test) = ssh_test {
+            record_ssh_host_test(&test).await;
+        }
+        close_socket(&mut socket).await;
+    }
+}
+
+/// Record a client resize message in `size`; false when it is not one.
+fn apply_resize(size: &mut PtySize, text: &str) -> bool {
+    match serde_json::from_str(text) {
+        Ok(SshTerminalInput::Resize { cols, rows }) if cols > 0 && rows > 0 => {
+            size.rows = rows;
+            size.cols = cols;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Relay one PTY session; `size` follows the client's resizes so a session
+/// started afterwards can open at the terminal's real dimensions.
+async fn relay_pty(
+    socket: &mut WebSocket,
+    session: PtySession,
+    mut output: Option<&mut String>,
+    size: &mut PtySize,
+    completed: Option<fn(&str) -> bool>,
+) -> Option<std::result::Result<portable_pty::ExitStatus, String>> {
+    let PtySession {
+        master,
+        input,
+        mut events,
+        kill,
+    } = session;
+    let mut child = PtyChildGuard {
+        kill,
+        running: true,
+    };
+
+    let status = loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(PtyEvent::Output(bytes)) => {
+                    if let Some(output) = output.as_deref_mut() { harness_setup::append_output(output, &bytes); }
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        return None;
+                    }
+                    if let (Some(completed), Some(output)) = (completed, output.as_deref()) {
+                        if completed(output) {
+                            return Some(Ok(portable_pty::ExitStatus::with_exit_code(0)));
+                        }
+                    }
+                }
+                Some(PtyEvent::Eof) => {} // EOF alone is not the child's exit status.
+                Some(PtyEvent::Exit(status)) => {
+                    child.running = false;
+                    break status;
+                }
+                None => break Err("Terminal ended without an exit status".into()),
+            },
+            message = socket.recv() => match message {
+                Some(Ok(Message::Binary(bytes))) => {
+                    if input.send(bytes.to_vec()).is_err() {
+                        break Err("Terminal input closed".into());
+                    }
+                }
+                Some(Ok(Message::Text(text))) => {
+                    if apply_resize(size, &text) {
+                        let _ = master.resize(*size);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return None,
+                Some(Ok(_)) => {}
+            }
+        }
+    };
+    // The waiter and PTY reader run on separate threads. Drain the final bytes
+    // briefly so the last diagnostic reaches the terminal before completion.
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(100), events.recv()).await
+    {
+        match event {
+            PtyEvent::Output(bytes) => {
+                if let Some(output) = output.as_deref_mut() {
+                    harness_setup::append_output(output, &bytes);
+                }
+                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                    return None;
+                }
+            }
+            PtyEvent::Eof | PtyEvent::Exit(_) => break,
+        }
+    }
+
+    Some(status)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectTerminalReq {
+    session_id: Option<String>,
+}
+
+async fn project_terminal(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    Path(id): Path<String>,
+    Query(req): Query<ProjectTerminalReq>,
+) -> Response {
+    if let Some(rejected) = reject_cross_origin(&headers) {
+        return rejected;
+    }
+    let active = Active::new();
+    ws.on_upgrade(move |mut socket| async move {
+        let _active = active;
+        let mut size = DEFAULT_PTY_SIZE;
+        let started = tokio::task::spawn_blocking(move || {
+            let root = project_terminal_root(&id, req.session_id.as_deref())?;
+            let (shell, args) = interactive_shell();
+            start_pty_with_env(&shell, args, &[], size, Some(&root))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        let session = match started {
+            Ok(session) => session,
+            Err(error) => {
+                send_terminal_error(&mut socket, error).await;
+                return;
+            }
+        };
+        let Some(status) = relay_pty(&mut socket, session, None, &mut size, None).await else {
+            return;
+        };
+        match status {
+            Ok(status) => {
+                let message = json!({ "type": "exit", "code": status.exit_code() });
+                let _ = socket.send(Message::Text(message.to_string().into())).await;
+                close_socket(&mut socket).await;
+            }
+            Err(error) => send_terminal_error(&mut socket, anyhow!(error)).await,
+        }
+    })
+}
+
+/// The session worktree or, without a session, the project clone.
+fn project_terminal_root(project_id: &str, session_id: Option<&str>) -> Result<std::path::PathBuf> {
+    let store = Store::open()?;
+    let project = store
+        .get_local_project(project_id)?
+        .ok_or_else(|| anyhow!("project not found"))?;
+    let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
+    let root = match session_id {
+        Some(session_id) => {
+            let session = store
+                .get_chat_session(session_id)?
+                .filter(|session| session.project_id == project.id)
+                .ok_or_else(|| anyhow!("chat session not found"))?;
+            session_checkout_root(&store, &project, &session.id)
+        }
+        None => resolve_checkout_root(&store, &project, None).map(|(root, _)| root),
+    };
+    root.map_err(|ApiError(_, message)| anyhow!(message))
+}
+
+/// The worktree the harness will create on its first turn, so a command run
+/// before any message acts on the same checkout the agent sees.
+fn session_checkout_root(
+    store: &Store,
+    project: &local::model::LocalProject,
+    session_id: &str,
+) -> std::result::Result<std::path::PathBuf, ApiError> {
+    match local::git::ensure_session_worktree(project, session_id) {
+        Ok(dir) => Ok(crate::paths::canonicalize(&dir).unwrap_or(dir)),
+        Err(error) => {
+            eprintln!("orx up: session worktree unavailable, using the clone: {error}");
+            resolve_checkout_root(store, project, Some(session_id)).map(|(root, _)| root)
+        }
+    }
+}
+
+/// Commands the settings page may run, keyed by the exact note text. The
+/// loopback and origin guards are the security boundary (the session ends in
+/// the user's shell anyway); this list only keeps the button honest.
+const SETTINGS_COMMANDS: &[(&str, &[&str])] = &[
+    ("gh auth login", &["gh", "auth", "login"]),
+    ("hf auth login", &["hf", "auth", "login"]),
+    ("claude auth status", &["claude", "auth", "status"]),
+];
+
+fn settings_command(command: &str) -> Option<&'static [&'static str]> {
+    SETTINGS_COMMANDS
+        .iter()
+        .find(|(text, _)| *text == command)
+        .map(|(_, argv)| *argv)
+}
+
+#[derive(Deserialize)]
+struct RunSettingsCommandReq {
+    command: String,
+}
+
+async fn run_settings_command(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    Query(req): Query<RunSettingsCommandReq>,
+) -> Response {
+    // Before the allowlist reply, so a cross-origin page learns nothing.
+    if let Some(rejected) = reject_cross_origin(&headers) {
+        return rejected;
+    }
+    let Some(argv) = settings_command(req.command.trim()) else {
+        return bad_request("command is not runnable from settings").into_response();
+    };
+    let program = local::shell_env::find_on_path(argv[0])
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow!("{} is not installed", argv[0]));
+    let args = argv[1..].iter().map(|arg| arg.to_string()).collect();
+    command_terminal(&headers, ws, program, args, true).await
+}
+
+/// The user's interactive login shell, so follow-up commands see the PATH a
+/// fresh terminal would (an installer that just added `~/.local/bin`, say).
+fn interactive_shell() -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        (shell, Vec::new())
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (shell, vec!["-i".to_string(), "-l".to_string()])
+    }
+}
+
+fn reject_cross_origin(headers: &HeaderMap) -> Option<Response> {
+    (!same_origin(headers))
+        .then(|| ApiError(StatusCode::FORBIDDEN, "Terminal origin rejected".into()).into_response())
+}
+
+/// Run `program` in a PTY relayed over the websocket. With `shell_after`, a
+/// command that ran is followed by the user's interactive shell in the same
+/// terminal, at the size the client last reported.
+async fn command_terminal(
+    headers: &HeaderMap,
+    ws: WebSocketUpgrade,
+    program: Result<String>,
+    args: Vec<String>,
+    shell_after: bool,
+) -> Response {
+    if let Some(rejected) = reject_cross_origin(headers) {
+        return rejected;
+    }
+    let active = Active::new();
+    ws.on_upgrade(move |mut socket| async move {
+        let _active = active;
+        let mut size = DEFAULT_PTY_SIZE;
+        let started = match program {
+            Ok(program) => spawn_pty(program, args, Vec::new(), size).await,
+            Err(error) => Err(error),
+        };
+        let session = match started {
+            Ok(session) => session,
+            Err(error) => {
+                send_terminal_error(&mut socket, error).await;
+                return;
+            }
+        };
+        let Some(status) = relay_pty(&mut socket, session, None, &mut size, None).await else {
+            return;
+        };
+        let result = async {
+            let status = status.map_err(|error| anyhow!(error))?;
+            anyhow::ensure!(
+                status.success(),
+                "Command exited with code {}",
+                status.exit_code()
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let message = match result {
+            Ok(()) => json!({ "type": "complete" }),
+            Err(error) => json!({ "type": "error", "error": error.to_string() }),
+        };
+        if socket
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if shell_after {
+            continue_in_shell(&mut socket, &mut size, Vec::new()).await;
+        } else {
+            close_socket(&mut socket).await;
+        }
+    })
+}
+
+/// WebKit drops the final frame of a socket closed without a close handshake,
+/// so send Close and wait for the client's before dropping it.
+async fn close_socket(socket: &mut WebSocket) {
+    if socket.send(Message::Close(None)).await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = socket.recv().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
+/// Hand the terminal to the user's interactive shell, with any env the command
+/// before it needed (OpenCode's isolated store), so follow-ups land in the
+/// same place.
+async fn continue_in_shell(
+    socket: &mut WebSocket,
+    size: &mut PtySize,
+    env: Vec<(&'static str, std::ffi::OsString)>,
+) {
+    let (shell, args) = interactive_shell();
+    match spawn_pty(shell, args, env, *size).await {
+        Ok(session) => {
+            if relay_pty(socket, session, None, size, None).await.is_some() {
+                close_socket(socket).await;
+            }
+        }
+        Err(error) => send_terminal_error(socket, error).await,
+    }
+}
+
+async fn spawn_pty(
+    program: String,
+    args: Vec<String>,
+    env: Vec<(&'static str, std::ffi::OsString)>,
+    size: PtySize,
+) -> Result<PtySession> {
+    tokio::task::spawn_blocking(move || start_pty_with_env(&program, args, &env, size, None))
+        .await?
+}
+
+async fn send_terminal_error(socket: &mut WebSocket, error: anyhow::Error) {
+    let _ = socket
+        .send(Message::Text(
+            json!({ "type": "error", "error": error.to_string() })
+                .to_string()
+                .into(),
+        ))
+        .await;
+    close_socket(socket).await;
+}
+
+async fn remote_sessions(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "sessions": state.remote_sessions.list().await }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRemoteSessionReq {
+    host: String,
+    #[serde(default)]
+    ui_preferences: crate::commands::up_remote::RemoteUiPreferences,
+}
+
+async fn create_remote_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateRemoteSessionReq>,
+) -> std::result::Result<Response, ApiError> {
+    let host = req.host.trim().to_string();
+    if host.is_empty() {
+        return Err(bad_request("host is required"));
+    }
+    require_configured_ssh_host(&host)?;
+    let (created, session) = state
+        .remote_sessions
+        .create(host, req.ui_preferences, None)
+        .await?;
+    Ok((
+        if created {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        },
+        Json(json!(session)),
+    )
+        .into_response())
+}
+
+async fn remote_session(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let session = state
+        .remote_sessions
+        .get(&id)
+        .await
+        .ok_or_else(|| not_found("remote session"))?;
+    Ok(Json(json!(session)))
+}
+
+async fn reconnect_remote_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    Ok(Json(json!(state.remote_sessions.reconnect(&id).await?)))
+}
+
+async fn disconnect_remote_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    Ok(Json(json!(state.remote_sessions.disconnect(&id).await?)))
+}
+
+async fn local_runtime() -> Json<Value> {
+    Json(json!({ "kind": "local", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+async fn list_local_models() -> ApiResult {
+    Ok(Json(local::local_models::list()?))
+}
+
+async fn discover_local_models(Json(req): Json<local::local_models::Probe>) -> ApiResult {
+    let models = local::local_models::discover(&req)
+        .await
+        .map_err(|e| bad_request(e.to_string()))?;
+    Ok(Json(json!({ "models": models })))
+}
+
+async fn check_local_model(Path(id): Path<String>) -> ApiResult {
+    let connection = local::local_models::read()?
+        .remove(&id)
+        .ok_or_else(|| not_found("local model connection"))?;
+    let models = local::local_models::discover(&local::local_models::Probe {
+        base_url: connection.base_url,
+        api_key: connection.api_key,
+    })
+    .await
+    .map_err(|e| bad_request(e.to_string()))?;
+    Ok(Json(json!({ "models": models })))
+}
+
+async fn connect_local_model(
+    State(state): State<AppState>,
+    Json(req): Json<local::local_models::Connect>,
+) -> ApiResult {
+    let model = local::local_models::connect(req)
+        .await
+        .map_err(|e| bad_request(e.to_string()))?;
+    *state.harnesses.lock().await = None;
+    Ok(Json(json!({ "model": model })))
+}
+
+async fn remove_local_model(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    local::local_models::remove(&id)?;
+    *state.harnesses.lock().await = None;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// --- harnesses ---------------------------------------------------------------
+
+const HARNESS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Minimum age before a still-pending or promotion-blocked entry may re-arm a
+/// catalog fill — bounds how often a non-converging state can buy a sweep.
+const FILL_RETRY_FLOOR: Duration = Duration::from_secs(5);
+
+#[derive(Deserialize, Default)]
+struct HarnessQuery {
+    refresh: Option<u8>,
+    retry: Option<u8>,
+}
+
+fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapshot) {
+    const FAILED_RECHECK_NOTE: &str = "Could not re-check Claude Code. The last verified configuration is still in use; re-check this harness.";
+    let Some(harnesses) = payload.get_mut("harnesses").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(claude) = harnesses
+        .iter_mut()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some("claude-code"))
+    else {
+        return;
+    };
+    // Overlaying would replace the reinstall note with advice that runs the
+    // failing binary.
+    if entry_install_broken(claude) {
+        return;
+    }
+    // A provisional entry is never overlaid: the shared state would stamp an
+    // auth verdict (or a "sign in" note) the fill is about to settle, under a
+    // card that reads "checking" anyway.
+    if claude.get("catalogPending").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    let entry_was_ready = claude.get("authState").and_then(Value::as_str) == Some("ready");
+    claude["authState"] = json!(snapshot.state);
+    claude["needsConfigRepair"] = json!(snapshot.credential_conflict);
+    claude["authCheckFailed"] = json!(snapshot.auth_check_failed);
+    claude["loginEligible"] = json!(
+        !snapshot.auth_check_failed
+            && !snapshot.runtime_rejected
+            && local::harness::claude::login_eligible_state(
+                snapshot.state,
+                snapshot.method,
+                snapshot.provider.as_deref(),
+                snapshot.credential_conflict,
+            )
+    );
+    if let Some(object) = claude.as_object_mut() {
+        match snapshot.method {
+            Some(method) => {
+                object.insert("authMethod".into(), json!(method));
+            }
+            None => {
+                object.remove("authMethod");
+            }
+        }
+        match &snapshot.provider {
+            Some(provider) => {
+                object.insert("authProvider".into(), json!(provider));
+            }
+            None => {
+                object.remove("authProvider");
+            }
+        }
+        if snapshot.state != local::harness::HarnessAuthState::Ready
+            || snapshot.method != Some("oauth")
+            || snapshot
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider != "firstParty")
+            || !entry_was_ready
+        {
+            object.remove("account");
+            object.remove("org");
+            object.remove("plan");
+        }
+    }
+    if snapshot.state == local::harness::HarnessAuthState::Ready {
+        claude["authenticated"] = json!(true);
+        claude["agentReady"] = json!(true);
+        if snapshot.auth_check_failed {
+            claude["agentNote"] = json!(FAILED_RECHECK_NOTE);
+        } else if !entry_was_ready
+            || claude.get("agentNote").and_then(Value::as_str) == Some(FAILED_RECHECK_NOTE)
+        {
+            if let Some(object) = claude.as_object_mut() {
+                object.remove("agentNote");
+            }
+        }
+        return;
+    }
+    claude["authenticated"] = json!(false);
+    claude["agentReady"] = json!(false);
+    claude["models"] = json!([]);
+    if snapshot.credential_conflict {
+        claude["agentNote"] = json!("Claude Code reports a subscription login while an Anthropic environment credential is set. Fix or unset that credential, then re-check this harness.");
+        return;
+    }
+    claude["agentNote"] = json!(if snapshot.runtime_rejected {
+        local::harness::claude::auth_recovery_note(snapshot.method, snapshot.provider.as_deref())
+    } else {
+        match snapshot.state {
+            local::harness::HarnessAuthState::NeedsLogin => {
+                if local::harness::claude::login_eligible_state(
+                    snapshot.state,
+                    snapshot.method,
+                    snapshot.provider.as_deref(),
+                    false,
+                ) {
+                    "Sign in with `claude auth login`, then re-check this harness."
+                } else {
+                    "Check the configured Claude Code provider with `claude auth status`, then re-check this harness."
+                }
+            }
+            local::harness::HarnessAuthState::Unknown => {
+                "Open a terminal and run `claude auth status`, then re-check this harness."
+            }
+            local::harness::HarnessAuthState::Unsupported => {
+                "Update Claude Code to 2.1.211 or newer, then re-check this harness."
+            }
+            local::harness::HarnessAuthState::Ready => unreachable!(),
+        }
+    });
+}
+
+struct ClaudeCatalogRequest {
+    bin: std::path::PathBuf,
+    ultracode: bool,
+    method: Option<&'static str>,
+    provider: Option<String>,
+}
+
+#[derive(Default)]
+struct ClaudeCatalogQueue {
+    running: bool,
+    latest: Option<(std::time::Instant, ClaudeCatalogRequest)>,
+}
+
+fn claude_catalog_request(
+    harnesses: &[local::harness::HarnessInfo],
+) -> Option<ClaudeCatalogRequest> {
+    let claude = harnesses
+        .iter()
+        .find(|h| h.id == "claude-code" && h.agent_ready)?;
+    if !local::harness::claude::external_provider(
+        claude.auth_method,
+        claude.auth_provider.as_deref(),
+    ) {
+        return None;
+    }
+    Some(ClaudeCatalogRequest {
+        bin: claude.bin_path.as_ref()?.into(),
+        ultracode: claude.claude_ultracode,
+        method: claude.auth_method,
+        provider: claude.auth_provider.clone(),
+    })
+}
+
+fn enqueue_claude_catalog(
+    state: AppState,
+    cached_at: std::time::Instant,
+    request: ClaudeCatalogRequest,
+) {
+    let mut queue = state.claude_catalog_queue.lock().unwrap();
+    queue.latest = Some((cached_at, request));
+    if queue.running {
+        return;
+    }
+    queue.running = true;
+    drop(queue);
+    tokio::spawn(async move {
+        loop {
+            let next = {
+                let mut queue = state.claude_catalog_queue.lock().unwrap();
+                match queue.latest.take() {
+                    Some(next) => next,
+                    None => {
+                        queue.running = false;
+                        return;
+                    }
+                }
+            };
+            let (cached_at, request) = next;
+            let models =
+                local::harness::claude::external_model_catalog(request.bin, request.ultracode)
+                    .await;
+            let empty = models.is_empty();
+            let mut cache = state.harnesses.lock().await;
+            let Some((at, payload)) = cache.as_mut() else {
+                continue;
+            };
+            if *at != cached_at {
+                continue;
+            }
+            let auth = state.claude.auth_snapshot();
+            if auth.state != local::harness::HarnessAuthState::Ready
+                || auth.runtime_rejected
+                || auth.method != request.method
+                || auth.provider != request.provider
+            {
+                continue;
+            }
+            let Some(claude) = payload["harnesses"].as_array_mut().and_then(|all| {
+                all.iter_mut()
+                    .find(|h| h["id"] == "claude-code" && h["agentReady"] == true)
+            }) else {
+                continue;
+            };
+            claude["models"] = json!(models);
+            if empty {
+                claude["agentNote"] = json!("Could not load Claude Code models. Re-check this harness or update Claude Code; the CLI default model is still available.");
+            } else if let Some(object) = claude.as_object_mut() {
+                object.remove("agentNote");
+            }
+            drop(cache);
+            state.chat.emit_event("harness.catalog", json!({}));
+        }
+    });
+}
+
+fn claude_entry(payload: &Value) -> Option<&Value> {
+    payload
+        .get("harnesses")?
+        .as_array()?
+        .iter()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some("claude-code"))
+}
+
+fn entry_install_broken(entry: &Value) -> bool {
+    entry.get("installBroken").and_then(Value::as_bool) == Some(true)
+}
+
+/// A claude the cached entry must never be restored over: one that can't run,
+/// or isn't there at all. Both would resurrect `agentReady` for a binary no
+/// turn can spawn.
+fn claude_unspawnable(payload: &Value) -> bool {
+    claude_entry(payload).is_none_or(|claude| {
+        entry_install_broken(claude)
+            || claude.get("installed").and_then(Value::as_bool) != Some(true)
+    })
+}
+
+fn payload_has_ready_claude(payload: &Value) -> bool {
+    claude_entry(payload)
+        .and_then(|claude| claude.get("agentReady"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+#[cfg(test)]
+fn claude_entry_pending(payload: &Value) -> bool {
+    claude_entry(payload)
+        .and_then(|claude| claude.get("catalogPending"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+async fn harness_snapshot(Path(id): Path<String>) -> ApiResult {
+    let info = local::harness::detect_harness_snapshot(&id)
+        .await
+        .ok_or_else(|| not_found("harness"))?;
+    Ok(Json(json!(info)))
+}
+
+async fn list_harnesses(
+    State(state): State<AppState>,
+    Query(q): Query<HarnessQuery>,
+) -> Json<Value> {
+    Json(harnesses_payload(&state, &q).await)
+}
+
+/// The shared detection path behind `GET /api/harnesses` and the startup
+/// preflight: the snapshot pass runs under the cache lock, so whoever arrives
+/// first does the probing and everyone else in the TTL window reads the same
+/// entry — no duplicate sweep at boot. `refresh=1` and the background fill
+/// detect before taking the lock, so a slow probe never stalls a reader.
+///
+/// A plain request answers with the snapshot pass — install/auth/readiness,
+/// without the model-catalog children that made cold calls take seconds — and
+/// a background fill replaces the entry with the full catalog, then tells the
+/// dashboard to re-read it. `refresh=1` still runs the full probe inline: an
+/// explicit re-check wants the real answer, and the UI shows its own spinner.
+async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
+    // `retry` only escalates to a full detect when it actually cleared a
+    // runtime rejection — a bare retry is an ordinary cached read.
+    let retried = q.retry == Some(1) && state.claude.clear_runtime_rejection();
+    if q.refresh == Some(1) || retried {
+        // An explicit re-check detects outside the cache lock: a full sweep
+        // takes seconds and must not stall every ordinary read queued behind
+        // it. Last writer wins — concurrent refreshes may duplicate a sweep.
+        state.claude.reserve_auth_check();
+        let harnesses = local::harness::detect_harnesses().await;
+        let catalog = claude_catalog_request(&harnesses);
+        let (mut payload, announce) = finish_harnesses_payload(state, harnesses, false).await;
+        let cached_at = std::time::Instant::now();
+        spawn_cursor_account_details(state, &mut payload, cached_at);
+        *state.harnesses.lock().await = Some((cached_at, payload.clone()));
+        if let Some(catalog) = catalog {
+            enqueue_claude_catalog(state.clone(), cached_at, catalog);
+        }
+        emit_auth_announcement(state, announce);
+        return payload;
+    }
+    let mut cache = state.harnesses.lock().await;
+    if let Some((at, payload)) = cache.as_ref() {
+        let auth = state.claude.auth_snapshot();
+        // Stale-while-revalidate serves the last answer while a fill
+        // refreshes it — re-snapshotting on every TTL tick would flap
+        // every card back to "checking". A provisional entry also asks
+        // for a fill: the single-flight flag makes that idempotent, and
+        // it re-arms a fill that lost the `snapshot_at` race so a
+        // provisional payload can't sit unanswered for a whole TTL. The
+        // same covers a live-verified login promotion (shared auth says
+        // Ready but the payload's claude isn't).
+        let promotable = auth.state == local::harness::HarnessAuthState::Ready
+            && !payload_has_ready_claude(payload);
+        // Provisional/promotable re-arms carry a floor: a state that cannot
+        // converge (e.g. Ready auth over a broken install) must not buy a
+        // full sweep on every read.
+        let wants_fill = payload_is_provisional(payload) || promotable;
+        if at.elapsed() >= HARNESS_CACHE_TTL || (wants_fill && at.elapsed() >= FILL_RETRY_FLOOR) {
+            spawn_catalog_fill(state.clone(), *at, uuid::Uuid::new_v4());
+        }
+        let mut out = payload.clone();
+        overlay_claude_auth(&mut out, &auth);
+        return out;
+    }
+    seed_harnesses_locked(state, &mut cache).await
+}
+
+/// Commit one harness's full detection after setup changed it, so the
+/// dashboard need not wait on every sibling's probes to see the result.
+async fn publish_harness(state: &AppState, info: &local::harness::HarnessInfo) {
+    if info.id == "claude-code" {
+        if let Some(probe) = info.auth_observation.as_ref() {
+            state.claude.observe_auth_probe(probe);
+        }
+    }
+    let catalog = claude_catalog_request(std::slice::from_ref(info));
+    let mut cache = state.harnesses.lock().await;
+    // Bumping `at` voids a fill that probed before setup ran (and any cursor
+    // lookup keyed to it); a fresh seed's fill probes after, so it keeps its `at`.
+    let claim = cache.is_some();
+    if !claim {
+        seed_harnesses_locked(state, &mut cache).await;
+    }
+    let Some((at, payload)) = cache.as_mut() else {
+        return;
+    };
+    let Some(slot) = payload["harnesses"]
+        .as_array_mut()
+        .and_then(|all| all.iter_mut().find(|h| h["id"].as_str() == Some(info.id)))
+    else {
+        return;
+    };
+    *slot = json!(info);
+    if claim {
+        *at = std::time::Instant::now();
+    }
+    let cached_at = *at;
+    let lookup_voided = claim
+        && payload["harnesses"].as_array().is_some_and(|all| {
+            all.iter()
+                .any(|h| h["id"] == "cursor" && h["accountLoading"] == true)
+        });
+    if lookup_voided || info.id == "cursor" {
+        spawn_cursor_account_details(state, payload, cached_at);
+    }
+    drop(cache);
+    if let Some(catalog) = catalog {
+        enqueue_claude_catalog(state.clone(), cached_at, catalog);
+    }
+    state.chat.emit_event("harness.catalog", json!({}));
+}
+
+/// The spawn-free snapshot → provisional cache → background fill sequence,
+/// shared by the first `/api/harnesses` request and the startup seed. The
+/// boot call starts the fill's heavyweight probes during the user's first
+/// page load instead of inside it — each spawn costs seconds on Windows, so
+/// where the clock starts is most of the difference. Caller holds the
+/// `harnesses` lock.
+async fn seed_harnesses_locked(
+    state: &AppState,
+    cache: &mut Option<(std::time::Instant, Value)>,
+) -> Value {
+    let started = std::time::Instant::now();
+    let harnesses = local::harness::detect_harnesses_snapshot().await;
+    let installed = harnesses.iter().filter(|h| h.installed).count();
+    // The snapshot row and the fill it seeds share one fillId so a boot's two
+    // passes join on it.
+    let fill_id = uuid::Uuid::new_v4();
+    let snapshot_ms = started.elapsed().as_millis() as u64;
+    let (mut payload, _) = finish_harnesses_payload(state, harnesses, true).await;
+    let cached_at = std::time::Instant::now();
+    spawn_cursor_account_details(state, &mut payload, cached_at);
+    *cache = Some((cached_at, payload.clone()));
+    // Off the lock-held request path and off a runtime worker: settings
+    // load + outbox persist are sync IO on the same filesystems this pass
+    // exists to stop blocking on.
+    tokio::task::spawn_blocking(move || {
+        crate::telemetry::harness::capture_detect(
+            fill_id,
+            "snapshot",
+            snapshot_ms,
+            None,
+            installed,
+            0,
+            Vec::new(),
+        );
+    });
+    spawn_catalog_fill(state.clone(), cached_at, fill_id);
+    payload
+}
+
+/// The post-detection half of the harness answer: reconcile the result with
+/// the ClaudeHost's tracked auth state, then overlay and report. Shared by
+/// the snapshot and full passes, and by the background catalog fill.
+///
+/// `provisional` marks a discovery-only snapshot. Only full passes publish
+/// live Claude auth observations and first-install telemetry.
+/// The returned `Option` is a claimed auth announcement: the caller emits it
+/// only after committing the payload, so a discarded pass never sends the
+/// dashboard on a `refresh=1` sweep for results nobody will see.
+async fn finish_harnesses_payload(
+    state: &AppState,
+    harnesses: Vec<local::harness::HarnessInfo>,
+    provisional: bool,
+) -> (Value, Option<local::claude::AuthSnapshot>) {
+    if !provisional {
+        if let Some(probe) = harnesses
+            .iter()
+            .find(|h| h.id == "claude-code")
+            .and_then(|h| h.auth_observation.as_ref())
+        {
+            state.claude.observe_auth_probe(probe);
+        }
+    }
+    let mut payload = json!({ "harnesses": harnesses });
+    let mut snapshot = state.claude.auth_snapshot();
+    // A claude that broke mid-session leaves the snapshot `Ready` — `detect`
+    // skips the probe, and `observe_auth_state` won't downgrade on `Unknown` —
+    // so drop it here instead, or the resurrection below would restore
+    // `agentReady` for a binary that cannot start.
+    if snapshot.state == local::harness::HarnessAuthState::Ready && claude_unspawnable(&payload) {
+        state.claude.defer_auth_verification(snapshot.generation);
+        snapshot = state.claude.auth_snapshot();
+    }
+    // A provisional pass must not announce: `harness.auth` makes the dashboard
+    // call `refreshHarnesses(true)`, an inline full sweep — the stall this
+    // whole design exists to remove — fired by the snapshot's own adoption.
+    // A real pass hands its auth snapshot back unclaimed; the caller claims at
+    // emit time, after the payload commits, so a pass that loses the cache
+    // race never burns a generation it can't announce.
+    let announce = (!provisional).then_some(snapshot.clone());
+    overlay_claude_auth(&mut payload, &snapshot);
+    if !provisional {
+        crate::telemetry::harness::capture_initial(&payload);
+    }
+    (payload, announce)
+}
+
+/// Emit `harness.auth` for a generation this pass is entitled to announce.
+/// The claim happens here — not in `finish_harnesses_payload` — so the
+/// generation is only consumed when the event actually goes out.
+fn emit_auth_announcement(state: &AppState, announce: Option<local::claude::AuthSnapshot>) {
+    if let Some(snap) = announce {
+        if state.claude.claim_auth_announcement(snap.generation) {
+            state.chat.emit_event(
+                "harness.auth",
+                json!({ "harness": "claude-code", "authState": snap.state }),
+            );
+        }
+    }
+}
+
+/// True while any entry still waits on the background catalog fill.
+fn payload_is_provisional(payload: &Value) -> bool {
+    payload["harnesses"].as_array().is_some_and(|all| {
+        all.iter()
+            .any(|h| h["catalogPending"].as_bool() == Some(true))
+    })
+}
+
+/// Cursor's account lookup is a second child process deferred off the
+/// detection answer; it patches the cache entry it was scheduled against.
+fn spawn_cursor_account_details(
+    state: &AppState,
+    payload: &mut Value,
+    cached_at: std::time::Instant,
+) {
+    // A provisional cursor entry keeps its lookup for the fill: spawning
+    // `<binPath> about` here would put a child process on the path that exists
+    // to avoid them — and the snapshot's binPath is only a first-candidate
+    // guess.
+    let cursor = payload["harnesses"].as_array_mut().and_then(|items| {
+        items.iter_mut().find(|h| {
+            h["id"] == "cursor"
+                && h["authenticated"] == true
+                && h["catalogPending"].as_bool() != Some(true)
+        })
+    });
+    if let Some(cursor) = cursor {
+        if let Some(bin) = cursor["binPath"].as_str().map(std::path::PathBuf::from) {
+            cursor["accountLoading"] = json!(true);
+            let cache = state.harnesses.clone();
+            tokio::spawn(async move {
+                let details = local::harness::cursor::account_details(&bin).await;
+                let mut cache = cache.lock().await;
+                let Some((at, payload)) = cache.as_mut() else {
+                    return;
+                };
+                // A newer detection owns its own account lookup.
+                if *at != cached_at {
+                    return;
+                }
+                let Some(cursor) = payload["harnesses"]
+                    .as_array_mut()
+                    .and_then(|items| items.iter_mut().find(|h| h["id"] == "cursor"))
+                else {
+                    return;
+                };
+                cursor["accountLoading"] = json!(false);
+                if let Some(details) = details {
+                    for (source, target) in [("userEmail", "account"), ("subscriptionTier", "plan")]
+                    {
+                        if let Some(value) =
+                            details[source].as_str().filter(|value| !value.is_empty())
+                        {
+                            cursor[target] = json!(value);
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Complete the catalog a snapshot answer deferred: the full sweep runs off
+/// the request path, replaces the cache entry it was scheduled against, and
+/// the `harness.catalog` event tells the dashboard to re-read it. `snapshot_at`
+/// guards the swap — a refresh or retry that landed in between owns the cache.
+/// One fill at a time: expired reads each ask for one, but a second sweep
+/// would only lose the `snapshot_at` race and throw its probes away.
+fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id: uuid::Uuid) {
+    if state
+        .harness_fill_in_flight
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    state.claude.reserve_auth_check();
+    let probe_timings = local::harness::ProbeTimingSink::default();
+    tokio::spawn(local::harness::probe_timing_scope(
+        probe_timings.clone(),
+        async move {
+            let _fill = FillGuard(state.harness_fill_in_flight.clone());
+            let started = std::time::Instant::now();
+            // Commit each harness as its probes land: the onboarding gate is
+            // per-entry (`agentReady && !catalogPending`), so a ready agent must
+            // not wait for the slowest sibling's catalog child. The batch swap at
+            // the end still applies the cross-entry reconciliation
+            // (`finish_harnesses_payload`) to the complete set.
+            let mut stream = std::pin::pin!(local::harness::detect_harnesses_each());
+            let mut ordered = Vec::new();
+            // `first_ready_ms` answers the churn question directly: how far into
+            // the fill did a usable agent actually publish.
+            let mut first_ready_ms = None;
+            while let Some((index, info)) = futures::StreamExt::next(&mut stream).await {
+                // A progressive claude entry settles shared auth *now*: reads
+                // overlay that state onto every non-pending entry, so a Ready
+                // probe left unobserved until fill end would be stamped back to
+                // Unknown on each answer — the stall this loop exists to remove.
+                if info.id == "claude-code" {
+                    if let Some(probe) = info.auth_observation.as_ref() {
+                        state.claude.observe_auth_probe(probe);
+                    }
+                }
+                let mut published = false;
+                {
+                    let mut cache = state.harnesses.lock().await;
+                    // Same guard as the final swap: a refresh or retry that
+                    // landed in between owns the cache.
+                    if let Some((at, payload)) = cache.as_mut() {
+                        if *at == snapshot_at {
+                            if let Some(slot) =
+                                payload["harnesses"].as_array_mut().and_then(|all| {
+                                    all.iter_mut().find(|h| h["id"].as_str() == Some(info.id))
+                                })
+                            {
+                                *slot = json!(info);
+                                published = true;
+                            }
+                        }
+                    }
+                }
+                // A superseded fill publishes nothing and must not announce: the
+                // pass that owns the cache emits its own catalog events.
+                if !published {
+                    ordered.push((index, info));
+                    continue;
+                }
+                state.chat.emit_event("harness.catalog", json!({}));
+                // For claude, "ready" means the overlay won't stamp it back down
+                // — its committed `agentReady` only stands once shared auth is
+                // Ready (the observation above).
+                if first_ready_ms.is_none()
+                    && info.agent_ready
+                    && (info.id != "claude-code"
+                        || state.claude.auth_snapshot().state
+                            == local::harness::HarnessAuthState::Ready)
+                {
+                    first_ready_ms = Some(started.elapsed().as_millis() as u64);
+                }
+                ordered.push((index, info));
+            }
+            ordered.sort_by_key(|(index, _)| *index);
+            let harnesses: Vec<local::harness::HarnessInfo> =
+                ordered.into_iter().map(|(_, info)| info).collect();
+            let catalog = claude_catalog_request(&harnesses);
+            // Finish before touching the cache: the Claude re-probe inside can
+            // cost a child process, and holding the lock across it stalls every
+            // reader the snapshot was meant to unblock.
+            let (mut payload, announce) = finish_harnesses_payload(&state, harnesses, false).await;
+            // The reconciled payload is authoritative — overlay applied — so
+            // readiness is counted from it, not the raw probes.
+            let installed = payload["harnesses"]
+                .as_array()
+                .map(|all| all.iter().filter(|h| h["installed"] == true).count())
+                .unwrap_or(0);
+            let ready = payload["harnesses"]
+                .as_array()
+                .map(|all| {
+                    all.iter()
+                        .filter(|h| h["agentReady"] == true && h["catalogPending"] != true)
+                        .count()
+                })
+                .unwrap_or(0);
+            let mut catalog_at = None;
+            let committed = {
+                let mut cache = state.harnesses.lock().await;
+                // A refresh or retry that landed in between owns the cache. No
+                // event: clients holding a provisional payload already poll it at
+                // 1 Hz, and the discarded pass must not announce auth it never
+                // committed.
+                if !matches!(cache.as_ref(), Some((at, _)) if *at == snapshot_at) {
+                    false
+                } else {
+                    // Readiness can be *established* by the finish (a Ready
+                    // shared-auth retry that ran no stream probe) — count it, but
+                    // only once publication is confirmed: a superseded fill
+                    // reports its probe timings with no invented readiness mark.
+                    if first_ready_ms.is_none() && ready > 0 {
+                        first_ready_ms = Some(started.elapsed().as_millis() as u64);
+                    }
+                    let filled_at = std::time::Instant::now();
+                    spawn_cursor_account_details(&state, &mut payload, filled_at);
+                    *cache = Some((filled_at, payload));
+                    catalog_at = Some(filled_at);
+                    true
+                }
+            };
+            // Emit regardless of the race outcome: a fill that lost it still ran
+            // real probes, and its timings are real data. Settings load +
+            // outbox persist are sync IO — keep them off the runtime workers.
+            let timings = std::mem::take(
+                &mut *probe_timings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            let duration_ms = started.elapsed().as_millis() as u64;
+            tokio::task::spawn_blocking(move || {
+                crate::telemetry::harness::capture_detect(
+                    fill_id,
+                    "full",
+                    duration_ms,
+                    first_ready_ms,
+                    installed,
+                    ready,
+                    timings,
+                );
+            });
+            if !committed {
+                return;
+            }
+            if let (Some(catalog), Some(at)) = (catalog, catalog_at) {
+                enqueue_claude_catalog(state.clone(), at, catalog);
+            }
+            state.chat.emit_event("harness.catalog", json!({}));
+            emit_auth_announcement(&state, announce);
+        },
+    ));
+}
+
+/// Clears the single-flight flag however the fill task exits once polled —
+/// including the superseded-swap early return and a dropped future. (A task
+/// dropped before its first poll leaks the flag, but that only happens at
+/// runtime shutdown, where no fill will ever be wanted again.)
+struct FillGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for FillGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// --- chat --------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionsQuery {
+    project_id: Option<String>,
+    /// `all` is the composer's `/resume` picker, which spans every project.
+    /// Spelled out so a dropped `projectId` cannot silently widen the scope.
+    scope: Option<String>,
+    archived: Option<bool>,
+    before_updated_at: Option<i64>,
+    before_id: Option<String>,
+}
+
+async fn list_chat_sessions(
+    State(state): State<AppState>,
+    Query(q): Query<SessionsQuery>,
+) -> ApiResult {
+    let store = Store::open()?;
+    if q.scope.as_deref() == Some("sidebar") {
+        let before = match (q.before_updated_at, q.before_id.as_deref()) {
+            (Some(at), Some(id)) => Some((at, id)),
+            (None, None) => None,
+            _ => return Err(bad_request("both cursor fields are required")),
+        };
+        let mut sessions = store.list_sidebar_chat_sessions(q.archived, before)?;
+        let has_more = sessions.len() > 50;
+        sessions.truncate(50);
+        let next = sessions
+            .last()
+            .filter(|_| has_more)
+            .map(|session| json!({ "updatedAt": session.updated_at, "id": session.id }));
+        let busy = state.chat.busy_sessions().await;
+        let sessions: Vec<Value> = sessions
+            .iter()
+            .map(|session| local::chat::session_json(session, busy.contains(&session.id)))
+            .collect();
+        return Ok(Json(json!({ "sessions": sessions, "next": next })));
+    }
+    let sessions = match (q.project_id.as_deref(), q.scope.as_deref()) {
+        (Some(project_id), _) => store.list_chat_sessions_by_project(project_id)?,
+        (None, Some("all")) => store.list_all_chat_sessions()?,
+        (None, _) => return Err(bad_request("projectId or scope=all is required")),
+    };
+    let busy = state.chat.busy_sessions().await;
+    let sessions: Vec<Value> = sessions
+        .iter()
+        .map(|s| local::chat::session_json(s, busy.contains(&s.id)))
+        .collect();
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateChatSessionReq {
+    project_id: String,
+    harness: String,
+    model: Option<String>,
+    service_tier: Option<String>,
+    permission_mode: Option<String>,
+    #[serde(default)]
+    plan_mode: bool,
+    reasoning_level: Option<String>,
+    autonomy: Option<Autonomy>,
+}
+
+async fn create_chat_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateChatSessionReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    if !local::harness::is_chat_harness(&req.harness) {
+        return Err(bad_request(format!("unknown harness: {}", req.harness)));
+    }
+    let _admission = state
+        .project_lifecycle
+        .admit(&req.project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    let store = Store::open()?;
+    store
+        .get_local_project(&req.project_id)?
+        .ok_or_else(|| not_found("project"))?;
+    let nonempty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+    let permission_mode = nonempty(req.permission_mode);
+    let service_tier = nonempty(req.service_tier);
+    if permission_mode
+        .as_deref()
+        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+    {
+        return Err(bad_request("invalid permission mode for selected harness"));
+    }
+    if service_tier
+        .as_deref()
+        .is_some_and(|tier| local::harness::service_tier_for(&req.harness, tier).is_none())
+    {
+        return Err(bad_request("invalid speed for selected harness"));
+    }
+    if req.plan_mode && !local::harness::supports_command_plan(&req.harness) {
+        return Err(bad_request(
+            "this harness activates Plan through permissions",
+        ));
+    }
+    let session = StoredChatSession {
+        id: format!("chat_{}", uuid::Uuid::new_v4()),
+        project_id: req.project_id,
+        harness: req.harness,
+        native_session_id: None,
+        title: None,
+        title_source: None,
+        model: nonempty(req.model),
+        service_tier,
+        permission_mode,
+        plan_mode: req.plan_mode,
+        plan_reset_pending: false,
+        reasoning_level: nonempty(req.reasoning_level),
+        archived: false,
+        context_usage_json: None,
+        bootstrap_context: None,
+        goal: None,
+        autonomy: req.autonomy.map(|autonomy| autonomy.id().to_string()),
+        active_leaf_id: None,
+        parent_session_id: None,
+        side_parent_session_id: None,
+        created_at: now_ms(),
+        updated_at: now_ms(),
+    };
+    store.create_chat_session(&session)?;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, false) }),
+    ))
+}
+
+/// Chats the user had in an agent's own CLI, for the composer's `/resume`
+/// picker. Reading them walks the agent's store, so it stays off the executor.
+async fn list_native_chats() -> ApiResult {
+    let chats = tokio::task::spawn_blocking(|| {
+        let owned = Store::open()?.native_session_ids()?;
+        Ok::<_, crate::error::Error>(local::native_chats::list(
+            &owned,
+            local::native_chats::LISTING_LIMIT,
+        ))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("native chat scan failed: {e}")))??;
+    let chats: Vec<Value> = chats
+        .iter()
+        .map(|chat| {
+            json!({
+                "harness": chat.harness,
+                "nativeId": chat.native_id,
+                "title": chat.title,
+                "cwd": chat.cwd,
+                "updatedAt": chat.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "chats": chats })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportNativeChatReq {
+    project_id: String,
+    harness: String,
+    native_id: String,
+    title: Option<String>,
+}
+
+/// Adopt one of those chats: a session bound to the agent's own id, with the
+/// transcript backfilled so it does not open blank. Turns continue in the
+/// agent's real home, since that is where the id resolves.
+async fn import_native_chat(
+    State(state): State<AppState>,
+    Json(req): Json<ImportNativeChatReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    if !local::native_chats::is_importable(&req.harness) {
+        return Err(bad_request("that agent's chats cannot be adopted"));
+    }
+    // As create does: a project whose delete is in flight takes no new sessions.
+    let _admission = state
+        .project_lifecycle
+        .admit(&req.project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    let session = tokio::task::spawn_blocking(move || {
+        local::chat::import_native_chat(
+            &Store::open()?,
+            &req.project_id,
+            &req.harness,
+            &req.native_id,
+            req.title,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("import failed: {e}")))??;
+    let session = state
+        .chat
+        .emit_session(Some(session))
+        .await
+        .ok_or_else(|| not_found("chat session"))?;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, false) }),
+    ))
+}
+
+async fn open_side_chat(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let parent = Store::open()?
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    if parent.side_parent_session_id.is_some() {
+        return Err(bad_request("a side chat cannot open its own side chat"));
+    }
+    let _admission = state
+        .project_lifecycle
+        .admit(&parent.project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    let session = state.chat.open_side_chat(&parent).await?;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, false) }),
+    ))
+}
+
+async fn delete_chat_session(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    state.chat.delete_session(&id).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateChatSessionReq {
+    archived: Option<bool>,
+    title: Option<String>,
+    plan_mode: Option<bool>,
+    permission_mode: Option<String>,
+    /// Present-and-null clears the goal, which is why it is doubly wrapped.
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    goal: Option<Option<String>>,
+    autonomy: Option<Autonomy>,
+}
+
+async fn update_chat_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateChatSessionReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let session = if let Some(title) = req.title {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(bad_request("title cannot be empty"));
+        }
+        state
+            .chat
+            .set_title(&id, title)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(archived) = req.archived {
+        state
+            .chat
+            .set_archived(&id, archived)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(plan_mode) = req.plan_mode {
+        state
+            .chat
+            .set_plan_mode(&id, plan_mode)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(goal) = req.goal {
+        let goal = goal
+            .map(|goal| goal.trim().to_string())
+            .filter(|goal| !goal.is_empty());
+        state
+            .chat
+            .set_goal(&id, goal.as_deref())
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(permission_mode) = req.permission_mode {
+        state
+            .chat
+            .set_permission_mode(&id, &permission_mode)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(autonomy) = req.autonomy {
+        state
+            .chat
+            .set_autonomy(&id, autonomy)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else {
+        return Err(bad_request("nothing to update"));
+    };
+    let busy = state.chat.is_busy(&id).await;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, busy) }),
+    ))
+}
+
+async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    // Messages first: these are two connections, so a turn writing between them
+    // can only leave the leaf *ahead* of the list, which the client falls back on
+    // safely — the other order hides a reply that is already in the list.
+    let messages = local::chat::list_messages(&id)?;
+    let session = Store::open()?
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    // The host restores its durable queue at startup; return the live snapshot
+    // so dispatch progress and cancellation are reflected immediately.
+    let queued = state.chat.queued_items(&id);
+    Ok(Json(json!({
+        "messages": messages,
+        "queued": queued,
+        "activeLeafId": session.active_leaf_id,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendChatReq {
+    text: String,
+    client_turn_id: Option<String>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    model: Option<Option<String>>,
+    service_tier: Option<String>,
+    permission_mode: Option<String>,
+    plan_mode: Option<bool>,
+    reasoning_level: Option<String>,
+    #[serde(default)]
+    images: Vec<local::chat::ImageAttachment>,
+    #[serde(default)]
+    annotations: Vec<local::chat::TextAnnotation>,
+    /// `"steer"` hands the message to a turn already running; omitted (an
+    /// older client) keeps the parked-queue path.
+    mode: Option<SendMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SendMode {
+    Steer,
+}
+
+#[derive(Deserialize)]
+struct ShellCommandReq {
+    command: String,
+}
+
+/// Runs a composer `!` command where the agent works and records it as a
+/// user-side message. Refused while a turn runs: a message landing mid-stream
+/// would sit between the turn's own messages and never reach the agent. (A
+/// turn started during the command itself is not caught; the card still shows.)
+async fn run_shell_command(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ShellCommandReq>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    let command = req.command.trim().to_string();
+    if command.is_empty() {
+        return Err(bad_request("command is required"));
+    }
+    if state.chat.is_busy(&id).await {
+        return Err(ApiError(StatusCode::CONFLICT, "session is busy".into()));
+    }
+    let session_id = id.clone();
+    let root = tokio::task::spawn_blocking(move || {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&session_id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        session_checkout_root(&store, &project, &session.id)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("shell task failed: {e}")))??;
+    let message = state
+        .chat
+        .run_shell_command(&id, command, root)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "message": message })))
+}
+
+async fn compact_chat_session(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    if state.chat.is_busy(&id).await {
+        return Err(ApiError(StatusCode::CONFLICT, "session is busy".into()));
+    }
+    let probe = id.clone();
+    tokio::task::spawn_blocking(move || {
+        Store::open()?
+            .get_chat_session(&probe)?
+            .ok_or_else(|| not_found("chat session"))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("compact task failed: {e}")))??;
+    let message = state
+        .chat
+        .compact_session(&id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "message": message })))
+}
+
+async fn send_chat_message(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SendChatReq>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    let store = Store::open()?;
+    let session = store
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    let project = store
+        .get_local_project(&session.project_id)?
+        .ok_or_else(|| not_found("project"))?;
+    let harness = session.harness;
+    let slash_skills = local::chat::builtin_slash_skill_names(&project, &req.text);
+    let text = req.text.trim().to_string();
+    let annotations = req
+        .annotations
+        .into_iter()
+        .filter(|annotation| !annotation.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if text.is_empty() && req.images.is_empty() && annotations.is_empty() {
+        return Err(bad_request("text is required"));
+    }
+    let overrides = local::chat::TurnOverrides {
+        clear_model: req.model == Some(None),
+        model: req.model.flatten(),
+        service_tier: req.service_tier,
+        permission_mode: req.permission_mode,
+        permission_revision: None,
+        plan_mode: req.plan_mode,
+        plan_revision: None,
+        reasoning_level: req.reasoning_level,
+    };
+    // The turn runs in the background; progress streams over /api/events.
+    let (response, capture_message) = if matches!(req.mode, Some(SendMode::Steer)) {
+        let result = state
+            .chat
+            .steer_message(
+                &id,
+                text,
+                overrides,
+                req.images,
+                annotations,
+                req.client_turn_id,
+            )
+            .await
+            .map_err(|error| {
+                if local::chat::is_client_turn_conflict(&error) {
+                    ApiError(StatusCode::CONFLICT, error.to_string())
+                } else {
+                    bad_request(error)
+                }
+            })?;
+        match result {
+            Some(turn) => {
+                let capture = !turn.existing;
+                (json!({ "ok": true, "turn": turn }), capture)
+            }
+            None => (json!({ "ok": true, "steered": true }), true),
+        }
+    } else {
+        let result = state
+            .chat
+            .send_message(
+                &id,
+                text,
+                overrides,
+                req.images,
+                annotations,
+                req.client_turn_id,
+            )
+            .await
+            .map_err(|error| {
+                if local::chat::is_client_turn_conflict(&error) {
+                    ApiError(StatusCode::CONFLICT, error.to_string())
+                } else {
+                    bad_request(error)
+                }
+            })?;
+        let capture = !result.existing;
+        (json!({ "ok": true, "turn": result }), capture)
+    };
+    if capture_message {
+        crate::telemetry::capture_chat_message_sent(&harness);
+        for skill in slash_skills {
+            crate::telemetry::capture_skill_invoked(skill, "slash", Some(&harness));
+        }
+    }
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoverChatReq {
+    action: String,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    service_tier: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    permission_mode: Option<Option<String>>,
+    plan_mode: Option<bool>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    reasoning_level: Option<Option<String>>,
+}
+
+fn present_nullable_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+async fn recover_chat_turn(
+    State(state): State<AppState>,
+    Path((id, turn_id)): Path<(String, String)>,
+    Json(req): Json<RecoverChatReq>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    let result = state
+        .chat
+        .recover_turn(
+            &id,
+            &turn_id,
+            &req.action,
+            local::chat::RecoveryOverrides {
+                model: req.model,
+                service_tier: req.service_tier,
+                permission_mode: req.permission_mode,
+                plan_mode: req.plan_mode,
+                reasoning_level: req.reasoning_level,
+            },
+        )
+        .await
+        .map_err(|error| ApiError(StatusCode::CONFLICT, error.to_string()))?;
+    Ok(Json(json!({ "ok": true, "turn": result })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkChatReq {
+    /// The message being re-sampled: an assistant reply to retry, or a user
+    /// message to re-ask with `text`.
+    message_id: String,
+    /// Edited prompt. Absent re-sends the original message unchanged.
+    text: Option<String>,
+}
+
+async fn fork_chat_turn(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForkChatReq>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    let edit_text = match req.text {
+        Some(text) if !text.trim().is_empty() => Some(text),
+        Some(_) => return Err(bad_request("text is required")),
+        None => None,
+    };
+    let invocation = if let Some(text) = edit_text.as_deref() {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let skills = local::chat::builtin_slash_skill_names(&project, text);
+        Some((session.harness, skills))
+    } else {
+        None
+    };
+    let kind = edit_text
+        .map(local::chat::ForkKind::Edit)
+        .unwrap_or(local::chat::ForkKind::Retry);
+    // A fork re-samples under the session's current settings, so it takes no
+    // overrides — the turn runs in the background and streams over /api/events.
+    let started = state
+        .chat
+        .fork_turn(&id, &req.message_id, kind)
+        .await
+        .map_err(bad_request)?;
+    if started {
+        if let Some((harness, skills)) = invocation {
+            crate::telemetry::capture_chat_message_sent(&harness);
+            for skill in skills {
+                crate::telemetry::capture_skill_invoked(skill, "slash", Some(&harness));
+            }
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectBranchReq {
+    /// The fork to show. Its whole branch comes with it.
+    leaf_id: String,
+}
+
+async fn select_chat_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SelectBranchReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    state
+        .chat
+        .select_branch(&id, &req.leaf_id)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Raw bytes of a chat attachment (image or PDF), by bare file name.
+async fn chat_attachment(
+    Path(name): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    // Names are server-minted (att-<uuid>__<name>.<ext>); anything else is rejected.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || name.contains("..")
+    {
+        return Err(bad_request("invalid attachment name"));
+    }
+    let (type_path, file) = tokio::task::spawn_blocking(move || {
+        let path = local::chat::attachments_dir()?.join(&name);
+        let file = std::fs::File::open(&path).map_err(|_| not_found("attachment"))?;
+        let metadata = file.metadata().map_err(|_| not_found("attachment"))?;
+        if !metadata.is_file() {
+            return Err(not_found("attachment"));
+        }
+        let resolved = crate::paths::canonicalize(&path).map_err(|_| not_found("attachment"))?;
+        Ok((resolved.to_string_lossy().into_owned(), file))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("attachment task failed: {e}")))??;
+    crate::commands::file_serve::disk_response(
+        &type_path,
+        file,
+        local::files::presentation_for_path(&type_path),
+        &method,
+        &headers,
+        "max-age=31536000, immutable",
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
+async fn interrupt_chat(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    state.chat.interrupt_by_user(&id).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Cancel one message parked behind a running turn (the ✕ on a queued chip).
+async fn cancel_queued_chat(
+    State(state): State<AppState>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> ApiResult {
+    let removed = state.chat.cancel_queued(&id, &item_id)?;
+    Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+/// Retry one queued message after its safe delivery budget was exhausted.
+async fn retry_queued_chat(
+    State(state): State<AppState>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    reject_if_moving(&state)?;
+    let retried = state.chat.retry_queued(&id, &item_id)?;
+    if !retried {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "queued message is no longer available for retry".into(),
+        ));
+    }
+    Ok(Json(json!({ "ok": true, "retried": retried })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RespondReq {
+    prompt_id: String,
+    #[serde(default = "default_true")]
+    approve: bool,
+    #[serde(default)]
+    resume_mode: Option<String>,
+    #[serde(default)]
+    answers: Vec<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    annotations: Vec<local::chat::TextAnnotation>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Answer an interactive prompt (plan / permission / question) on a session.
+async fn respond_chat(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RespondReq>,
+) -> ApiResult {
+    reject_if_stopping(&state)?;
+    state
+        .chat
+        .respond(local::chat::PromptAnswer {
+            session_id: id,
+            prompt_id: req.prompt_id,
+            approve: req.approve,
+            resume_mode: req.resume_mode,
+            answers: req.answers,
+            note: req.note,
+            annotations: req
+                .annotations
+                .into_iter()
+                .filter(|annotation| !annotation.text.trim().is_empty())
+                .collect(),
+        })
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The `orx mcp-gate` bridge relaying one blocked tool call from a plan-mode
+/// claude turn. The response body is the permission decision verbatim
+/// (`{"behavior":"allow",…}` / `{"behavior":"deny",…}`) — the bridge
+/// stringifies it into the MCP tool result unchanged. Deliberately long-held:
+/// it returns when the user answers the card (or policy/timeout decides).
+async fn bridge_permission(
+    State(state): State<AppState>,
+    Json(req): Json<BridgePermissionReq>,
+) -> ApiResult {
+    let decision = state
+        .chat
+        .request_permission(&req.session_id, &req.token, &req.tool_name, req.tool_input)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(serde_json::to_value(decision).map_err(bad_request)?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgePermissionReq {
+    session_id: String,
+    token: String,
+    tool_name: String,
+    #[serde(default)]
+    tool_input: Value,
+}
+
+// --- agent ----------------------------------------------------------------
+
+async fn agent_status(State(state): State<AppState>) -> Json<Value> {
+    let agents = state.agent.status().await;
+    Json(json!({ "running": !agents.is_empty(), "agents": agents }))
+}
+
+// --- /api/events SSE ------------------------------------------------------
+
+async fn events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    // Small buffer on purpose: run.log events can carry ~MB payloads, and a
+    // stalled client must backpressure the loop, not queue hundreds of MB.
+    let (tx, rx) = mpsc::channel::<Event>(16);
+    tokio::spawn(event_loop(tx.clone()));
+    // Chat events ride the same stream: chat.session / chat.message / chat.busy.
+    tokio::spawn(forward_chat_events(state.chat.subscribe(), tx));
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|ev| (Ok(ev), rx))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn forward_chat_events(
+    mut chat_rx: tokio::sync::broadcast::Receiver<(&'static str, Value)>,
+    tx: mpsc::Sender<Event>,
+) {
+    loop {
+        let event = tokio::select! {
+            _ = tx.closed() => return,
+            event = chat_rx.recv() => event,
+        };
+        match event {
+            Ok((name, data)) => {
+                if tx.send(json_event(name, &data)).await.is_err() {
+                    return;
+                }
+            }
+            // The client must repair snapshots after missed edge-only events.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                if tx
+                    .send(json_event("resync.required", &json!({})))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Diff state for one SSE subscriber.
+#[derive(Default)]
+struct EventCursor {
+    projects: HashMap<String, i64>,
+    experiments: HashMap<String, i64>,
+    files: HashMap<String, u64>,
+    runs: HashMap<String, (String, i64)>,
+    log_offsets: HashMap<String, u64>,
+    /// Last update status sent. Unlike the rest of the cursor this isn't store
+    /// state — the updater is a separate process, so its progress reaches the UI
+    /// through the same diff the store changes do.
+    update: Option<updates::UpdateStatus>,
+    update_sampled_at: Option<std::time::Instant>,
+}
+
+/// How often the event loop re-reads update status. The 500ms store cadence is
+/// there for run logs; nothing about an update needs that resolution.
+const UPDATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 500ms poll loop: diff the store + log files, push named events into the
+/// channel. Ends when the subscriber disconnects (send fails). Same idiom as
+/// serve.rs, extended with project/experiment diffs.
+async fn event_loop(tx: mpsc::Sender<Event>) {
+    let mut cursor = EventCursor::default();
+    let mut first = true;
+    loop {
+        if !first {
+            // An idle store never sends, so a failed send can't be the only
+            // disconnect signal — watch the receiver side too or the loop
+            // (and its 2Hz store polling) leaks per closed EventSource.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                _ = tx.closed() => return,
+            }
+        }
+        if tx.is_closed() {
+            return;
+        }
+        // Store hiccups (locked db) just skip a tick.
+        let batch = collect_events(&mut cursor, first).unwrap_or_default();
+        first = false;
+        for ev in batch {
+            if tx.send(ev).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn json_event(name: &str, data: &Value) -> Event {
+    Event::default().event(name).data(data.to_string())
+}
+
+/// One diff pass. On the first pass everything is "changed", so a fresh
+/// subscriber gets a full snapshot and needs no separate baseline fetches.
+fn collect_events(cursor: &mut EventCursor, first: bool) -> Result<Vec<Event>> {
+    let mut out = Vec::new();
+
+    // Sampled far below the 2Hz loop — the updater works on the scale of
+    // minutes, and this reads files. `cursor.update` is committed only once the
+    // batch is certain: every `?` below discards it (`event_loop` swallows the
+    // error), and a cursor that had already moved would never re-emit, leaving
+    // the restart banner permanently unshown for that subscriber.
+    let sampled_update = cursor
+        .update_sampled_at
+        .is_none_or(|at| at.elapsed() >= UPDATE_SAMPLE_INTERVAL)
+        .then(|| {
+            cursor.update_sampled_at = Some(std::time::Instant::now());
+            updates::status()
+        })
+        .filter(|update| cursor.update.as_ref() != Some(update));
+    if let Some(update) = &sampled_update {
+        out.push(json_event("update.status", &json!(update)));
+    }
+
+    let store = Store::open()?;
+    // Cap log bytes per tick so one pass never materializes a huge batch —
+    // remainders (whole-log replays included) stream out on later ticks.
+    let mut log_budget: u64 = 2_000_000;
+
+    for project in store.list_local_projects()? {
+        if cursor.projects.get(&project.id) != Some(&project.updated_at) {
+            cursor
+                .projects
+                .insert(project.id.clone(), project.updated_at);
+            out.push(json_event(
+                "project.updated",
+                &json!({ "project": project_json(&project) }),
+            ));
+        }
+        push_experiment_events(&store, &project.id, cursor, &mut out)?;
+        // Artifacts appear live — anything written into the directory (by the
+        // agent or the user) pings the UI to refetch the listing.
+        let fp = local::files::fingerprint(&project);
+        if cursor.files.get(&project.id) != Some(&fp) {
+            cursor.files.insert(project.id.clone(), fp);
+            out.push(json_event(
+                "files.updated",
+                &json!({ "projectId": project.id }),
+            ));
+        }
+    }
+
+    for run in store.list_runs(200)? {
+        let changed = match cursor.runs.get(&run.id) {
+            None => true,
+            Some((status, updated)) => *status != run.status || *updated != run.updated_at,
+        };
+        if changed {
+            cursor
+                .runs
+                .insert(run.id.clone(), (run.status.clone(), run.updated_at));
+            out.push(json_event(
+                "run.updated",
+                &json!({ "run": ApiRun::from(&run) }),
+            ));
+        }
+        if first {
+            // Live runs replay their whole log through the stream (chunked per
+            // tick); terminal runs start at EOF — backfill is /api/runs/{id}/log.
+            let start = if is_terminal(&run.status) {
+                log_size(&run.id)
+            } else {
+                0
+            };
+            cursor.log_offsets.insert(run.id.clone(), start);
+        }
+        // Terminal runs were seeded at EOF above, so this is a no-op for them.
+        push_log_delta(&run, cursor, &mut out, &mut log_budget);
+    }
+    // Committed only now that the batch is certain to be returned.
+    if let Some(update) = sampled_update {
+        cursor.update = Some(update);
+    }
+    Ok(out)
+}
+
+fn push_experiment_events(
+    store: &Store,
+    project_id: &str,
+    cursor: &mut EventCursor,
+    out: &mut Vec<Event>,
+) -> Result<()> {
+    for exp in store.list_experiments_by_project(project_id)? {
+        if cursor.experiments.get(&exp.id) != Some(&exp.updated_at) {
+            cursor.experiments.insert(exp.id.clone(), exp.updated_at);
+            out.push(json_event(
+                "experiment.updated",
+                &json!({ "experiment": exp }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn push_log_delta(
+    run: &StoredRun,
+    cursor: &mut EventCursor,
+    out: &mut Vec<Event>,
+    budget: &mut u64,
+) {
+    let offset = *cursor.log_offsets.entry(run.id.clone()).or_insert(0);
+    let size = log_size(&run.id);
+    if size <= offset || *budget == 0 {
+        return;
+    }
+    let chunk = read_log_from(&run.id, offset, *budget);
+    *budget -= chunk.len() as u64;
+    cursor
+        .log_offsets
+        .insert(run.id.clone(), offset + chunk.len() as u64);
+    // base64: chunk boundaries are arbitrary byte positions, and exact byte
+    // lengths are what lets the client dedup replays.
+    out.push(json_event(
+        "run.log",
+        &json!({
+            "runId": run.id,
+            "dataBase64": base64::engine::general_purpose::STANDARD.encode(&chunk),
+            "offset": offset,
+        }),
+    ));
+}
+
+fn log_size(run_id: &str) -> u64 {
+    std::fs::metadata(log_path(run_id))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+fn read_log_from(run_id: &str, offset: u64, max: u64) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(log_path(run_id)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if f.seek(SeekFrom::Start(offset)).is_ok() {
+        let _ = f.take(max).read_to_end(&mut out);
+    }
+    out
+}
+
+// --- embedded SPA ----------------------------------------------------------
+
+/// ui/dist, embedded at release build time (debug builds read from disk).
+#[derive(rust_embed::RustEmbed)]
+#[folder = "ui/dist"]
+struct UiDist;
+
+const NOT_BUILT_PAGE: &str = "<!doctype html><html><head><title>orx up</title></head>\
+<body style=\"font-family:system-ui;background:#111;color:#ddd;display:grid;place-items:center;height:100vh;margin:0\">\
+<div><h1>UI not built</h1><p>Run <code>pnpm build</code> in <code>ui/</code>, then rebuild orx.</p>\
+<p>The API is live at <code>/api/health</code>.</p></div></body></html>";
+
+fn mime_for(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("json") | Some("map") => "application/json",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn asset_response(path: &str, file: rust_embed::EmbeddedFile) -> Response {
+    // index.html must revalidate every load or browsers heuristically cache it
+    // and keep loading a stale (hashed) bundle; the hashed assets themselves
+    // are immutable by name. favicon.svg is likewise served under a fixed name.
+    let cache = if path == "index.html" || path == "favicon.svg" {
+        "no-cache"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, mime_for(path)),
+            (header::CACHE_CONTROL, cache),
+        ],
+        file.data.into_owned(),
+    )
+        .into_response()
+}
+
+/// Every non-/api path: exact asset if it exists, index.html
+/// otherwise (SPA client routing), friendly page when the UI isn't built.
+pub(crate) async fn spa(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    if path.starts_with("api/") || path == "api" {
+        return not_found("route").into_response();
+    }
+    let candidate = if path.is_empty() { "index.html" } else { path };
+    if let Some(file) = UiDist::get(candidate) {
+        return asset_response(candidate, file);
+    }
+    match UiDist::get("index.html") {
+        Some(file) => asset_response("index.html", file),
+        None => Html(NOT_BUILT_PAGE).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_local_error_reports_the_http_status() {
+        for (status, body, expected) in [
+            (StatusCode::BAD_GATEWAY, "", "HTTP 502 Bad Gateway"),
+            (StatusCode::NOT_FOUND, "", "HTTP 404 Not Found"),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":""}"#,
+                "HTTP 400 Bad Request",
+            ),
+        ] {
+            let response = axum::http::Response::builder()
+                .status(status)
+                .body(body.to_string())
+                .unwrap();
+            let error = decode_local_response::<Value>(response.into(), "start the run")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("orx up could not start the run: {expected}")
+            );
+        }
+    }
+
+    #[test]
+    fn successful_recheck_clears_stale_claude_warning() {
+        let host = local::claude::ClaudeHost::new();
+        let ready = local::harness::claude::parse_auth_status(
+            Some(0),
+            br#"{"loggedIn":true,"authMethod":"third_party","apiProvider":"bedrock"}"#,
+            local::harness::claude::auth_barrier_sequence(),
+        );
+        host.observe_auth_probe(&ready);
+        let failed = local::harness::claude::parse_auth_status(
+            Some(2),
+            b"bad status",
+            local::harness::claude::auth_barrier_sequence(),
+        );
+        host.observe_auth_probe(&failed);
+        let mut payload =
+            json!({"harnesses": [{"id": "claude-code", "authState": "ready", "agentReady": true}]});
+        overlay_claude_auth(&mut payload, &host.auth_snapshot());
+        assert_eq!(payload["harnesses"][0]["authCheckFailed"], true);
+        assert!(payload["harnesses"][0]["agentNote"]
+            .as_str()
+            .unwrap()
+            .contains("Could not re-check"));
+
+        let recovered = local::harness::claude::parse_auth_status(
+            Some(0),
+            br#"{"loggedIn":true,"authMethod":"third_party","apiProvider":"bedrock"}"#,
+            local::harness::claude::auth_barrier_sequence(),
+        );
+        host.observe_auth_probe(&recovered);
+        overlay_claude_auth(&mut payload, &host.auth_snapshot());
+        assert_eq!(payload["harnesses"][0]["authCheckFailed"], false);
+        assert!(payload["harnesses"][0].get("agentNote").is_none());
+    }
+
+    #[test]
+    fn send_model_distinguishes_cli_default_from_no_override() {
+        let omitted: SendChatReq = serde_json::from_value(json!({ "text": "hello" })).unwrap();
+        let default: SendChatReq =
+            serde_json::from_value(json!({ "text": "hello", "model": null })).unwrap();
+        assert_eq!(omitted.model, None);
+        assert_eq!(default.model, Some(None));
+    }
+
+    #[test]
+    fn harness_payload_predicates_read_the_wire_shape() {
+        let provisional = json!({
+            "harnesses": [
+                {"id": "claude-code", "agentReady": false, "catalogPending": true},
+                {"id": "codex", "agentReady": false},
+            ]
+        });
+        assert!(payload_is_provisional(&provisional));
+        assert!(claude_entry_pending(&provisional));
+        assert!(!payload_has_ready_claude(&provisional));
+
+        let filled = json!({
+            "harnesses": [
+                {"id": "claude-code", "agentReady": true},
+                {"id": "codex", "agentReady": false},
+            ]
+        });
+        assert!(!payload_is_provisional(&filled));
+        assert!(!claude_entry_pending(&filled));
+        assert!(payload_has_ready_claude(&filled));
+
+        // `catalogPending` is skip-serialized when false — its absence must
+        // read as settled, not pending.
+        let no_claude = json!({ "harnesses": [{"id": "codex", "agentReady": false}] });
+        assert!(!payload_is_provisional(&no_claude));
+        assert!(!claude_entry_pending(&no_claude));
+    }
+
+    #[tokio::test]
+    async fn closed_dashboard_releases_idle_chat_receiver() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            forward_chat_events(receiver, tx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sender.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_streaming_response_stays_active_until_its_body_is_sent() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let release = gate.clone();
+        let app = Router::new()
+            .route(
+                "/file",
+                get(move || async move {
+                    axum::body::Body::from_stream(futures::stream::once(async move {
+                        gate.notified().await;
+                        Ok::<_, Infallible>("done")
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn(track_active));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let response = crate::net::loopback_client()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        assert_eq!(response.text().await.unwrap(), "done");
+        for _ in 0..100 {
+            if ACTIVE.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a sent response body stayed active");
+    }
+
+    #[tokio::test]
+    async fn lagged_chat_stream_requests_resync_and_continues() {
+        use axum::response::IntoResponse;
+        let (sender, receiver) = tokio::sync::broadcast::channel(1);
+        sender.send(("chat.busy", json!({"busy": true}))).unwrap();
+        sender.send(("chat.busy", json!({"busy": false}))).unwrap();
+        drop(sender);
+        let (tx, mut rx) = mpsc::channel(4);
+        forward_chat_events(receiver, tx).await;
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(Ok::<_, Infallible>(event));
+        }
+        let response = Sse::new(futures::stream::iter(events)).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.starts_with("event: resync.required\ndata: {}\n\n"));
+        assert!(body.contains("event: chat.busy\ndata: {\"busy\":false}"));
+    }
+
+    #[tokio::test]
+    async fn workspace_requests_validate_metadata_and_allow_independent_preferences() {
+        let preferences: SetUiStateReq =
+            serde_json::from_value(json!({"tourCompleted":true})).unwrap();
+        assert!(preferences.workspace.is_none());
+        let workspace: SetUiStateReq = serde_json::from_value(json!({"workspace":{
+            "lastLocation":"/projects/project/tasks/new", "railOpen":true,
+            "panelWidth":500, "experimentsView":"tree"
+        }}))
+        .unwrap();
+        assert!(workspace.preferred_agent.is_none());
+        workspace.workspace.unwrap().validate().unwrap();
+        assert!(serde_json::from_value::<SetUiStateReq>(json!({"workspace":{
+            "lastLocation":null, "railOpen":true, "panelWidth":500,
+            "experimentsView":"grid"
+        }}))
+        .is_err());
+        let invalid: GlobalWorkspaceState = serde_json::from_value(json!({
+            "lastLocation":"/projects/project", "railOpen":true,
+            "panelWidth":500, "experimentsView":"tree"
+        }))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+        let result = set_ui_state(Json(SetUiStateReq {
+            tour_completed: Some(true),
+            preferred_agent: None,
+            workspace: Some(invalid),
+            preferred_autonomy: None,
+        }))
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+        let unsupported: WorkspaceState = serde_json::from_value(json!({
+            "version":2, "lastLocation":null, "tasks":{}
+        }))
+        .unwrap();
+        let result = set_project_ui_state(Path("project".into()), Json(unsupported)).await;
+        assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn ssh_workspace_blocks_local_machine_actions_but_keeps_config_editing() {
+        for path in [
+            "/api/project-path/pick",
+            "/api/update",
+            "/api/update/apply",
+            "/api/update/restart",
+            "/api/settings/data-dir",
+            "/api/settings/data-dir/move",
+            "/api/settings/commands/run",
+            "/api/remote/sessions",
+            "/api/projects/p1/file/open",
+            "/api/projects/p1/file/reveal",
+        ] {
+            assert!(remote_route_forbidden(path), "{path}");
+        }
+        assert!(!remote_route_forbidden("/api/settings/ssh/config"));
+        assert!(!remote_route_forbidden("/api/settings/ssh/master"));
+        assert!(!remote_route_forbidden("/api/settings/ssh/preflight"));
+        assert!(!remote_route_forbidden("/api/settings/ssh/connect"));
+        assert!(!remote_route_forbidden("/api/projects/p1/file"));
+    }
+
+    #[test]
+    fn remote_callback_token_is_limited_to_runs_and_the_spawn_preflight() {
+        assert!(is_remote_callback_route(&Method::POST, "/api/runs"));
+        assert!(is_remote_callback_route(
+            &Method::POST,
+            "/api/runs/run-1/cancel"
+        ));
+        assert!(!is_remote_callback_route(&Method::GET, "/api/runs"));
+        assert!(!is_remote_callback_route(
+            &Method::POST,
+            "/api/runs/run-1/extra/cancel"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::POST,
+            "/api/chat/sessions/s1/message"
+        ));
+        assert!(is_remote_callback_route(
+            &Method::GET,
+            "/api/harnesses/codex/snapshot"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::POST,
+            "/api/harnesses/codex/snapshot"
+        ));
+        assert!(!is_remote_callback_route(&Method::GET, "/api/harnesses"));
+        assert!(!is_remote_callback_route(
+            &Method::GET,
+            "/api/harnesses/setup/commands"
+        ));
+    }
+
+    #[test]
+    fn ssh_terminal_requires_the_dashboard_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:4791".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:4791".parse().unwrap());
+        assert!(same_origin(&headers));
+
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        assert!(!same_origin(&headers));
+        headers.remove(header::ORIGIN);
+        assert!(!same_origin(&headers));
+    }
+
+    #[test]
+    fn ssh_terminal_resize_message_deserializes() {
+        let input: SshTerminalInput =
+            serde_json::from_str(r#"{"type":"resize","cols":120,"rows":40}"#).unwrap();
+        let SshTerminalInput::Resize { cols, rows } = input;
+        assert_eq!((cols, rows), (120, 40));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_ssh_master_status_is_not_a_disconnection() {
+        let response = ssh_master_status(Query(SshPreflightReq {
+            host: "unused-host".into(),
+            container: None,
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.1));
+        assert!(response.0["running"].is_null());
+    }
+
+    #[test]
+    fn ssh_connection_failure_is_a_persistable_preflight_result() {
+        let test = ssh_connect_failure("cluster", "authentication failed".into());
+        assert_eq!(test.host, "cluster");
+        assert!(!test.reachable);
+        assert!(!test.tools_found);
+        assert_eq!(test.error.as_deref(), Some("authentication failed"));
+        assert!(test.tested_at > 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_relays_input_output_resize_exit_and_cancel() {
+        let mut session = start_pty(
+            "sh",
+            vec![
+                "-c".into(),
+                "read value; printf 'reply:%s\\n' \"$value\"".into(),
+            ],
+        )
+        .unwrap();
+        session
+            .master
+            .resize(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        session.input.send(b"hello\n".to_vec()).unwrap();
+
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = session.events.recv().await {
+                match event {
+                    PtyEvent::Output(bytes) => output.extend(bytes),
+                    PtyEvent::Exit(Ok(status)) => {
+                        assert!(status.success());
+                        break;
+                    }
+                    PtyEvent::Exit(Err(error)) => panic!("PTY wait failed: {error}"),
+                    PtyEvent::Eof => {}
+                }
+            }
+        })
+        .await
+        .expect("PTY did not exit");
+        assert!(String::from_utf8_lossy(&output).contains("reply:hello"));
+
+        let mut cancelled =
+            start_pty("sh", vec!["-c".into(), "trap '' HUP; sleep 30".into()]).unwrap();
+        cancelled.kill.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = cancelled.events.recv().await {
+                if matches!(event, PtyEvent::Exit(_)) {
+                    return;
+                }
+            }
+            panic!("cancelled PTY ended without an exit event");
+        })
+        .await
+        .expect("cancelled PTY did not exit");
+    }
+
+    #[test]
+    fn client_resizes_update_the_tracked_size_only_when_valid() {
+        let mut size = DEFAULT_PTY_SIZE;
+        assert!(apply_resize(
+            &mut size,
+            r#"{"type":"resize","cols":111,"rows":33}"#
+        ));
+        assert_eq!((size.cols, size.rows), (111, 33));
+        assert!(!apply_resize(
+            &mut size,
+            r#"{"type":"resize","cols":0,"rows":9}"#
+        ));
+        assert!(!apply_resize(&mut size, "not json"));
+        assert_eq!((size.cols, size.rows), (111, 33));
+    }
+
+    #[test]
+    fn settings_commands_are_an_exact_allowlist() {
+        assert_eq!(
+            settings_command("gh auth login"),
+            Some(&["gh", "auth", "login"][..])
+        );
+        assert_eq!(settings_command("gh auth login; rm -rf ~"), None);
+        assert_eq!(settings_command("gh"), None);
+    }
+
+    #[tokio::test]
+    async fn project_path_status_reports_an_unborn_repository_as_importable() {
+        let path =
+            std::env::temp_dir().join(format!("orx-project-path-status-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let response = project_path_status(Query(ProjectPathStatusQ {
+            path: Some(path.to_string_lossy().into_owned()),
+        }))
+        .await;
+        let Json(body) = match response {
+            Ok(body) => body,
+            Err(error) => panic!("unexpected path status error: {}", error.1),
+        };
+
+        assert_eq!(body["gitState"], "unborn");
+        assert_eq!(body["initialized"], true);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn plan_never_becomes_the_preferred_mode_for_new_sessions() {
+        assert_eq!(
+            preferred_permission_mode("claude-code", Some("plan".into())).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            preferred_permission_mode("codex", Some("plan".into())).as_deref(),
+            Some("approve-for-me")
+        );
+        assert_eq!(
+            preferred_permission_mode("opencode", Some("plan".into())).as_deref(),
+            Some("default")
+        );
+    }
+
+    fn expect_profile(
+        result: std::result::Result<crate::telemetry::ResearchProfile, ApiError>,
+    ) -> crate::telemetry::ResearchProfile {
+        match result {
+            Ok(profile) => profile,
+            Err(error) => panic!("unexpected profile error: {}", error.1),
+        }
+    }
+
+    #[test]
+    fn research_profile_requires_an_area_and_other_description() {
+        let missing_area = normalize_research_profile(vec![], None, None, vec![]).unwrap_err();
+        assert_eq!(missing_area.1, "choose at least one research area");
+
+        let missing_other =
+            normalize_research_profile(vec!["Other".into()], Some("   ".into()), None, vec![])
+                .unwrap_err();
+        assert_eq!(
+            missing_other.1,
+            "describe your research area when choosing Other"
+        );
+    }
+
+    #[test]
+    fn research_profile_preserves_disclosed_free_text() {
+        let profile = expect_profile(normalize_research_profile(
+            vec!["AI/ML".into(), "Other".into()],
+            Some("  AI for theorem proving  ".into()),
+            Some("  I study RL.\nSecond line.  ".into()),
+            vec![crate::telemetry::ProfilePaper {
+                paper_id: "1706.03762".into(),
+                title: Some("Attention Is All You Need".into()),
+            }],
+        ));
+
+        assert_eq!(
+            profile.other_area.as_deref(),
+            Some("  AI for theorem proving  ")
+        );
+        assert_eq!(
+            profile.background.as_deref(),
+            Some("  I study RL.\nSecond line.  ")
+        );
+        assert_eq!(
+            profile.papers[0].title.as_deref(),
+            Some("Attention Is All You Need")
+        );
+    }
+
+    #[test]
+    fn legacy_profile_update_preserves_saved_research_areas() {
+        let current = crate::telemetry::ResearchProfile {
+            research_areas: vec!["Physics".into(), "Other".into()],
+            other_area: Some("Quantum information".into()),
+            research_diagnosis: Some(test_research_diagnosis()),
+            ..crate::telemetry::ResearchProfile::default()
+        };
+        let updated = expect_profile(profile_settings_update(
+            SetProfileReq {
+                research_areas: vec![],
+                other_area: None,
+                background: Some("Updated background".into()),
+                papers: vec![],
+                research_diagnosis: None,
+            },
+            current,
+        ));
+
+        assert_eq!(updated.research_areas, vec!["Physics", "Other"]);
+        assert_eq!(updated.other_area.as_deref(), Some("Quantum information"));
+        assert_eq!(updated.background.as_deref(), Some("Updated background"));
+        assert_eq!(updated.research_diagnosis, Some(test_research_diagnosis()));
+    }
+
+    fn test_research_diagnosis() -> crate::telemetry::ResearchDiagnosis {
+        crate::telemetry::ResearchDiagnosis {
+            version: 1,
+            answers: crate::telemetry::DIAGNOSIS_INDICATORS
+                .iter()
+                .map(|key| ((*key).into(), crate::telemetry::DiagnosisLevel::Unsure))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn research_diagnosis_requires_complete_known_indicators() {
+        assert!(validate_research_diagnosis(Some(test_research_diagnosis())).is_ok());
+        assert!(validate_research_diagnosis(None).is_ok());
+        let mut missing = test_research_diagnosis();
+        missing.answers.remove("research_question");
+        assert!(validate_research_diagnosis(Some(missing)).is_err());
+        let mut unknown = test_research_diagnosis();
+        unknown
+            .answers
+            .insert("unknown".into(), crate::telemetry::DiagnosisLevel::New);
+        assert!(validate_research_diagnosis(Some(unknown)).is_err());
+        let mut future = test_research_diagnosis();
+        future.version = 2;
+        assert!(validate_research_diagnosis(Some(future)).is_err());
+    }
+
+    #[test]
+    fn api_run_exposes_cancel_intent() {
+        let run = StoredRun {
+            id: "run-1".into(),
+            experiment_id: "experiment-1".into(),
+            project_id: "project-1".into(),
+            status: "running".into(),
+            backend_json: "{}".into(),
+            command: String::new(),
+            created_at: 1,
+            updated_at: 2,
+            ended_at: None,
+            exit_code: None,
+            commit_sha: None,
+            result_markdown: None,
+            cancel_requested: true,
+            chat_session_id: None,
+        };
+
+        let value = serde_json::to_value(ApiRun::from(&run)).unwrap();
+        assert_eq!(value["cancelRequested"], true);
+    }
+
+    #[test]
+    fn compute_settings_registers_tinker_without_exposing_its_key() {
+        let settings = compute_settings_json();
+        let tinker = settings["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["id"] == "tinker")
+            .unwrap();
+        assert!(tinker["configured"].is_boolean());
+        assert!(tinker.get("key").is_none());
+        assert!(tinker.get("apiKey").is_none());
+    }
+
+    #[test]
+    fn create_run_request_round_trips_agent_attribution_and_force() {
+        let request = CreateRunReq {
+            invocation_context: None,
+            telemetry_suppressed: true,
+            experiment_id: "experiment-1".into(),
+            backend: Some("local".into()),
+            flavor: None,
+            host: None,
+            container: None,
+            no_container: false,
+            manifest: None,
+            image: None,
+            timeout: None,
+            force: true,
+            chat_session_id: Some("session-1".into()),
+            agent_origin: None,
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["experimentId"], "experiment-1");
+        assert_eq!(value["chatSessionId"], "session-1");
+        assert_eq!(value["force"], true);
+        assert_eq!(
+            serde_json::from_value::<CreateRunReq>(value).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn project_json_exposes_artifacts_dir_with_legacy_alias() {
+        let project = local::model::LocalProject {
+            id: "p1".into(),
+            name: "Demo".into(),
+            slug: "demo".into(),
+            github_owner: "o".into(),
+            github_repo: "r".into(),
+            github_sync_enabled: true,
+            baseline_branch: "main".into(),
+            repo_path: "/tmp/r".into(),
+            run_command: None,
+            paper_id: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let json = project_json_with_artifacts_dir(
+            &project,
+            "/tmp/openresearch-test/files/demo".to_string(),
+        );
+        assert_eq!(json["artifactsDir"], json["filesDir"]);
+        assert!(json["artifactsDir"]
+            .as_str()
+            .unwrap()
+            .ends_with("files/demo"));
+    }
+
+    #[test]
+    fn project_file_text_never_lossily_decodes_binary_bytes() {
+        let (content, binary) = decode_project_file_text(b"plain text\n".to_vec(), false);
+        assert_eq!(content, "plain text\n");
+        assert!(!binary);
+
+        for bytes in [b"header\0payload".to_vec(), vec![0x89, b'P', b'N', b'G']] {
+            let (content, binary) = decode_project_file_text(bytes, false);
+            assert!(content.is_empty());
+            assert!(binary);
+        }
+
+        let mut split_utf8 = b"prefix".to_vec();
+        split_utf8.push(0xe2);
+        let (content, binary) = decode_project_file_text(split_utf8, true);
+        assert_eq!(content, "prefix");
+        assert!(!binary);
+    }
+
+    #[test]
+    fn project_file_versions_track_exact_bytes() {
+        let first = file_version(b"same-size-a");
+        let second = file_version(b"same-size-b");
+        assert_ne!(first, second);
+
+        let path = std::env::temp_dir().join(format!("orx-file-version-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"same-size-a").unwrap();
+        assert_eq!(
+            file_version_on_disk(&path)
+                .map_err(|error| error.1)
+                .unwrap(),
+            first
+        );
+        std::fs::write(&path, b"same-size-b").unwrap();
+        assert_eq!(
+            file_version_on_disk(&path)
+                .map_err(|error| error.1)
+                .unwrap(),
+            second
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn project_file_paths_reject_traversal() {
+        assert_eq!(
+            validated_project_file_path("./figures/chart.png")
+                .map_err(|error| error.1)
+                .unwrap()
+                .0,
+            "figures/chart.png"
+        );
+        for path in ["", "../secret", "/etc/passwd", "figures/../secret"] {
+            assert!(
+                validated_project_file_path(path).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_file_actions_rename_duplicate_and_delete() {
+        let root = std::env::temp_dir().join(format!("orx-file-actions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        std::fs::write(root.join("reports/result.md"), "result").unwrap();
+
+        let renamed = manage_local_file(
+            &root,
+            "reports/result.md",
+            FileAction::Rename,
+            Some("summary.md"),
+            true,
+        )
+        .map_err(|error| error.1)
+        .unwrap();
+        assert_eq!(renamed, "reports/summary.md");
+
+        let duplicated = manage_local_file(&root, &renamed, FileAction::Duplicate, None, true)
+            .map_err(|error| error.1)
+            .unwrap();
+        assert_eq!(duplicated, "reports/summary copy.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join(&duplicated)).unwrap(),
+            "result"
+        );
+
+        manage_local_file(&root, &duplicated, FileAction::Delete, None, true)
+            .map_err(|error| error.1)
+            .unwrap();
+        assert!(!root.join(duplicated).exists());
+        assert!(manage_local_file(
+            &root,
+            &renamed,
+            FileAction::Rename,
+            Some("../escape.md"),
+            true,
+        )
+        .is_err());
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "private").unwrap();
+        assert!(manage_local_file(&root, ".git/config", FileAction::Delete, None, true,).is_err());
+        #[cfg(unix)]
+        {
+            let outside = std::env::temp_dir()
+                .join(format!("orx-file-actions-outside-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("jump")).unwrap();
+            std::os::unix::fs::symlink(root.join(&renamed), outside.join("back")).unwrap();
+            assert!(
+                manage_local_file(&root, "jump/back", FileAction::Delete, None, true,).is_err()
+            );
+            assert!(outside.join("back").exists());
+            std::os::unix::fs::symlink(root.join(&renamed), root.join("reports/summary-link"))
+                .unwrap();
+            assert!(manage_local_file(
+                &root,
+                &renamed,
+                FileAction::Rename,
+                Some("summary-link"),
+                true,
+            )
+            .is_err());
+            assert!(root.join(&renamed).exists());
+            assert!(std::fs::symlink_metadata(root.join("reports/summary-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(manage_local_file(
+                &root,
+                "reports/summary-link",
+                FileAction::Duplicate,
+                None,
+                true,
+            )
+            .is_err());
+            std::os::unix::fs::symlink(root.join(".git"), root.join("git-link")).unwrap();
+            assert!(
+                manage_local_file(&root, "git-link/config", FileAction::Delete, None, true,)
+                    .is_err()
+            );
+            let _ = std::fs::remove_dir_all(outside);
+        }
+        let case_renamed = manage_local_file(
+            &root,
+            &renamed,
+            FileAction::Rename,
+            Some("SUMMARY.md"),
+            true,
+        )
+        .map_err(|error| error.1)
+        .unwrap();
+        assert_eq!(case_renamed, "reports/SUMMARY.md");
+        assert!(root.join(case_renamed).exists());
+        assert!(std::fs::read_dir(root.join("reports"))
+            .unwrap()
+            .any(|entry| entry.unwrap().file_name() == "SUMMARY.md"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ApiError has no Debug, so `.unwrap()` on the Err path won't compile; drop
+    // the error to its message string to make the Result assertion-friendly.
+    fn abs_path(path: &str) -> std::result::Result<(String, std::path::PathBuf), String> {
+        validated_absolute_file_path(path).map_err(|error| error.1)
+    }
+
+    #[test]
+    fn absolute_file_paths_require_an_absolute_path() {
+        #[cfg(windows)]
+        let absolute = r"C:\Windows\System32\drivers\etc\hosts";
+        #[cfg(not(windows))]
+        let absolute = "/etc/hosts";
+
+        assert_eq!(
+            abs_path(&format!("  {absolute}  ")),
+            Ok((absolute.to_string(), std::path::PathBuf::from(absolute))),
+        );
+        for path in ["", "   ", "relative/path", "../secret", &"/x".repeat(3000)] {
+            assert!(abs_path(path).is_err(), "accepted {path:?}");
+        }
+    }
+
+    #[test]
+    fn absolute_file_paths_expand_a_leading_tilde() {
+        let home = dirs::home_dir().expect("home dir");
+        // `~/x` and bare `~` resolve under home; the display stays as typed.
+        assert_eq!(
+            abs_path("~/.ssh/config"),
+            Ok(("~/.ssh/config".to_string(), home.join(".ssh/config"))),
+        );
+        assert_eq!(abs_path("~").map(|(_, p)| p), Ok(home));
+        // `~otheruser` isn't expanded, so it stays relative and is rejected.
+        assert!(abs_path("~otheruser/x").is_err());
+    }
+}

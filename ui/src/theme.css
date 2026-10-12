@@ -1,0 +1,230 @@
+@theme inline {
+  --color-*: initial;
+  --color-transparent: transparent;
+  --color-current: currentColor;
+  --color-white: #fff;
+  --color-background: var(--base);
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-surface: var(--surface);
+  --color-surface-bright: var(--surface-bright);
+  --color-highlight: var(--highlight);
+  --color-text: var(--text);
+  --color-subtext: var(--subtext);
+  --color-muted: var(--muted);
+  --color-primary: var(--primary);
+  --color-primary-subtle: var(--primary-subtle);
+  --color-border: var(--border);
+  --color-border-variant: var(--border-variant);
+  --color-border-strong: var(--border-strong);
+  --color-accent: var(--accent);
+  --color-accent-orange: var(--accent-orange);
+  --color-accent-red: var(--accent-red);
+  --color-accent-teal: var(--accent-teal);
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-amber: var(--accent-amber);
+  --color-accent-green: var(--accent-green);
+  --color-accent-purple: var(--accent-purple);
+  --color-accent-green-subtle: var(--accent-green-subtle);
+  --color-accent-amber-subtle: var(--accent-amber-subtle);
+  --color-accent-red-subtle: var(--accent-red-subtle);
+  --color-accent-blue-subtle: var(--accent-blue-subtle);
+  --color-dots-strong: var(--dots-strong);
+  --color-syntax-comment: var(--syntax-comment);
+  --color-syntax-text: var(--syntax-text);
+  --color-syntax-red: var(--syntax-red);
+  --color-syntax-orange: var(--syntax-orange);
+  --color-syntax-green: var(--syntax-green);
+  --color-syntax-yellow: var(--syntax-yellow);
+  --color-syntax-cyan: var(--syntax-cyan);
+  --color-syntax-purple: var(--syntax-purple);
+  --color-syntax-blue: var(--syntax-blue);
+  --color-skill-blue: var(--skill-blue);
+  --color-skill-blue-subtle: var(--skill-blue-subtle);
+  --color-skill-blue-slash: var(--skill-blue-slash);
+  --color-terminal: var(--term-bg);
+  --color-terminal-app: var(--term-app-bg);
+  --color-hover-faint: color-mix(in oklab, var(--text) 3%, transparent);
+  --color-divider-faint: color-mix(in oklab, var(--text) 6%, transparent);
+  --color-divider-subtle: color-mix(in oklab, var(--text) 7%, transparent);
+  --color-hover-muted: color-mix(in oklab, var(--text) 8%, transparent);
+  --color-hover-subtle: color-mix(in oklab, var(--text) 10%, transparent);
+  --color-resizer-hover: color-mix(in oklab, var(--text) 12%, transparent);
+  --color-hover-strong: color-mix(in oklab, var(--text) 15%, transparent);
+  --color-border-muted: color-mix(in oklab, var(--border) 50%, transparent);
+  --color-border-hover-strong: color-mix(in oklab, var(--border) 55%, var(--text));
+  --color-danger-outline: color-mix(in oklab, var(--accent-red) 55%, transparent);
+  --color-danger-notice-border: color-mix(in srgb, var(--accent-red) 35%, var(--border-variant));
+  --color-primary-hover: color-mix(in oklab, var(--primary) 88%, var(--text));
+  --color-primary-active: color-mix(in oklab, var(--primary) 80%, var(--text));
+  --color-stop-hover: color-mix(in oklab, var(--surface) 88%, var(--text));
+  --color-danger-hover: color-mix(in oklab, var(--accent-red) 8%, transparent);
+  --color-danger-active: color-mix(in oklab, var(--accent-red) 14%, transparent);
+  --color-plan-caret: color-mix(in oklab, var(--base) 35%, var(--text));
+  --color-image-backdrop: rgb(29 27 26 / 85%);
+  --color-modal-backdrop: rgb(29 27 26 / 42%);
+  --color-modal-backdrop-light: rgb(29 27 26 / 40%);
+  --color-diff-selection: var(--code-selection);
+  --color-diff-gutter-selection: var(--code-selection);
+  --color-diff-insert-gutter: color-mix(in oklab, var(--base) 84%, var(--accent-green));
+  --color-diff-delete-gutter: color-mix(in oklab, var(--base) 86%, var(--accent-red));
+  --color-diff-insert-code: color-mix(in oklab, var(--base) 91%, var(--accent-green));
+  --color-diff-delete-code: color-mix(in oklab, var(--base) 92%, var(--accent-red));
+  --color-diff-insert-edit: color-mix(in oklab, var(--base) 72%, var(--accent-green));
+  --color-diff-delete-edit: color-mix(in oklab, var(--base) 78%, var(--accent-red));
+  --color-diff-omit-gutter: color-mix(in oklab, var(--base) 86%, var(--text));
+  --color-diff-gutter-text: color-mix(in oklab, var(--text) 45%, var(--base));
+
+  --text-prose-emphasis: 1.05em;
+  --text-menu: 0.8125rem;
+  --text-menu--line-height: 1.25rem;
+
+  --shadow-elevated: 0 8px 28px color-mix(in oklab, var(--text) 5%, transparent), 0 1px 3px color-mix(in oklab, var(--text) 4%, transparent);
+  --shadow-panel-max: 0 18px 48px color-mix(in oklab, var(--text) 16%, transparent);
+  --shadow-segment: 0 1px 2px color-mix(in oklab, var(--text) 12%, transparent);
+  --shadow-menu: 0 12px 32px rgb(22 27 35 / 12%);
+  --shadow-modal: 0 24px 60px rgb(22 27 35 / 18%);
+  --shadow-dropdown: 0 10px 26px rgb(22 27 35 / 12%);
+  --shadow-popover: 0 4px 16px rgb(22 27 35 / 8%);
+  --shadow-control: 0 2px 8px rgb(22 27 35 / 8%);
+  --shadow-control-subtle: 0 2px 8px rgb(22 27 35 / 4%);
+  --shadow-floating: 0 8px 24px rgb(22 27 35 / 10%);
+  --shadow-hairline: 0 1px 2px rgb(22 27 35 / 4%);
+  --shadow-card: 0 14px 36px color-mix(in oklab, var(--text) 5%, transparent);
+  --shadow-plan: 0 2px 10px rgb(22 27 35 / 5%);
+  --shadow-plan-menu: 0 6px 20px rgb(22 27 35 / 10%);
+  --shadow-logo: 0 0 0 1px rgb(0 0 0 / 8%);
+  --shadow-tree: 0 1px 2px rgb(0 0 0 / 4%);
+  --shadow-tree-hover: 0 2px 8px rgb(0 0 0 / 8%);
+  --shadow-tree-live: 0 2px 12px rgb(40 126 115 / 16%);
+  --shadow-file-line: inset 2px 0 0 var(--accent-blue);
+  --shadow-diff-active: inset 2px 0 0 var(--text);
+  --shadow-selected: 0 0 0 1px var(--accent);
+
+  --font-sans: var(--sans);
+  --font-mono: var(--mono);
+  --ease-standard: ease;
+  --container-readable: var(--readable-col);
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 999px;
+}
+
+:root {
+  /* VERA's workspace stays light, independent of the operating system. */
+  color-scheme: light;
+  --base: #ffffff;
+  --canvas: #f3f2ef;
+  --panel: #eae7e2;
+  --surface: #f7f6f3;
+  --surface-bright: #ffffff;
+  --highlight: #fff0f1;
+  --chat-annotation-highlight: #f4cbd0;
+  --selection-background: #f1c7cd;
+  --selection-text: #42151c;
+  --code-selection: var(--selection-background);
+  --text: #252a32;
+  --subtext: #505a67;
+  --muted: #5d6672;
+  /* Sampled from the dominant opaque red in the supplied VERA logo. */
+  --brand-red: #e20105;
+  --primary: var(--brand-red);
+  --primary-subtle: #fff0f0;
+  --hero-veil: linear-gradient(90deg, rgb(247 246 243 / 88%) 0%, rgb(247 246 243 / 76%) 42%, rgb(247 246 243 / 26%) 68%, rgb(247 246 243 / 18%) 100%);
+  --hero-control: rgb(255 255 255 / 88%);
+  --hero-glass-fill: linear-gradient(140deg, rgb(255 255 255 / 48%), rgb(255 255 255 / 16%));
+  --hero-glass-border: rgb(255 255 255 / 72%);
+  --hero-glass-shadow: 0 22px 52px rgb(37 42 50 / 10%), inset 0 1px 0 rgb(255 255 255 / 80%), inset 0 -1px 0 rgb(255 255 255 / 20%);
+  --landing-paper: var(--panel);
+  --landing-paper-rule: rgb(37 42 50 / 3%);
+  --landing-spine: color-mix(in srgb, var(--primary) 42%, var(--border));
+  --landing-step-border: color-mix(in srgb, var(--border-strong) 42%, var(--border));
+  --landing-step-shadow: 0 6px 16px rgb(37 42 50 / 5%);
+  --border: #d6d3cd;
+  --border-variant: #e6e3dd;
+  --border-strong: #79828e;
+
+  --accent-orange: #9b4b20;
+  --accent-red: #ad293d;
+  --accent-teal: #206e65;
+  --accent-blue: #315f9d;
+  --accent-amber: #8a560c;
+  --accent-green: #3f6d40;
+  --accent-purple: #76599f;
+
+  --accent-green-subtle: #eaf2e9;
+  --accent-amber-subtle: #fbf2e3;
+  --accent-teal-subtle: #e7f2f0;
+  --accent-red-subtle: #fbeaec;
+  --accent-blue-subtle: #eaf0f7;
+  --skill-blue: #2c5e96;
+  --skill-blue-subtle: #e8eff7;
+  --skill-blue-slash: #3e699c;
+  --accent-purple-subtle: #f1edf6;
+
+  --dots-muted: #e4e8ec;
+  --dots-strong: #c4cbd3;
+
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --sans: Inter, Aptos, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --modal-top: min(30vh, 260px);
+  --term-bg: #f4f6f8;
+  --term-foreground: #20242a;
+  --term-selection: #dbe5f1;
+  --term-app-bg: #f7f8fa;
+  --term-app-foreground: #20242a;
+  --term-app-selection: #dbe5f1;
+  --term-app-ansi-black: #252a31;
+  --term-app-ansi-red: #b42335;
+  --term-app-ansi-green: #3f7546;
+  --term-app-ansi-yellow: #98600d;
+  --term-app-ansi-blue: #315f9d;
+  --term-app-ansi-magenta: #76599f;
+  --term-app-ansi-cyan: #287e73;
+  --term-app-ansi-white: #717a86;
+  --term-app-ansi-bright-black: #58616c;
+  --term-app-ansi-bright-red: #c33b4b;
+  --term-app-ansi-bright-green: #4b7d4c;
+  --term-app-ansi-bright-yellow: #a86a12;
+  --term-app-ansi-bright-blue: #3f6fae;
+  --term-app-ansi-bright-magenta: #76599f;
+  --term-app-ansi-bright-cyan: #287e73;
+  --term-app-ansi-bright-white: #20242a;
+  --tool-shimmer: color-mix(in srgb, var(--text) 58%, var(--subtext));
+  --editor-selection: var(--code-selection);
+  --readable-col: 840px;
+  --accent: var(--primary);
+  --teal: var(--accent-teal);
+  --green: var(--accent-green);
+  --red: var(--accent-red);
+  --amber: var(--accent-amber);
+
+  --syntax-comment: #5d6672;
+  --syntax-text: #303843;
+  --syntax-red: #b42335;
+  --syntax-orange: #9a5c16;
+  --syntax-green: #3f7546;
+  --syntax-yellow: #98600d;
+  --syntax-cyan: #287e73;
+  --syntax-purple: #76599f;
+  --syntax-blue: #315f9d;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+/* Legacy theme attributes resolve to the same light palette. */
+:root[data-theme="dark"] {
+  --base: #ffffff;
+  --chat-annotation-highlight: #f4cbd0;
+  --selection-background: #f1c7cd;
+  --selection-text: #42151c;
+  --code-selection: var(--selection-background);
+  --syntax-comment: #5d6672;
+  color-scheme: light;
+}

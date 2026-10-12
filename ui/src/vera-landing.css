@@ -1,0 +1,81 @@
+/* The academic writing introduction fits the desktop viewport on each launch. */
+.vera-landing { height: 100dvh; min-height: 0; overflow: hidden; overscroll-behavior: contain; border-top: 3px solid var(--primary); }
+.vera-landing-titlebar { display: none; }
+.vera-landing-content { grid-template-rows: auto minmax(0, 1fr) auto; padding-inline: max(48px, env(safe-area-inset-left)) max(48px, env(safe-area-inset-right)); }
+.vera-landing-header { position: relative; min-height: clamp(56px, 8.5dvh, 80px); padding-block: max(12px, env(safe-area-inset-top)) 12px; }
+.vera-landing-header::after { position: absolute; inset-inline-start: 0; bottom: -1px; width: 48px; height: 2px; background: var(--primary); content: ""; }
+.vera-landing-header-enter.btn { padding: 10px 16px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-bright); }
+.vera-landing-nav, .vera-landing-link { text-decoration: none; }
+.vera-landing-nav:hover { color: var(--text); }
+.vera-landing-nav:focus-visible, .vera-landing-link:focus-visible { outline: 2px solid var(--text); outline-offset: 6px; border-radius: var(--radius-xs); }
+.vera-landing-main { grid-template-rows: minmax(0, 1.65fr) minmax(0, 1fr); gap: clamp(12px, 2.2dvh, 24px); padding-block: clamp(12px, 2.2dvh, 24px); }
+.vera-landing-hero { position: relative; isolation: isolate; min-height: 0; overflow: hidden; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 40px; margin-inline: -32px; padding: clamp(16px, 2.4dvh, 28px) 32px; border: 1px solid var(--border); border-radius: 24px; background: var(--surface); }
+.vera-hero-backdrop { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+.vera-hero-media { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: cover; object-position: center; }
+.vera-hero-veil { position: absolute; inset: 0; background: var(--hero-veil); }
+.vera-hero-video-control.icon-btn { position: absolute; inset-inline-end: 12px; bottom: 10px; z-index: 2; width: 32px; height: 32px; background: var(--hero-control); border: 1px solid var(--border); }
+.vera-landing-story { min-width: 0; }
+.vera-landing-title { margin: clamp(12px, 1.8dvh, 18px) 0; font-family: Georgia, "Times New Roman", serif; font-size: clamp(2.25rem, 5.8dvh, 3.5rem); font-weight: 400; line-height: 1.08; }
+.vera-landing-title span, .vera-landing-title em { display: block; }
+.vera-landing-title em { margin-top: 8px; color: var(--primary); font-weight: 400; }
+.vera-landing-description { max-width: 540px; margin: 0; font-size: clamp(1rem, 2dvh, 1.125rem); }
+.vera-landing-actions { margin-top: clamp(16px, 2.4dvh, 24px); }
+.vera-landing-enter.btn { gap: 16px; border-radius: var(--radius-md); padding-inline: 24px; }
+.vera-landing-enter svg, .vera-landing-link svg, .vera-landing-header-enter svg { transition: transform 160ms ease-out; }
+.vera-landing-enter:hover svg, .vera-landing-header-enter:hover svg { transform: translateX(3px); }
+.vera-landing-link:hover svg { transform: translate(2px, 2px); }
+.vera-landing-local { max-width: 440px; margin: clamp(10px, 1.6dvh, 16px) 0 0; }
+.vera-landing-identity { align-self: center; justify-self: center; width: min(100%, 36dvh, 360px); aspect-ratio: 1; padding: clamp(20px, 3dvh, 32px); border: 1px solid var(--hero-glass-border); border-radius: 24px; background: var(--hero-glass-fill); box-shadow: var(--hero-glass-shadow); -webkit-backdrop-filter: blur(18px) saturate(115%); backdrop-filter: blur(18px) saturate(115%); }
+.vera-landing-logo { display: block; width: min(100%, 280px); max-width: 100%; aspect-ratio: 1; object-fit: contain; }
+.vera-landing-workflow { position: relative; display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; margin-inline: -32px; padding: clamp(16px, 2.2dvh, 24px) 32px; border: 1px solid var(--border); border-radius: 24px; background: var(--landing-paper); }
+.vera-landing-workflow::before { position: absolute; top: 20px; bottom: 20px; inset-inline-start: 0; width: 3px; border-radius: var(--radius-full); background: var(--primary); content: ""; }
+.vera-landing-workflow:target { border-color: var(--landing-spine); }
+.vera-landing-workflow-heading { margin-bottom: clamp(12px, 1.8dvh, 20px); }
+.vera-landing-workflow h2 { font-family: Georgia, "Times New Roman", serif; font-size: clamp(1.375rem, 3.2dvh, 1.875rem); font-weight: 400; letter-spacing: -.02em; line-height: 1.2; }
+.vera-landing-steps { min-height: 0; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
+.vera-landing-step { position: relative; min-width: 0; padding: clamp(14px, 1.8dvh, 20px) 20px; border: 1px solid var(--landing-step-border); border-inline-start: 2px solid var(--primary); border-radius: var(--radius-md); background: var(--base); box-shadow: var(--landing-step-shadow); transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease; }
+.vera-landing-step::after { position: absolute; inset-inline: 24px; bottom: 12px; height: 1px; background: var(--landing-paper-rule); content: ""; }
+.vera-landing-step-number { font-family: Georgia, "Times New Roman", serif; font-size: clamp(1.5rem, 3dvh, 1.875rem); font-weight: 400; line-height: 1; }
+.vera-landing-step-rule { background: var(--landing-step-border); transform-origin: left; transition: background 180ms ease; }
+.vera-landing-step h3 { margin: clamp(10px, 1.6dvh, 16px) 0 8px; font-size: clamp(1rem, 1.9dvh, 1.125rem); font-weight: 600; line-height: 1.35; }
+.vera-landing-step p { line-height: 1.5; }
+.vera-landing-footer { position: relative; min-height: clamp(40px, 6dvh, 56px); padding-block: 10px max(10px, env(safe-area-inset-bottom)); }
+.vera-landing-footer::before { position: absolute; inset-inline-end: 0; top: -1px; width: 48px; height: 2px; background: var(--primary); content: ""; }
+.vera-landing-footer-note { font-family: Georgia, "Times New Roman", serif; font-size: var(--text-base); font-style: italic; }
+@media (hover: hover) {
+  .vera-landing-step:hover { transform: translateY(-3px); border-color: var(--landing-spine); box-shadow: var(--shadow-card); }
+  .vera-landing-step:hover .vera-landing-step-rule { background: var(--landing-spine); }
+}
+.vera-landing-story > *, .vera-landing-identity, .vera-landing-workflow { animation: vera-landing-enter 500ms ease-out both; }
+.vera-landing-title { animation-delay: 70ms; }
+.vera-landing-description { animation-delay: 140ms; }
+.vera-landing-actions, .vera-landing-local { animation-delay: 210ms; }
+.vera-landing-identity { animation-delay: 140ms; }
+.vera-landing-workflow { animation-delay: 280ms; }
+.vera-landing-leaving .vera-landing-content { opacity: 0; transition: opacity 180ms ease-out; }
+.win-titlebar .vera-landing { padding-top: 36px; }
+.mac-titlebar .vera-landing { padding-top: 28px; }
+.win-titlebar .vera-landing-titlebar, .mac-titlebar .vera-landing-titlebar { display: block; position: fixed; top: 0; inset-inline-start: 0; width: calc(100% - 150px); height: 36px; }
+@keyframes vera-landing-enter {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (max-height: 760px) {
+  .vera-landing-header { min-height: 56px; padding-block: 8px; }
+  .vera-landing-main { gap: 12px; padding-block: 12px; }
+  .vera-landing-hero { padding-block: 16px; }
+  .vera-landing-title { margin-block: 12px; font-size: clamp(2rem, 5.4dvh, 2.5rem); }
+  .vera-landing-title em { margin-top: 4px; }
+  .vera-landing-description { font-size: var(--text-base); line-height: 1.5; }
+  .vera-landing-actions { margin-top: 16px; }
+  .vera-landing-local { margin-top: 10px; }
+  .vera-landing-workflow { padding-block: 16px; }
+  .vera-landing-workflow-heading { margin-bottom: 12px; }
+  .vera-landing-step { padding-block: 12px; }
+  .vera-landing-step h3 { margin-block: 10px 6px; }
+  .vera-landing-step p { font-size: var(--text-xs); }
+  .vera-landing-footer { min-height: 40px; padding-block: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vera-landing *, .vera-landing *::before, .vera-landing *::after { animation: none !important; transition: none !important; }
+}

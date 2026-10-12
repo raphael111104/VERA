@@ -1,0 +1,2155 @@
+//! Self-update plumbing shared by `orx version`, `orx update`, and the
+//! outdated-version warning shown on every command.
+//!
+//! Latest-version discovery deliberately avoids the GitHub REST API: its
+//! unauthenticated limit is 60 requests/hour *per IP*, which is routinely
+//! exhausted on the datacenter/NAT addresses agents run from. Instead we fetch
+//! the `dist-manifest.json` asset that cargo-dist uploads to every release via
+//! the documented `releases/latest/download/<asset>` permalink — a plain CDN
+//! redirect with no API rate limit.
+//!
+//! The cargo-dist shell installer writes an install receipt to
+//! `${XDG_CONFIG_HOME:-~/.config}/openresearch-cli/openresearch-cli-receipt.json`
+//! (its PowerShell twin: `%LOCALAPPDATA%\openresearch-cli\` on Windows).
+//! That receipt is the only thing distinguishing an installer-managed binary
+//! from a `cargo install` one (both live at `~/.cargo/bin/orx` because
+//! dist-workspace.toml sets `install-path = "CARGO_HOME"`), so `orx update`
+//! refuses to touch the binary unless the receipt matches it.
+
+use std::io::{IsTerminal, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use semver::Version;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{anyhow, Result};
+
+#[cfg(target_os = "linux")]
+pub mod linux_app;
+pub mod macos_app;
+#[cfg(windows)]
+pub(crate) mod windows;
+
+const RELEASE_REPOSITORY_ENV: &str = "VERA_RELEASE_REPOSITORY";
+
+fn normalize_release_repository(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim().trim_end_matches('/');
+    let url = reqwest::Url::parse(candidate).ok()?;
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    (url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && segments.len() == 2)
+        .then(|| candidate.to_string())
+}
+
+/// A VERA release repository is opt-in so this fork never checks or installs
+/// binaries from the upstream product by default.
+pub(crate) fn release_repository() -> Option<String> {
+    std::env::var(RELEASE_REPOSITORY_ENV)
+        .ok()
+        .or_else(|| option_env!("VERA_RELEASE_REPOSITORY").map(str::to_owned))
+        .and_then(|candidate| normalize_release_repository(&candidate))
+}
+
+fn require_release_repository() -> Result<String> {
+    release_repository().ok_or_else(|| {
+        anyhow!(
+            "Updates are not configured for this VERA build. Set {RELEASE_REPOSITORY_ENV} to a VERA GitHub repository."
+        )
+    })
+}
+
+#[cfg(test)]
+mod release_source_tests {
+    use super::*;
+
+    #[test]
+    fn release_repository_requires_a_canonical_https_github_path() {
+        assert_eq!(
+            normalize_release_repository("https://github.com/example/vera"),
+            Some("https://github.com/example/vera".to_string())
+        );
+        assert_eq!(
+            normalize_release_repository("https://github.com/example/vera/"),
+            Some("https://github.com/example/vera".to_string())
+        );
+        for candidate in [
+            "http://github.com/example/vera",
+            "https://example.com/example/vera",
+            "https://github.com/example/vera/releases",
+            "https://user@github.com/example/vera",
+            "https://github.com/example/vera?download=1",
+        ] {
+            assert_eq!(normalize_release_repository(candidate), None, "{candidate}");
+        }
+    }
+
+    #[test]
+    fn desktop_downloads_use_vera_asset_names() {
+        assert_eq!(
+            desktop_app_download_url_for("https://github.com/example/vera", "windows", "x86_64"),
+            "https://github.com/example/vera/releases/latest/download/VERA-Setup.exe"
+        );
+        assert_eq!(
+            desktop_app_download_url_for("https://github.com/example/vera", "freebsd", "x86_64"),
+            "https://github.com/example/vera/releases/latest"
+        );
+    }
+}
+
+/// The cargo-dist app name (the *package* name, not the `orx` bin name) — used
+/// in release asset names and the receipt path.
+pub const APP_NAME: &str = "openresearch-cli";
+
+/// How long a cached update check stays fresh.
+const CHECK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Sent on requests to GitHub — some CDNs reject the default (empty) UA.
+const UA: &str = concat!("openresearch-cli/", env!("CARGO_PKG_VERSION"));
+
+fn desktop_app_download_url_for(repository: &str, os: &str, arch: &str) -> String {
+    let asset = match (os, arch) {
+        ("macos", _) => "VERA.dmg",
+        ("windows", _) => "VERA-Setup.exe",
+        ("linux", "x86_64") => "VERA-x86_64.AppImage",
+        ("linux", "aarch64") => "VERA-aarch64.AppImage",
+        _ => return format!("{repository}/releases/latest"),
+    };
+    format!("{repository}/releases/latest/download/{asset}")
+}
+
+/// Where this platform's desktop app downloads from, if a VERA release source
+/// has been configured.
+pub fn desktop_app_download_url() -> Option<String> {
+    let repository = release_repository()?;
+    Some(desktop_app_download_url_for(
+        &repository,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ))
+}
+
+pub fn current_version() -> Version {
+    // The crate version is always valid semver; a panic here is a build bug.
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is valid semver")
+}
+
+fn http() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| crate::net::remote_client().build().expect("http client"))
+}
+
+// ---------------------------------------------------------------------------
+// Latest-version discovery (dist-manifest.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct LatestRelease {
+    pub version: Version,
+    /// The git tag (e.g. `v0.1.15`), used to pin asset downloads to the same
+    /// release the manifest described.
+    pub tag: String,
+}
+
+#[derive(Deserialize)]
+struct DistManifest {
+    announcement_tag: String,
+    #[serde(default)]
+    releases: Vec<ManifestRelease>,
+}
+
+#[derive(Deserialize)]
+struct ManifestRelease {
+    app_name: String,
+    app_version: String,
+}
+
+/// Extracts our app's version (and the release tag) from a dist-manifest body.
+fn parse_manifest(body: &str) -> Result<LatestRelease> {
+    let manifest: DistManifest = serde_json::from_str(body)?;
+    let release = manifest
+        .releases
+        .iter()
+        .find(|r| r.app_name == APP_NAME)
+        .ok_or_else(|| anyhow!("Release manifest has no entry for {}", APP_NAME))?;
+    let version = Version::parse(&release.app_version)
+        .map_err(|e| anyhow!("Could not parse version {:?}: {}", release.app_version, e))?;
+    Ok(LatestRelease {
+        version,
+        tag: manifest.announcement_tag,
+    })
+}
+
+/// Fetches the latest released version from GitHub (rate-limit-free permalink).
+pub async fn fetch_latest(timeout: Duration) -> Result<LatestRelease> {
+    let repository = require_release_repository()?;
+    let url = format!("{repository}/releases/latest/download/dist-manifest.json");
+    let res = http()
+        .get(&url)
+        .header("user-agent", UA)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Could not fetch the release manifest from {}: {}",
+                repository,
+                e
+            )
+        })?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "Release manifest request failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+    let body = res.text().await?;
+    parse_manifest(&body)
+}
+
+/// Downloads a release asset pinned to `tag` and returns its bytes.
+pub async fn fetch_release_asset(tag: &str, asset: &str, timeout: Duration) -> Result<Vec<u8>> {
+    let repository = require_release_repository()?;
+    let url = format!("{repository}/releases/download/{tag}/{asset}");
+    let res = http()
+        .get(&url)
+        .header("user-agent", UA)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not download {}: {}", url, e))?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "Download of {} failed ({} {})",
+            url,
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(res.bytes().await?.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Install receipt (written by the cargo-dist shell installer)
+// ---------------------------------------------------------------------------
+
+/// The fields of the cargo-dist install receipt that `orx update` relies on.
+#[derive(Debug, Deserialize)]
+pub struct Receipt {
+    pub install_prefix: String,
+    pub version: String,
+    /// Read only where the shell installer is re-run; the Windows swap never touches PATH.
+    #[serde(default)]
+    #[cfg_attr(windows, allow(dead_code))]
+    pub modify_path: bool,
+}
+
+pub fn receipt_path() -> PathBuf {
+    // Through `shell_env`, like `config::config_dir()`: in macOS app mode the
+    // user's real XDG_CONFIG_HOME lives only in this process.
+    let base = crate::local::shell_env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            // Where the PowerShell installer writes it.
+            #[cfg(windows)]
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                return PathBuf::from(local);
+            }
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config")
+        });
+    base.join(APP_NAME)
+        .join(format!("{}-receipt.json", APP_NAME))
+}
+
+/// Reads the install receipt. `Ok(None)` when it does not exist (i.e. the
+/// shell installer never ran on this machine); `Err` when it exists but cannot
+/// be parsed, since silently treating a corrupt receipt as "not installed by
+/// the installer" would point users at the wrong update path.
+pub fn load_receipt() -> Result<Option<Receipt>> {
+    let path = receipt_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("Could not read {}: {}", path.display(), e)),
+    };
+    let receipt: Receipt = serde_json::from_str(&raw)
+        .map_err(|e| anyhow!("Install receipt at {} is malformed: {}", path.display(), e))?;
+    Ok(Some(receipt))
+}
+
+/// Whether the running executable lives under the receipt's install prefix.
+/// The receipt records the prefix root (e.g. `~/.cargo`), while the binary sits
+/// in its `bin/` subdirectory for the cargo-home layout — so a trailing `bin`
+/// component is stripped from the exe's directory before comparing. Both paths
+/// should be canonicalized by the caller.
+pub fn exe_matches_prefix(exe: &Path, prefix: &Path) -> bool {
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let dir = if dir.file_name() == Some(std::ffi::OsStr::new("bin")) {
+        dir.parent().unwrap_or(dir)
+    } else {
+        dir
+    };
+    dir == prefix
+}
+
+// ---------------------------------------------------------------------------
+// Install channel
+// ---------------------------------------------------------------------------
+
+/// How this orx got onto the machine — which decides whether it may replace
+/// itself, and with what. Only the two channels we ship (the installer script
+/// and the macOS bundle) can self-update; everything else belongs to a package
+/// manager that would be clobbered by writing over its files.
+#[derive(Debug)]
+pub enum InstallChannel {
+    /// Installed by the cargo-dist shell installer, which left a receipt naming
+    /// the prefix it owns.
+    Installer {
+        receipt: Receipt,
+        prefix: PathBuf,
+    },
+    /// The executable inside `OpenResearch.app`; the path is the bundle root.
+    AppBundle(PathBuf),
+    /// The executable inside the Linux AppImage; the path is the `.AppImage`
+    /// file, which orx replaces whole.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    AppImage(PathBuf),
+    /// A Windows `orx.exe` extracted from the release zip; the path is its
+    /// directory, where orx swaps the new `orx.exe` in.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Portable(PathBuf),
+    /// `cargo install` — lands in the same `~/.cargo/bin/orx` as the installer,
+    /// so only the absent receipt tells them apart.
+    Cargo,
+    Homebrew,
+    Nix,
+    Unknown,
+}
+
+impl InstallChannel {
+    /// The stable label reported by `orx version --json` and the dashboard.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InstallChannel::Installer { .. } => "installer",
+            InstallChannel::AppBundle(_) => "app-bundle",
+            InstallChannel::AppImage(_) => "appimage",
+            InstallChannel::Portable(_) => "portable",
+            InstallChannel::Cargo => "cargo",
+            InstallChannel::Homebrew => "homebrew",
+            InstallChannel::Nix => "nix",
+            InstallChannel::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this channel can apply its own updates at all (before consulting
+    /// the user's opt-out).
+    pub fn self_updates(&self) -> bool {
+        matches!(
+            self,
+            InstallChannel::Installer { .. }
+                | InstallChannel::AppBundle(_)
+                | InstallChannel::AppImage(_)
+                | InstallChannel::Portable(_)
+        )
+    }
+}
+
+/// The `.app` root for a bundle executable at `<root>.app/Contents/MacOS/<exe>`.
+/// Split out from [`detect_channel`] so it can be tested off macOS.
+fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    if !macos.ends_with("Contents/MacOS") {
+        return None;
+    }
+    // `Contents/MacOS` -> `Contents` -> the bundle root.
+    macos.parent()?.parent().map(Path::to_path_buf)
+}
+
+/// The `.AppImage` file `exe` runs from, given the AppImage runtime's `APPDIR`
+/// (where the image is mounted) and `APPIMAGE` (the file). Agents inherit both,
+/// so an `orx` outside the mount is some other install.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn appimage_file(
+    exe: &Path,
+    appdir: Option<&std::ffi::OsStr>,
+    appimage: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let appimage = appimage?;
+    crate::paths::in_appimage_mount(exe, appdir).then(|| PathBuf::from(appimage))
+}
+
+/// The `.AppImage` file this process runs from, if it is the AppImage's own orx.
+#[cfg(all(desktop_app, target_os = "linux"))]
+pub fn running_appimage() -> Option<PathBuf> {
+    appimage_file(
+        &current_exe().ok()?,
+        std::env::var_os("APPDIR").as_deref(),
+        std::env::var_os("APPIMAGE").as_deref(),
+    )
+}
+
+/// Classify `exe`. The app tests come first: an app's binary has no receipt,
+/// so every later branch would misfile it. A malformed receipt is an error
+/// rather than "no receipt" for the reason [`load_receipt`] gives — the wrong
+/// answer here sends the user down the wrong update path.
+pub fn detect_channel(exe: &Path) -> Result<InstallChannel> {
+    if let Some(root) = app_bundle_root(exe) {
+        return Ok(InstallChannel::AppBundle(root));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(file) = appimage_file(
+        exe,
+        std::env::var_os("APPDIR").as_deref(),
+        std::env::var_os("APPIMAGE").as_deref(),
+    ) {
+        return Ok(InstallChannel::AppImage(file));
+    }
+    let exe_str = exe.to_string_lossy();
+    if exe_str.starts_with("/nix/store/") {
+        return Ok(InstallChannel::Nix);
+    }
+    if exe_str.starts_with("/opt/homebrew/") || exe_str.contains("/Cellar/") {
+        return Ok(InstallChannel::Homebrew);
+    }
+    if let Some(receipt) = load_receipt()? {
+        let prefix = PathBuf::from(&receipt.install_prefix);
+        let prefix = crate::paths::canonicalize(&prefix).unwrap_or(prefix);
+        #[cfg(windows)]
+        if let Some(dir) = portable_outside_prefix(exe, &prefix) {
+            return Ok(InstallChannel::Portable(dir));
+        }
+        return Ok(InstallChannel::Installer { receipt, prefix });
+    }
+    if exe.parent().is_some_and(|dir| dir.ends_with(".cargo/bin")) {
+        return Ok(InstallChannel::Cargo);
+    }
+    #[cfg(windows)]
+    if let Some(dir) = portable_dir(exe) {
+        return Ok(InstallChannel::Portable(dir));
+    }
+    Ok(InstallChannel::Unknown)
+}
+
+/// The directory of a zip-extracted `orx.exe`. The name must be exactly what the
+/// zip ships, since the installer writes that name back; and the directory must
+/// not belong to something else that manages it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn portable_dir(exe: &Path) -> Option<PathBuf> {
+    if exe.file_name().is_none_or(|name| name != "orx.exe") {
+        return None;
+    }
+    let dir = exe.parent()?;
+    (!package_manager_owns(dir)).then(|| dir.to_path_buf())
+}
+
+/// A zip-extracted or desktop-app `orx.exe` away from the CLI installer's prefix
+/// still updates itself when that installer's receipt exists too.
+// Un-gated so its test runs on CI's Linux runner; only Windows has a caller.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn portable_outside_prefix(exe: &Path, prefix: &Path) -> Option<PathBuf> {
+    if exe_matches_prefix(exe, prefix) {
+        return None;
+    }
+    portable_dir(exe)
+}
+
+/// Scoop, Chocolatey and winget each install under a directory named for them;
+/// `Program Files` is never a user's unpacked download; `target` is a cargo
+/// build that must not be swapped for a release. Split from [`portable_dir`] so
+/// it can be tested with Windows paths off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn package_manager_owns(dir: &Path) -> bool {
+    let lower = dir.to_string_lossy().to_ascii_lowercase();
+    [
+        "\\scoop\\",
+        "\\chocolatey\\",
+        "\\winget\\",
+        "\\program files",
+        "\\target\\",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Where a replaced Windows binary is parked: `orx.exe.<id>.old` beside it. The
+/// id is fresh per update, so a server still mapping the last one never blocks
+/// the next; [`remove_retired_exes`] sweeps them all.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn retired_path(exe: &Path) -> PathBuf {
+    let mut retired = exe.as_os_str().to_owned();
+    retired.push(format!(".{}.old", uuid::Uuid::new_v4().simple()));
+    PathBuf::from(retired)
+}
+
+/// Delete the `orx.exe.*.old` files earlier updates left beside this binary.
+/// Best effort: a process still running one keeps it until the next start.
+#[cfg(windows)]
+pub fn remove_retired_exes() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        if file.starts_with(&prefix) && file.ends_with(".old") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A relaunched `orx up` or app waits here for the process it replaces to release the
+/// port, then sweeps the binary that process was running. Only Windows
+/// relaunches by spawning; everywhere else this is a no-op.
+pub fn await_replaced_parent() {
+    #[cfg(windows)]
+    if windows::await_replaced_parent() {
+        remove_retired_exes();
+    }
+}
+
+/// Set the receipt's `version` after a Windows update, which swaps the binary
+/// itself instead of letting the installer rewrite the receipt. Every other
+/// field is left as the installer wrote it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rewrite_receipt_version(path: &Path, version: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut receipt: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(fields) = receipt.as_object_mut() else {
+        return Err(anyhow!(
+            "Install receipt at {} is not an object",
+            path.display()
+        ));
+    };
+    fields.insert("version".into(), serde_json::Value::String(version.into()));
+    // Rename, not overwrite: a concurrent `orx` reading a half-written receipt
+    // would classify itself as a corrupt install.
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&tmp, serde_json::to_string(&receipt)?)?;
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// [`rewrite_receipt_version`] for the receipt this install reads.
+#[cfg(windows)]
+pub fn record_receipt_version(version: &str) -> Result<()> {
+    rewrite_receipt_version(&receipt_path(), version)
+}
+
+/// The running executable, canonicalized. Canonical because
+/// [`exe_matches_prefix`] compares it against a canonicalized prefix, and
+/// because the bundle's `orx` symlink must resolve to the real executable
+/// before its `Contents/MacOS` parent can be recognized.
+fn current_exe() -> Result<PathBuf> {
+    crate::paths::canonicalize(std::env::current_exe()?)
+        .map_err(|e| anyhow!("Could not resolve the running executable: {}", e))
+}
+
+/// Classify the running binary. Successes are memoized: classification
+/// canonicalizes the executable and may read the receipt, and a running process
+/// cannot change how it was installed — `orx up` samples this on a timer, so the
+/// repeat cost is real. Failures are *not* cached, because the likeliest cause is
+/// a receipt caught mid-rewrite by the installer; caching that would strand a
+/// long-lived `orx up` on "unknown, never self-updates" until it restarts.
+pub fn current_channel() -> Result<&'static InstallChannel> {
+    static CHANNEL: OnceLock<InstallChannel> = OnceLock::new();
+    if let Some(channel) = CHANNEL.get() {
+        return Ok(channel);
+    }
+    let channel = detect_channel(&current_exe()?)?;
+    Ok(CHANNEL.get_or_init(|| channel))
+}
+
+/// Whether an update may be applied **without asking** on this install: a
+/// self-updating channel, not opted out, and not a corrupt-receipt install
+/// (where [`detect_channel`] errors and the manual command should explain why).
+///
+/// The `autoUpdate` setting is a narrower switch than [`opted_out`]: it stops
+/// the silent apply but leaves the check and the outdated warning in place, so
+/// a user who wants to choose their moment still learns there is a release.
+pub fn auto_update_eligible() -> bool {
+    release_repository().is_some()
+        && !opted_out()
+        && crate::config::auto_update_enabled()
+        && current_channel()
+            .map(|channel| channel.self_updates())
+            .unwrap_or(false)
+}
+
+/// How to enable updates for a future VERA release repository.
+const INSTALL_HINT: &str =
+    "Configure VERA_RELEASE_REPOSITORY to a VERA GitHub repository before updating.";
+
+/// Confirm a directory can be written before an update commits to it — root-owned
+/// installs and read-only filesystems fail here rather than after a download.
+fn probe_writable(dir: &Path) -> std::io::Result<()> {
+    let probe = dir.join(format!(".orx-update-probe-{}", uuid::Uuid::new_v4()));
+    std::fs::File::create(&probe)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// What `preflight` resolved this install to. The installer variant is checked
+/// here; the bundle's checks live in `macos_app::ensure_replaceable`, which runs
+/// after the version comparison so `--dry-run` needs no signed, writable app.
+pub enum UpdateTarget {
+    /// The receipt names the prefix to reinstall into.
+    Installer(Receipt),
+    /// The `.app` root to swap. macOS only; see the `macos_app` module.
+    AppBundle(PathBuf),
+    /// The `.AppImage` file to replace. Linux only; see the `linux_app` module.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    AppImage(PathBuf),
+    /// The directory holding a zip-extracted `orx.exe`. Only Windows reads it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Portable(PathBuf),
+}
+
+/// Classify the install and, for the installer channel, check everything that
+/// must hold before orx overwrites itself. `force` waives only the two
+/// "something else is managing this binary" checks.
+pub fn preflight(force: bool) -> Result<UpdateTarget> {
+    let exe = current_exe()?;
+    let channel = detect_channel(&exe)?;
+    let (receipt, prefix) = match channel {
+        InstallChannel::AppBundle(root) => return Ok(UpdateTarget::AppBundle(root)),
+        InstallChannel::AppImage(file) => return Ok(UpdateTarget::AppImage(file)),
+        InstallChannel::Portable(dir) => {
+            probe_writable(&dir).map_err(|e| {
+                anyhow!(
+                    "No write permission for {} ({}). Move orx.exe somewhere you can write to.",
+                    dir.display(),
+                    e
+                )
+            })?;
+            return Ok(UpdateTarget::Portable(dir));
+        }
+        InstallChannel::Nix => {
+            return Err(anyhow!(
+                "This orx is managed by Nix ({}). Update it through your Nix configuration.",
+                exe.display()
+            ))
+        }
+        InstallChannel::Homebrew => {
+            return Err(anyhow!(
+                "This orx looks Homebrew-managed ({}). Update it with `brew upgrade`.",
+                exe.display()
+            ))
+        }
+        InstallChannel::Cargo | InstallChannel::Unknown => {
+            return Err(anyhow!(
+                "orx was not installed by the installer script (no receipt at {}),\n\
+                 so `orx update` won't touch it. Update it the way it was installed:\n\
+                 - cargo: cargo install --path . (or your original cargo install invocation)\n\
+                 - or reinstall with the installer: {}",
+                receipt_path().display(),
+                INSTALL_HINT
+            ))
+        }
+        InstallChannel::Installer { receipt, prefix } => (receipt, prefix),
+    };
+
+    if !exe_matches_prefix(&exe, &prefix) && !force {
+        return Err(anyhow!(
+            "The running orx is at {} but the installer's receipt says it installed to {}.\n\
+             Are multiple copies of orx installed? Pass --force to update the receipt's copy anyway.",
+            exe.display(),
+            prefix.display()
+        ));
+    }
+    let current = current_version();
+    if receipt.version != current.to_string() && !force {
+        return Err(anyhow!(
+            "The running orx is {} but the install receipt records {} — something other than\n\
+             the installer (likely `cargo install`) overwrote {}. Updating would clobber it.\n\
+             Pass --force to proceed anyway.",
+            current,
+            receipt.version,
+            exe.display()
+        ));
+    }
+
+    // Before the download, not after it.
+    if let Some(bin_dir) = exe.parent() {
+        probe_writable(bin_dir).map_err(|e| {
+            anyhow!(
+                "No write permission for {} ({}). If orx was installed with sudo,\n\
+                 update it the same way or reinstall per-user.",
+                bin_dir.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(UpdateTarget::Installer(receipt))
+}
+
+// ---------------------------------------------------------------------------
+// Update-check cache (the warning's 24h throttle)
+// ---------------------------------------------------------------------------
+
+/// Shortest gap between two background update attempts, doubling per consecutive
+/// failure up to [`ATTEMPT_BACKOFF_MAX`]. Without this an unreachable GitHub (or
+/// a release whose asset 404s) would respawn an updater on *every* invocation —
+/// ruinous when an agent drives `orx` in a loop.
+const ATTEMPT_BACKOFF_MIN: Duration = Duration::from_secs(60 * 60);
+const ATTEMPT_BACKOFF_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CheckCache {
+    /// Unix seconds of the last completed (or attempted) check.
+    checked_at: u64,
+    /// Latest version seen at that time.
+    latest: String,
+    #[serde(default)]
+    latest_tag: String,
+    /// Unix seconds of the last background update *attempt* (distinct from the
+    /// version check above, which is only a fetch).
+    #[serde(default)]
+    attempted_at: u64,
+    /// Consecutive failed attempts, reset on success. Drives the backoff.
+    #[serde(default)]
+    failures: u32,
+    /// Version the updater last installed. Compared against the *running*
+    /// version to tell a long-lived process (`orx up`, the app) that the copy on
+    /// disk has moved on and a restart would pick it up. It lives in the cache
+    /// rather than in memory because the updater is a separate process.
+    #[serde(default)]
+    installed_version: String,
+    #[serde(default)]
+    installed_tag: String,
+    /// A release the updater held back because a backend was using this
+    /// install; that backend installs it when it restarts.
+    #[serde(default)]
+    deferred_version: String,
+    #[serde(default)]
+    deferred_tag: String,
+}
+
+fn cache_path() -> PathBuf {
+    // Per channel. The macOS app and a script-installed CLI share a config dir
+    // but track different release trains, so one file would have each install
+    // reading the other's `latest` (suppressing a real update) and the other's
+    // `installed_version` — which is a restart banner for a bundle that was
+    // never touched, and the one symptom here that does not self-heal.
+    let channel = current_channel()
+        .map(InstallChannel::as_str)
+        .unwrap_or("unknown");
+    crate::config::config_dir().join(format!("update-check-{channel}.json"))
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The single cache this feature shipped with, before channels split it. Read
+/// once as a fallback so an existing install keeps its `latest` instead of
+/// warning off nothing for a cycle; removed on the first write.
+fn legacy_cache_path() -> PathBuf {
+    crate::config::config_dir().join("update-check.json")
+}
+
+fn read_cache() -> Option<CheckCache> {
+    let raw = std::fs::read_to_string(cache_path())
+        .or_else(|_| std::fs::read_to_string(legacy_cache_path()))
+        .ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Record the latest known release.
+pub fn write_check_cache(latest: &str, tag: &str) {
+    mutate_cache(|cache| {
+        cache.checked_at = now_unix();
+        cache.latest = latest.to_string();
+        cache.latest_tag = tag.to_string();
+    });
+}
+
+/// Record the outcome of an update attempt: success clears the backoff, failure
+/// lengthens it.
+pub fn record_attempt(succeeded: bool) {
+    mutate_cache(|cache| {
+        cache.attempted_at = now_unix();
+        cache.failures = if succeeded {
+            0
+        } else {
+            cache.failures.saturating_add(1)
+        };
+    });
+}
+
+/// Note that an updater was already running, damping the spawn storm without
+/// touching `failures`. Recording this as a *success* would reset the counter
+/// the real updater is about to increment — and losing that race is most likely
+/// precisely when the holder is slow because it is failing.
+pub fn record_contended() {
+    mutate_cache(|cache| cache.attempted_at = now_unix());
+}
+
+/// Record a version as installed on disk. Also refreshes the check fields — an
+/// install is the freshest possible answer to "what is the latest release".
+pub fn record_installed(version: &str, tag: &str) {
+    mutate_cache(|cache| {
+        cache.checked_at = now_unix();
+        cache.latest = version.to_string();
+        cache.latest_tag = tag.to_string();
+        cache.installed_version = version.to_string();
+        cache.installed_tag = tag.to_string();
+        cache.deferred_version.clear();
+        cache.deferred_tag.clear();
+    });
+}
+
+/// Held by an `orx update` for its whole run.
+pub fn updater_lock_path() -> PathBuf {
+    let channel = current_channel()
+        .map(InstallChannel::as_str)
+        .unwrap_or("unknown");
+    crate::config::config_dir().join(format!("update-{channel}.lock"))
+}
+
+/// Whether an `orx update` is still running, e.g. one `apply_now` stopped waiting for.
+pub fn updater_running() -> bool {
+    std::fs::File::open(updater_lock_path())
+        .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+}
+
+/// Consecutive failed update attempts recorded so far.
+pub fn failure_count() -> u32 {
+    read_cache().map_or(0, |cache| cache.failures)
+}
+
+/// Record a release held back for a running backend to install on restart.
+pub fn record_deferred(version: &str, tag: &str) {
+    mutate_cache(|cache| {
+        cache.checked_at = now_unix();
+        cache.latest = version.to_string();
+        cache.latest_tag = tag.to_string();
+        cache.deferred_version = version.to_string();
+        cache.deferred_tag = tag.to_string();
+    });
+}
+
+/// How long to wait after `failures` consecutive failures before trying again.
+/// The shift is clamped so a runaway counter can't overflow it.
+fn attempt_backoff(failures: u32) -> Duration {
+    ATTEMPT_BACKOFF_MIN
+        .saturating_mul(1 << failures.min(31))
+        .min(ATTEMPT_BACKOFF_MAX)
+}
+
+/// Whether enough time has passed since the last background update attempt.
+/// A cache with no recorded attempt (fresh install, or the first run after this
+/// feature shipped) is due immediately.
+fn attempt_due(cache: Option<&CheckCache>) -> bool {
+    let Some(cache) = cache else {
+        return true;
+    };
+    now_unix().saturating_sub(cache.attempted_at) >= attempt_backoff(cache.failures).as_secs()
+}
+
+/// Hand the update to a detached `orx update --background`.
+///
+/// A separate process, not an in-process task: the update replaces this very
+/// binary and must outlive a command that exits in milliseconds.
+///
+/// Failures here are silent by design: this is a best-effort background nicety,
+/// and `orx update` remains the path that explains what went wrong.
+fn spawn_background_update() {
+    let Ok(mut cmd) = updater_command() else {
+        return;
+    };
+    // Stdio is null because the parent's terminal belongs to the command the
+    // user actually ran.
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        // Reap it if we outlive it (`orx up` does); if the runtime is torn down
+        // first the child is simply reparented and keeps going.
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+    }
+}
+
+/// The `orx update --background` invocation both spawn sites use.
+///
+/// The environment is the load-bearing part: in macOS app mode the user's real
+/// `XDG_CONFIG_HOME`/`ORX_DATA_DIR` live only in this process (`shell_env::set`
+/// deliberately avoids `env::set_var`), so a child left to inherit launchd's
+/// environment would take its lock and write its cache under a *different*
+/// config dir than the parent reads — losing the restart signal and the backoff,
+/// and failing to serialize against a terminal `orx update`.
+fn updater_command() -> Result<tokio::process::Command> {
+    let mut cmd = tokio::process::Command::new(crate::paths::spawnable_exe()?);
+    cmd.args(["update", "--background"])
+        .stdin(std::process::Stdio::null());
+    if let Some(path) = crate::local::shell_env::search_path() {
+        cmd.env("PATH", path);
+    }
+    crate::local::shell_env::export_to(|key, value| {
+        cmd.env(key, value);
+    });
+    // Own process group, so a Ctrl-C — or an agent killing the group it spawned
+    // `orx` in — can't land between the two renames that swap the binary.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    Ok(cmd)
+}
+
+/// Read-modify-write the cache, preserving fields the caller didn't touch: the
+/// version check and the attempt bookkeeping are written by different code
+/// paths, so a whole-object write from either would erase the other's.
+///
+/// Errors are swallowed — the cache only throttles a best-effort check. The
+/// rename is what makes the *file* safe to read concurrently (never torn, always
+/// the old or a complete new one); the read-modify-write around it is unlocked,
+/// so two processes racing can still lose one side's fields. Both writers
+/// re-run often enough that a lost update costs at most one cycle, which is
+/// cheaper than holding a lock on every `orx` invocation.
+fn mutate_cache(f: impl FnOnce(&mut CheckCache)) {
+    let mut cache = read_cache().unwrap_or_default();
+    f(&mut cache);
+    let path = cache_path();
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(parent);
+    let Ok(body) = serde_json::to_string(&cache) else {
+        return;
+    };
+    let tmp = parent.join(format!(".update-check.{}.tmp", uuid::Uuid::new_v4()));
+    if std::fs::write(&tmp, body).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        // Rename failed (e.g. cross-device, racing cleanup); don't leak the temp.
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    // Migrated: this channel now has its own file.
+    let _ = std::fs::remove_file(legacy_cache_path());
+}
+
+// ---------------------------------------------------------------------------
+// Status, for long-lived processes (`orx up` and the desktop app)
+// ---------------------------------------------------------------------------
+
+/// How often a long-lived process re-checks. Short enough that a day-long
+/// session still lands the update, long enough to be invisible.
+pub const PERIODIC_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// What the dashboard shows about updates. Derived entirely from the cache and
+/// the install channel, so it is the same answer whether the updater ran in this
+/// process or in a detached one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatus {
+    pub current: String,
+    /// Latest release this install can actually move to. `None` before the first
+    /// check.
+    pub latest: Option<String>,
+    pub latest_tag: Option<String>,
+    pub release_repository: Option<String>,
+    /// How orx was installed — see [`InstallChannel::as_str`].
+    pub channel: &'static str,
+    /// Whether this install can update itself at all.
+    pub self_updates: bool,
+    /// Whether an update would be applied automatically — the setting *and* the
+    /// env opt-outs, so this never promises something that will never run.
+    pub auto_update: bool,
+    /// The environment, not the user's setting, is what forced `auto_update`
+    /// off. Kept separate so the UI only blames `ORX_NO_UPDATE_CHECK` when it is
+    /// actually the reason.
+    pub env_disabled: bool,
+    pub update_available: bool,
+    /// The version a restart of *this* process moves to: already on disk, or held
+    /// back until this backend restarts. Named separately from `latest` because a
+    /// release can land between the install and the restart.
+    pub installed_version: Option<String>,
+    pub installed_tag: Option<String>,
+    pub restart_required: bool,
+    /// Whether `POST /api/update/restart` is honored (see [`relaunch`]); pair
+    /// with `restart_required`. Always true now that every platform relaunches;
+    /// kept in the API shape for a channel that one day cannot.
+    pub can_restart: bool,
+    /// Identifies this server process, so a client can tell a relaunched server
+    /// from the one it was talking to even when both report the same version.
+    pub instance: &'static str,
+}
+
+/// Installed on disk or held back for this restart: either way a restart is what moves to it.
+fn restart_target<'a>(cache: &'a CheckCache, current: &Version) -> Option<(Version, &'a str)> {
+    [
+        (&cache.installed_version, &cache.installed_tag),
+        (&cache.deferred_version, &cache.deferred_tag),
+    ]
+    .into_iter()
+    .filter_map(|(version, tag)| Some((Version::parse(version).ok()?, tag.as_str())))
+    .filter(|(version, _)| is_outdated(current, version))
+    .max_by(|a, b| a.0.cmp(&b.0))
+}
+
+pub fn status() -> UpdateStatus {
+    let current = current_version();
+    let cache = read_cache();
+    let channel = current_channel().ok();
+    let repository = release_repository();
+    let latest = cache.as_ref().and_then(|c| Version::parse(&c.latest).ok());
+    let restart_target = cache.as_ref().and_then(|c| restart_target(c, &current));
+    UpdateStatus {
+        update_available: latest
+            .as_ref()
+            .is_some_and(|latest| is_outdated(&current, latest)),
+        restart_required: restart_target.is_some(),
+        can_restart: true,
+        instance: instance_id(),
+        installed_tag: restart_target
+            .as_ref()
+            .and_then(|(_, tag)| (!tag.is_empty()).then(|| tag.to_string())),
+        installed_version: restart_target.map(|(version, _)| version.to_string()),
+        latest_tag: latest
+            .as_ref()
+            .and(cache.as_ref())
+            .and_then(|c| (!c.latest_tag.is_empty()).then(|| c.latest_tag.clone())),
+        release_repository: repository.clone(),
+        latest: latest.map(|v| v.to_string()),
+        channel: channel.map(InstallChannel::as_str).unwrap_or("unknown"),
+        self_updates: repository.is_some()
+            && channel.map(InstallChannel::self_updates).unwrap_or(false),
+        auto_update: repository.is_some() && !opted_out() && crate::config::auto_update_enabled(),
+        env_disabled: opted_out(),
+        current: current.to_string(),
+    }
+}
+
+/// Whether the binary [`relaunch`] would exec reports a newer version than this process.
+pub async fn newer_exe_on_disk() -> bool {
+    // This process runs from the AppImage's mount, but the updater renames a new
+    // `.AppImage` over the file, so ask whether that file was replaced instead.
+    #[cfg(all(desktop_app, target_os = "linux"))]
+    if let Some(appimage) = running_appimage() {
+        return STARTUP_APPIMAGE
+            .get()
+            .copied()
+            .flatten()
+            .is_some_and(|start| file_identity(&appimage) != Some(start));
+    }
+    let Ok(exe) = crate::paths::spawnable_exe() else {
+        return false;
+    };
+    let Ok(out) = tokio::process::Command::new(exe)
+        .arg("--version")
+        .output()
+        .await
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .strip_prefix("orx ")
+        .and_then(|v| Version::parse(v).ok())
+        .is_some_and(|on_disk| is_outdated(&current_version(), &on_disk))
+}
+
+#[cfg(all(desktop_app, target_os = "linux"))]
+static STARTUP_APPIMAGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+
+/// Note which `.AppImage` file this process started from, before an update can replace it.
+pub fn note_startup_image() {
+    #[cfg(all(desktop_app, target_os = "linux"))]
+    STARTUP_APPIMAGE.get_or_init(|| running_appimage().as_deref().and_then(file_identity));
+}
+
+#[cfg(any(all(test, unix), all(desktop_app, target_os = "linux")))]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Whether a held-back update is waiting for this process's restart, with no failed
+/// install of it backing off and no updater still installing it.
+pub fn deferred_update_due() -> bool {
+    let current = current_version();
+    read_cache().is_some_and(|cache| {
+        Version::parse(&cache.deferred_version).is_ok_and(|v| is_outdated(&current, &v))
+            && (cache.failures == 0 || attempt_due(Some(&cache)))
+    }) && !updater_running()
+}
+
+/// Beside what the updater replaces, so every config and data dir using this
+/// install agrees on it.
+fn backend_lock_path() -> Option<PathBuf> {
+    let target = match current_channel().ok()? {
+        InstallChannel::AppBundle(root) | InstallChannel::AppImage(root) => root.clone(),
+        _ => current_exe().ok()?,
+    };
+    Some(target.parent()?.join(BACKEND_LOCK))
+}
+
+const BACKEND_LOCK: &str = ".orx-backend.lock";
+
+/// Where the backends of the copy `target` replaces hold their lock, which with
+/// `--force` need not be the copy running the updater.
+fn target_lock_path(target: &UpdateTarget) -> Option<PathBuf> {
+    let dir = match target {
+        UpdateTarget::Installer(receipt) => {
+            let prefix = PathBuf::from(&receipt.install_prefix);
+            let bin = prefix.join("bin");
+            if bin.is_dir() {
+                bin
+            } else {
+                prefix
+            }
+        }
+        UpdateTarget::AppBundle(file) | UpdateTarget::AppImage(file) => file.parent()?.into(),
+        UpdateTarget::Portable(dir) => dir.clone(),
+    };
+    Some(dir.join(BACKEND_LOCK))
+}
+
+fn open_lock(path: Option<PathBuf>) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path?)
+        .ok()
+}
+
+/// Held shared for an `orx up`'s lifetime. Swapping the binary under it would hand
+/// its agents a different `orx` than the backend running them, so updaters defer.
+pub struct BackendLock {
+    _file: std::fs::File,
+}
+
+impl BackendLock {
+    /// Waits out an install in progress, so a backend never starts under one.
+    /// `None` leaves this backend unprotected, as every backend before this lock was.
+    pub fn acquire() -> Option<Self> {
+        let file = open_lock(backend_lock_path())?;
+        file.lock_shared().ok()?;
+        Some(Self { _file: file })
+    }
+}
+
+/// An updater's exclusive hold on the install, kept until it finishes replacing it.
+pub struct InstallClaim {
+    _file: Option<std::fs::File>,
+}
+
+/// `None` while an `orx up` is using this install. A lock nobody could open protects nobody.
+pub fn claim_install(target: &UpdateTarget) -> Option<InstallClaim> {
+    let Some(file) = open_lock(target_lock_path(target)) else {
+        return Some(InstallClaim { _file: None });
+    };
+    match file.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        _ => Some(InstallClaim { _file: Some(file) }),
+    }
+}
+
+fn instance_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Environment the app relaunch hands to the new app: the port the old one
+/// served on, so the new window keeps its origin (and localStorage) even when
+/// the old one had fallen back from the app's usual port.
+#[cfg(desktop_app)]
+pub const APP_RELAUNCH_PORT_ENV: &str = "ORX_APP_RELAUNCH_PORT";
+
+/// Relaunch this process into the copy on disk. Returns only on failure.
+///
+/// A terminal `orx up` execs itself: same PID, same terminal, same arguments
+/// (plus `--no-browser`), so whatever started it (a shell, a supervisor, an SSH launcher's tunnel)
+/// sees an uninterrupted process. The macOS app cannot be exec'd — AppKit and
+/// LaunchServices track the launch, not the image — so it exits and leaves a
+/// detached shell to `open` the bundle once the old process is gone. The Linux
+/// AppImage execs the replaced `.AppImage` file.
+///
+/// `port` is what the dashboard is served on; the relaunch keeps it. A terminal
+/// `orx up` also skips opening a browser, because the tab that asked is reloading
+/// itself; the app opens a fresh window on the same origin.
+#[cfg(unix)]
+pub fn relaunch(port: u16) -> std::io::Error {
+    // Same test as `main`: the bundle exe run from a terminal with arguments is
+    // a CLI and execs like one.
+    #[cfg(target_os = "macos")]
+    if crate::commands::app::launched_as_app_bundle() && std::env::args_os().len() == 1 {
+        match current_exe().ok().and_then(|exe| app_bundle_root(&exe)) {
+            Some(root) => return relaunch_app_bundle(&root, port),
+            None => return std::io::Error::other("could not locate the app bundle to relaunch"),
+        }
+    }
+    #[cfg(all(desktop_app, target_os = "linux"))]
+    if crate::commands::app::launched_with_app_arg() {
+        // The update replaced the `.AppImage` file, not this mount of it, and its
+        // AppRun adds `app`, which the exec below's `--no-browser` would undo.
+        let mut app = match running_appimage() {
+            Some(appimage) => {
+                let mut app = std::process::Command::new(appimage);
+                // Or the new AppRun would save this image's GTK settings as the session's.
+                crate::local::shell_env::restore_host_gui_env(&mut app);
+                app
+            }
+            None => {
+                let Ok(exe) = crate::paths::spawnable_exe() else {
+                    return std::io::Error::other("could not resolve the running executable");
+                };
+                let mut app = std::process::Command::new(exe);
+                app.arg(crate::commands::app::APP_ARG);
+                app
+            }
+        };
+        return app.env(APP_RELAUNCH_PORT_ENV, port.to_string()).exec();
+    }
+    // Only the app relaunches need the port; exec keeps the original `--port`.
+    #[cfg(not(all(desktop_app, unix)))]
+    let _ = port;
+
+    // Not the canonical helper: the launch path is what the installer swapped
+    // under, and canonicalizing a replaced binary would pin the old inode.
+    let Ok(exe) = crate::paths::spawnable_exe() else {
+        return std::io::Error::other("could not resolve the running executable");
+    };
+    std::process::Command::new(exe)
+        .args(relaunch_args(std::env::args_os().skip(1)))
+        .exec()
+}
+
+/// Windows has no `exec`: spawn the new binary, which waits for this process to
+/// exit before it binds the port, then leave. The desktop app comes back as the
+/// app, on the same port.
+#[cfg(windows)]
+pub fn relaunch(port: u16) -> std::io::Error {
+    if crate::commands::app::launched_with_app_arg() {
+        return windows::relaunch(
+            vec![crate::commands::app::APP_ARG.into()],
+            &[(APP_RELAUNCH_PORT_ENV, port.to_string())],
+        );
+    }
+    windows::relaunch(relaunch_args(std::env::args_os().skip(1)), &[])
+}
+
+/// The original arguments plus `--no-browser`: the tab that asked for the
+/// restart reloads itself, so a second tab would only be clutter.
+fn relaunch_args(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = args.collect();
+    if !args.iter().any(|arg| arg == "--no-browser") {
+        args.push("--no-browser".into());
+    }
+    args
+}
+
+#[cfg(target_os = "macos")]
+fn relaunch_app_bundle(root: &Path, port: u16) -> std::io::Error {
+    let spawned = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 0.1; done; exec open -n --env "$3" "$2""#)
+        .arg("sh")
+        .arg(std::process::id().to_string())
+        .arg(root)
+        .arg(format!("{APP_RELAUNCH_PORT_ENV}={port}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Its own group, so it outlives this process and whatever signals it.
+        .process_group(0)
+        .spawn();
+    match spawned {
+        Ok(_) => std::process::exit(0),
+        Err(err) => err,
+    }
+}
+
+/// The newest version *this* install can move to.
+///
+/// The channel decides which manifest answers, and getting this wrong is
+/// user-visible: the macOS app installs from `macos-app.json`, which is attached
+/// by a separate workflow after the release and legitimately lags (or 404s)
+/// behind the CLI's `dist-manifest.json`. Reporting the CLI's version to an app
+/// install would advertise — and endlessly re-attempt — a build that does not
+/// exist for it. `Ok(None)` means "nothing newer published for this channel".
+pub async fn fetch_latest_for_channel(timeout: Duration) -> Result<Option<LatestRelease>> {
+    match current_channel() {
+        Ok(InstallChannel::AppBundle(_)) => macos_app::fetch_manifest(timeout)
+            .await?
+            .map(|m| {
+                Ok(LatestRelease {
+                    version: Version::parse(&m.version)?,
+                    tag: m.tag,
+                })
+            })
+            .transpose(),
+        #[cfg(target_os = "linux")]
+        Ok(InstallChannel::AppImage(_)) => linux_app::fetch_manifest(timeout)
+            .await?
+            .map(|m| {
+                Ok(LatestRelease {
+                    version: Version::parse(&m.version)?,
+                    tag: m.tag,
+                })
+            })
+            .transpose(),
+        _ => Ok(Some(fetch_latest(timeout).await?)),
+    }
+}
+
+/// Fetches a desktop app's release manifest. `Ok(None)` for a 404 — the expected
+/// state between a release being published and its app build being attached.
+/// That is "nothing to update to yet", never an error the user should see.
+async fn fetch_app_manifest<T: serde::de::DeserializeOwned>(
+    asset: &str,
+    timeout: Duration,
+) -> Result<Option<T>> {
+    let Some(repository) = release_repository() else {
+        return Ok(None);
+    };
+    let url = format!("{repository}/releases/latest/download/{asset}");
+    let res = http()
+        .get(&url)
+        .header("user-agent", UA)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not fetch {asset}: {e}"))?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let status = res.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "{asset} request failed ({} {})",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
+        ));
+    }
+    Ok(Some(serde_json::from_str(&res.text().await?)?))
+}
+
+/// Apply an update right now, on request, ignoring the backoff — a person
+/// asking is a better signal than the timer. Waits for the updater so the caller
+/// can report the outcome, unlike the fire-and-forget background path.
+pub async fn apply_now() -> Result<()> {
+    if opted_out() {
+        return Err(anyhow!(
+            "Updates are switched off for this install (ORX_NO_UPDATE_CHECK / \
+             OPENRESEARCH_CLI_DISABLE_UPDATE)."
+        ));
+    }
+    let out = tokio::time::timeout(APPLY_NOW_TIMEOUT, updater_command()?.output())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "The update is still running after {} minutes. It will finish in the background; \
+                 reopen Settings to see the result.",
+                APPLY_NOW_TIMEOUT.as_secs() / 60
+            )
+        })?
+        .map_err(|e| anyhow!("Could not start the updater: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr.trim();
+        return Err(anyhow!(
+            "The update failed{}",
+            if detail.is_empty() {
+                ".".to_string()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    Ok(())
+}
+
+/// How long a user-initiated update may hold its HTTP request open. Generous
+/// enough for a universal app bundle on a slow link, bounded so the dashboard
+/// request can't hang indefinitely — the updater keeps running past it either
+/// way, and the next status sample reports the result.
+const APPLY_NOW_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One update pass for a process that outlives the invocation-time check in
+/// [`UpdateWarning::start`] — `orx up` and the desktop app can run for days, so
+/// they poll instead.
+///
+/// The check is refreshed even when auto-update is off, so the dashboard can
+/// still tell the user a release exists. The apply itself goes through the same
+/// detached `orx update --background` as the CLI: it takes the updater's file
+/// lock, records its own outcome, and — inside the bundle — routes to the app
+/// updater. Nothing here needs to know which.
+pub async fn periodic_update_pass() {
+    if opted_out() {
+        return;
+    }
+    if let Ok(Some(latest)) = fetch_latest_for_channel(Duration::from_secs(10)).await {
+        write_check_cache(&latest.version.to_string(), &latest.tag);
+    }
+    if !auto_update_eligible() {
+        return;
+    }
+    let cache = read_cache();
+    let outdated = cache
+        .as_ref()
+        .and_then(|c| Version::parse(&c.latest).ok())
+        .is_some_and(|latest| is_outdated(&current_version(), &latest));
+    if outdated && attempt_due(cache.as_ref()) {
+        spawn_background_update();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outdated-version warning
+// ---------------------------------------------------------------------------
+
+/// The leading label every warning message starts with. Shared so the builder
+/// (`warning_for`) and the styler (`render`, which bolds just this label) can't
+/// silently drift apart on a copy edit.
+const WARNING_LABEL: &str = "Warning:";
+
+/// Whether the user has explicitly silenced the update check. When true, no
+/// warning is shown and no background refresh runs — the one escape hatch for
+/// anyone who can't tolerate the extra stderr line (including CI).
+fn opted_out() -> bool {
+    std::env::var_os("ORX_NO_UPDATE_CHECK").is_some()
+        // The generic convention honored by update-notifier and friends.
+        || std::env::var_os("NO_UPDATE_NOTIFIER").is_some()
+        // cargo-dist's own "don't manage updates for this install" switch; the
+        // installer already honors it, so it is the one mental model.
+        || std::env::var("OPENRESEARCH_CLI_DISABLE_UPDATE").as_deref() == Ok("1")
+}
+
+/// Whether to emit ANSI styling on stderr: only when stderr is a real terminal
+/// and the user hasn't set the conventional `NO_COLOR` opt-out. Pipes, files,
+/// and CI logs get plain text — never raw escape codes — which matters because
+/// this warning now prints on non-interactive runs too.
+fn stderr_supports_ansi() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+}
+
+/// Wraps `text` in the ANSI bold sequence when `enabled`, else returns it as-is.
+/// `\x1b[22m` resets bold/faint specifically (not `\x1b[0m`, which would also
+/// clear any surrounding styling the terminal had).
+fn bold(text: &str, enabled: bool) -> String {
+    if enabled {
+        format!("\x1b[1m{text}\x1b[22m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Renders the warning for printing to stderr: bolds the leading `Warning:`
+/// label when `ansi` is set, and sets the whole thing off in its own block with
+/// a blank line above and below. Returns the exact bytes to write (the caller
+/// uses `write!`, not `writeln!`, since the trailing newlines are included).
+fn render(message: &str, ansi: bool) -> String {
+    // The message always begins with WARNING_LABEL (see `warning_for`); bold just
+    // that label, gh/cargo-style, rather than the whole sentence. If the prefix
+    // ever drifts, fall back to the unstyled message — never panic, never emit a
+    // stray escape.
+    let styled = match message.strip_prefix(WARNING_LABEL) {
+        Some(rest) => format!("{}{rest}", bold(WARNING_LABEL, ansi)),
+        None => message.to_string(),
+    };
+    format!("\n{styled}\n\n")
+}
+
+/// Version-precedence key: everything that orders two releases *except* build
+/// metadata. Per the SemVer spec build metadata is not part of precedence
+/// (`1.0.0+a` and `1.0.0+b` are the same release), but `semver::Version`'s `Ord`
+/// compares it anyway — so two builds of the same release would otherwise read
+/// as "outdated". Comparing this key instead avoids that false positive.
+/// `Prerelease`'s own `Ord` already encodes the spec rule that a release sorts
+/// above its pre-releases (empty pre-release is the greatest).
+fn precedence(v: &Version) -> (u64, u64, u64, &semver::Prerelease) {
+    (v.major, v.minor, v.patch, &v.pre)
+}
+
+/// Whether `latest` outranks `current` in [`precedence`] — false when `current`
+/// is already current, or ahead (a local dev build, or the same release with
+/// different build metadata).
+pub(crate) fn is_outdated(current: &Version, latest: &Version) -> bool {
+    precedence(latest) > precedence(current)
+}
+
+/// Builds the outdated-version warning, or `None` when `current` is not behind.
+///
+/// Older CLI builds can miss fixes and compatibility updates, so the warning
+/// explains the reason to upgrade instead of showing a neutral version notice.
+///
+/// When the auto-updater is going to handle it, the message says so instead of
+/// asking for a command the user doesn't need to run: the update is already
+/// downloading and the *next* invocation will be current. Installs orx doesn't
+/// own (cargo/Homebrew/Nix), and anyone who turned auto-update off, keep the
+/// manual instruction.
+fn warning_for(
+    current: &Version,
+    latest: &Version,
+    orx: &str,
+    automatic: bool,
+    tag: Option<&str>,
+) -> Option<String> {
+    if !is_outdated(current, latest) {
+        return None;
+    }
+    let remedy = if automatic {
+        format!("orx is updating to {latest} in the background; your next run will use it.")
+    } else {
+        format!("Run `{orx} update` to upgrade.")
+    };
+    let notes = tag
+        .zip(release_repository())
+        .map(|(tag, repository)| format!(" Release notes: {repository}/releases/tag/{tag}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{WARNING_LABEL} orx {current} is outdated (latest {latest}). A newer VERA release is \
+         available; upgrade to receive the latest fixes. {remedy}{notes}"
+    ))
+}
+
+/// For an agent whose `orx up` predates restarting itself into updates: it keeps
+/// serving the old code, which the version this CLI reports no longer describes.
+fn stale_up_warning() -> Option<String> {
+    let up_version = std::env::var(crate::local::chat::UP_VERSION_ENV)
+        .ok()
+        .and_then(|version| Version::parse(&version).ok());
+    (matches!(crate::local::chat::trusted_up_port(), Ok(Some(_)))
+        && up_version.is_none_or(|version| is_outdated(&version, &current_version())))
+    .then(|| {
+        format!(
+            "{WARNING_LABEL} this session's `orx up` is older than orx {} and still runs its \
+             old code, so runs it launches and sandboxes it builds miss this version's fixes. \
+             Ask the user to restart `orx up` (or click Restart in the dashboard's update \
+             banner) once no chats are running.",
+            current_version()
+        )
+    })
+}
+
+/// The outdated-version warning, modeled on the gh CLI / update-notifier
+/// pattern: the message shown this run comes from the *cached* previous check,
+/// so it is instant and never adds latency to the command. A background refresh
+/// updates the cache for the next run at most once per [`CHECK_TTL`].
+///
+/// Unlike a quiet "new version" nudge, the warning is shown on every command —
+/// piped, scripted, or interactive — and is printed in [`start`](Self::start),
+/// *before* the command runs, so it survives commands that `std::process::exit`
+/// on their own (e.g. the "not logged in" path) instead of returning to `main`.
+/// [`opted_out`] is the single switch to silence it.
+///
+/// Because the message comes from cache, the *first* run after a fresh install
+/// has nothing cached yet and shows nothing; the background refresh it kicks off
+/// warms the cache so a later run can warn. The refresh is always fire-and-forget
+/// — it never blocks the command — so a one-shot environment that throws its
+/// cache away each run (e.g. an ephemeral CI container) may take a few runs to
+/// warm up, or never. That is the accepted cost of adding zero latency.
+pub struct UpdateWarning {
+    refresh: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl UpdateWarning {
+    /// Prints the cached warning (if any) to stderr immediately, hands a pending
+    /// update to a detached updater, then kicks off a best-effort background
+    /// refresh of the cached "latest" for next time. Printing here — rather than
+    /// after the command — is what guarantees the warning shows even when the
+    /// command exits the process itself.
+    pub fn start(may_update: bool) -> UpdateWarning {
+        if let Some(message) = stale_up_warning() {
+            let _ = write!(
+                std::io::stderr(),
+                "{}",
+                render(&message, stderr_supports_ansi())
+            );
+        }
+        if opted_out() {
+            return UpdateWarning { refresh: None };
+        }
+
+        let current = current_version();
+        let cache = read_cache();
+        let cached_latest = cache.as_ref().and_then(|c| Version::parse(&c.latest).ok());
+        // Resolved once: it reads settings.json and canonicalizes the exe, and
+        // both the message and the spawn decision below depend on it.
+        let automatic = cached_latest
+            .as_ref()
+            .is_some_and(|latest| is_outdated(&current, latest))
+            && auto_update_eligible();
+
+        if let Some(message) = cached_latest.as_ref().and_then(|latest| {
+            warning_for(
+                &current,
+                latest,
+                crate::invocation::orx(),
+                automatic,
+                cache
+                    .as_ref()
+                    .map(|c| c.latest_tag.as_str())
+                    .filter(|tag| !tag.is_empty()),
+            )
+        }) {
+            // Infallible: a closed/broken stderr (e.g. `2>&-`, or a reader that
+            // already exited) must not panic the process before the command even
+            // runs. `eprintln!` would; a swallowed `writeln!` won't.
+            let _ = write!(
+                std::io::stderr(),
+                "{}",
+                render(&message, stderr_supports_ansi())
+            );
+        }
+
+        if may_update && automatic && attempt_due(cache.as_ref()) {
+            spawn_background_update();
+        }
+
+        // Refresh whenever the cache is stale (or absent), regardless of whether
+        // stderr is a terminal: scripted/piped runs warn too, so their cache has
+        // to stay fresh or they'd warn off a frozen answer indefinitely.
+        let stale = cache
+            .as_ref()
+            .map(|c| now_unix().saturating_sub(c.checked_at) >= CHECK_TTL.as_secs())
+            .unwrap_or(true);
+        if !stale {
+            return UpdateWarning { refresh: None };
+        }
+
+        let prev_latest = cache.map(|c| (c.latest, c.latest_tag));
+        let handle = tokio::spawn(async move {
+            let latest = fetch_latest_for_channel(Duration::from_secs(3))
+                .await
+                .ok()
+                .flatten()
+                .map(|release| (release.version.to_string(), release.tag));
+            // On fetch failure, refresh checked_at with the old answer so errors
+            // don't cause a retry on every invocation. Only fabricate `current`
+            // as a last resort (no cache, no previous answer): a one-off failed
+            // fetch then suppresses the warning until the TTL lapses, which is
+            // the price of not re-fetching on every offline invocation.
+            let value = latest
+                .or(prev_latest)
+                .unwrap_or_else(|| (current.to_string(), String::new()));
+            write_check_cache(&value.0, &value.1);
+        });
+
+        UpdateWarning {
+            refresh: Some(handle),
+        }
+    }
+
+    /// Called after the real command finished. On an interactive terminal, grants
+    /// the fire-and-forget refresh a brief grace window to land in the cache — it
+    /// has often finished during the command's own work — so the cache is warm for
+    /// the user's *next* command; the window gives the write a chance to commit
+    /// before `#[tokio::main]` tears the runtime down, without which quick commands
+    /// would never warm the cache.
+    ///
+    /// On a non-terminal (pipe, CI, cron) the wait is skipped entirely: an
+    /// ephemeral environment throws its cache away between runs, so warming it
+    /// buys nothing, and a per-invocation 250ms tail across a CI pipeline that
+    /// calls `orx` many times is pure cost. The refresh is still spawned (it may
+    /// land if the process outlives it); we just don't pay to wait for it. Never
+    /// blocks the command meaningfully, never touches stdout or the exit code.
+    pub async fn finish(self) {
+        let Some(handle) = self.refresh else {
+            return;
+        };
+        if !std::io::stderr().is_terminal() {
+            return;
+        }
+        // Timed out -> the task keeps running (it may still land); the next stale
+        // run tries again regardless.
+        let _ = tokio::time::timeout(Duration::from_millis(250), handle).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        app_bundle_root, attempt_backoff, attempt_due, bold, claim_install, detect_channel,
+        exe_matches_prefix, now_unix, package_manager_owns, parse_manifest, portable_dir,
+        portable_outside_prefix, precedence, relaunch_args, release_repository, render,
+        restart_target, retired_path, target_lock_path, warning_for, BackendLock, CheckCache,
+        InstallChannel, UpdateTarget, ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
+    };
+    use semver::Version;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn render_sets_off_the_warning_in_its_own_block() {
+        let msg = "Warning: orx 0.1.0 is outdated (latest 0.2.0). foo Run `orx update` to upgrade.";
+        // Plain (non-TTY): blank line before and after, no escape codes at all.
+        let plain = render(msg, false);
+        assert_eq!(plain, format!("\n{msg}\n\n"));
+        assert!(
+            !plain.contains('\x1b'),
+            "plain output must not contain ANSI"
+        );
+
+        // Styled (TTY): only the "Warning:" label is bolded; same blank-line block.
+        let styled = render(msg, true);
+        assert!(styled.starts_with("\n\x1b[1mWarning:\x1b[22m"));
+        assert!(styled.ends_with("upgrade.\n\n"));
+        // Everything after the label is unstyled — exactly one bold open/close.
+        assert_eq!(styled.matches("\x1b[1m").count(), 1);
+        assert_eq!(styled.matches("\x1b[22m").count(), 1);
+
+        // Fail-soft: a message without the "Warning:" prefix is passed through
+        // unstyled (no panic, no stray escapes), so the label/builder coupling
+        // degrades gracefully if the prefix ever changes.
+        let no_label = render("orx is outdated.", true);
+        assert_eq!(no_label, "\norx is outdated.\n\n");
+    }
+
+    #[test]
+    fn bold_is_a_noop_when_disabled() {
+        assert_eq!(bold("x", false), "x");
+        assert_eq!(bold("x", true), "\x1b[1mx\x1b[22m");
+    }
+
+    #[test]
+    fn precedence_ignores_build_metadata_and_orders_prereleases() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        // Build metadata is not part of precedence: same release.
+        assert_eq!(precedence(&v("1.2.3+a")), precedence(&v("1.2.3+b")));
+        assert_eq!(precedence(&v("1.2.3")), precedence(&v("1.2.3+build.99")));
+        // A release outranks its pre-releases (empty pre-release is greatest).
+        assert!(precedence(&v("0.2.0")) > precedence(&v("0.2.0-rc.1")));
+        assert!(precedence(&v("0.2.0-rc.2")) > precedence(&v("0.2.0-rc.1")));
+        // Ordinary ordering on the numeric fields still holds.
+        assert!(precedence(&v("0.2.0")) > precedence(&v("0.1.29")));
+    }
+
+    // Every outdated case shows the same message; assert its stable markers
+    // without pinning the exact copy.
+    fn assert_warns(msg: &str) {
+        assert!(msg.contains("outdated"), "{msg}");
+        assert!(msg.contains("receive the latest fixes"), "{msg}");
+        assert!(msg.contains("orx update"), "{msg}");
+    }
+
+    #[test]
+    fn no_warning_when_current_or_ahead() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        // Exactly current.
+        assert!(warning_for(&v("0.1.29"), &v("0.1.29"), "orx", false, None).is_none());
+        // Local build ahead of the latest release.
+        assert!(warning_for(&v("0.2.0"), &v("0.1.29"), "orx", false, None).is_none());
+        // Build metadata is ignored by semver ordering, so it's not "outdated".
+        assert!(warning_for(&v("0.1.29"), &v("0.1.29+build.5"), "orx", false, None).is_none());
+        // Running ahead of the latest stable on a local pre-release: not outdated.
+        assert!(warning_for(&v("0.3.0-dev.1"), &v("0.2.0"), "orx", false, None).is_none());
+    }
+
+    #[test]
+    fn warns_on_every_kind_of_outdated_gap() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        // The same warning fires regardless of how far behind: patch, minor,
+        // major, 0.0.x, post-1.0, and a pre-release behind its final release.
+        for (cur, latest) in [
+            ("0.1.28", "0.1.29"),     // pre-1.0 patch
+            ("0.1.29", "0.2.0"),      // pre-1.0 minor
+            ("0.0.1", "0.0.2"),       // 0.0.x patch
+            ("0.9.0", "1.0.0"),       // 0.x -> 1.0
+            ("1.2.3", "1.2.4"),       // post-1.0 patch
+            ("1.2.3", "1.3.0"),       // post-1.0 minor
+            ("1.4.0", "2.0.0"),       // major
+            ("0.2.0-rc.1", "0.2.0"),  // pre-release behind its final release
+            ("0.1.29", "0.2.0-rc.1"), // behind the next minor's pre-release
+        ] {
+            assert_warns(
+                &warning_for(&v(cur), &v(latest), "orx", false, None).unwrap_or_else(|| {
+                    panic!("expected a warning for {cur} -> {latest}");
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn an_automatic_update_is_reported_not_prescribed() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        // Auto-updating installs are told what is happening, not what to run:
+        // the command would be busywork for something already underway.
+        let auto = warning_for(&v("0.1.28"), &v("0.1.29"), "orx", true, None).unwrap();
+        assert!(auto.contains("outdated"), "{auto}");
+        assert!(auto.contains("in the background"), "{auto}");
+        assert!(!auto.contains("Run `orx update`"), "{auto}");
+        // The manual form is unchanged for the channels orx doesn't own.
+        assert_warns(&warning_for(&v("0.1.28"), &v("0.1.29"), "orx", false, None).unwrap());
+
+        let notes = warning_for(
+            &v("0.1.28"),
+            &v("0.1.29"),
+            "orx",
+            false,
+            Some("releases/v0.1.29"),
+        )
+        .unwrap();
+        if let Some(repository) = release_repository() {
+            assert!(
+                notes.contains(&format!("{repository}/releases/tag/releases/v0.1.29")),
+                "{notes}"
+            );
+        } else {
+            assert!(!notes.contains("/releases/tag/"), "{notes}");
+        }
+    }
+
+    #[test]
+    fn old_update_cache_without_tags_still_loads() {
+        let cache: CheckCache =
+            serde_json::from_str(r#"{"checked_at":1,"latest":"0.2.13"}"#).unwrap();
+        assert!(cache.latest_tag.is_empty());
+        assert!(cache.installed_tag.is_empty());
+    }
+
+    #[test]
+    fn attempt_backoff_grows_then_caps() {
+        assert_eq!(attempt_backoff(0), ATTEMPT_BACKOFF_MIN);
+        assert_eq!(attempt_backoff(1), ATTEMPT_BACKOFF_MIN * 2);
+        assert_eq!(attempt_backoff(3), ATTEMPT_BACKOFF_MIN * 8);
+        // Capped, and never panics on a failure count that would overflow the
+        // shift.
+        assert_eq!(attempt_backoff(20), ATTEMPT_BACKOFF_MAX);
+        assert_eq!(attempt_backoff(u32::MAX), ATTEMPT_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn a_deferred_update_is_a_restart_target() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        let mut cache = CheckCache {
+            deferred_version: "0.2.17".into(),
+            deferred_tag: "v0.2.17".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            restart_target(&cache, &v("0.2.16")),
+            Some((v("0.2.17"), "v0.2.17"))
+        );
+        // The newer of installed and deferred wins; neither counts once running.
+        cache.installed_version = "0.2.18".into();
+        assert_eq!(restart_target(&cache, &v("0.2.16")).unwrap().0, v("0.2.18"));
+        assert_eq!(restart_target(&cache, &v("0.2.18")), None);
+    }
+
+    #[test]
+    fn an_updater_defers_only_while_a_backend_holds_its_lock() {
+        let exe = std::env::current_exe().unwrap();
+        let target = UpdateTarget::Portable(exe.parent().unwrap().to_path_buf());
+        let lock = BackendLock::acquire().expect("backend lock beside the test binary");
+        assert!(claim_install(&target).is_none());
+        drop(lock);
+        let claim = claim_install(&target).expect("no backend running");
+        // The claim excludes backends until the install finishes.
+        assert!(claim_install(&target).is_none());
+        drop(claim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renaming_a_new_file_over_an_image_changes_its_identity() {
+        use super::file_identity;
+        let dir = std::env::temp_dir().join(format!("orx-image-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("OpenResearch.AppImage");
+        std::fs::write(&image, "old").unwrap();
+        let start = file_identity(&image);
+        std::fs::write(dir.join("new"), "new").unwrap();
+        std::fs::rename(dir.join("new"), &image).unwrap();
+        assert!(start.is_some() && file_identity(&image) != start);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_installer_update_locks_beside_the_receipts_binary() {
+        let prefix = std::env::temp_dir().join(format!("orx-lock-{}", uuid::Uuid::new_v4()));
+        let target = UpdateTarget::Installer(super::Receipt {
+            install_prefix: prefix.to_string_lossy().into_owned(),
+            version: "0.2.15".into(),
+            modify_path: false,
+        });
+        assert_eq!(
+            target_lock_path(&target),
+            Some(prefix.join(".orx-backend.lock"))
+        );
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        assert_eq!(
+            target_lock_path(&target),
+            Some(prefix.join("bin").join(".orx-backend.lock"))
+        );
+        std::fs::remove_dir_all(&prefix).unwrap();
+    }
+
+    #[test]
+    fn an_attempt_is_due_until_one_is_recorded() {
+        // No cache at all (fresh install): due immediately.
+        assert!(attempt_due(None));
+
+        let cache = |attempted_at, failures| CheckCache {
+            attempted_at,
+            failures,
+            ..Default::default()
+        };
+        // Just attempted: not due, whether it succeeded or failed.
+        assert!(!attempt_due(Some(&cache(now_unix(), 0))));
+        assert!(!attempt_due(Some(&cache(now_unix(), 3))));
+        // A clean cache that has never attempted (attempted_at 0) is due.
+        assert!(attempt_due(Some(&cache(0, 0))));
+        // Past the window for its failure count.
+        let long_ago = now_unix() - ATTEMPT_BACKOFF_MIN.as_secs() - 1;
+        assert!(attempt_due(Some(&cache(long_ago, 0))));
+        // ...but not past the doubled window after two failures.
+        assert!(!attempt_due(Some(&cache(long_ago, 2))));
+    }
+
+    #[test]
+    fn channels_that_orx_does_not_own_never_self_update() {
+        let channel = |exe: &str| detect_channel(Path::new(exe)).unwrap();
+        // The bundle test wins over everything else: the bundled binary has no
+        // receipt, so any later branch would misfile it.
+        let bundle = channel("/Applications/OpenResearch.app/Contents/MacOS/OpenResearch");
+        assert_eq!(bundle.as_str(), "app-bundle");
+        assert!(bundle.self_updates());
+        assert!(matches!(
+            bundle,
+            InstallChannel::AppBundle(root) if root == Path::new("/Applications/OpenResearch.app")
+        ));
+
+        for (exe, want) in [
+            ("/nix/store/abc123-orx/bin/orx", "nix"),
+            ("/opt/homebrew/bin/orx", "homebrew"),
+            ("/usr/local/Cellar/orx/0.1.0/bin/orx", "homebrew"),
+        ] {
+            let channel = channel(exe);
+            assert_eq!(channel.as_str(), want, "{exe}");
+            assert!(!channel.self_updates(), "{exe}");
+        }
+    }
+
+    #[test]
+    fn a_bundle_root_is_the_directory_above_contents() {
+        assert_eq!(
+            app_bundle_root(Path::new(
+                "/Applications/OpenResearch.app/Contents/MacOS/orx"
+            )),
+            Some(PathBuf::from("/Applications/OpenResearch.app"))
+        );
+        // Anything not laid out as a bundle executable.
+        assert_eq!(app_bundle_root(Path::new("/usr/local/bin/orx")), None);
+        assert_eq!(app_bundle_root(Path::new("/a/Contents/orx")), None);
+    }
+
+    #[test]
+    fn a_portable_exe_is_anywhere_nothing_else_manages() {
+        let owned = |dir: &str| package_manager_owns(Path::new(dir));
+        assert!(!owned(r"C:\Users\me\Downloads\orx"));
+        assert!(!owned(r"C:\Users\me\Desktop"));
+        assert!(owned(r"C:\Users\me\scoop\apps\orx\current"));
+        assert!(owned(r"C:\ProgramData\chocolatey\bin"));
+        assert!(owned(
+            r"C:\Users\me\AppData\Local\Microsoft\WinGet\Packages\x"
+        ));
+        assert!(owned(r"C:\Program Files\orx"));
+        assert!(owned(r"C:\Program Files (x86)\orx"));
+        assert!(owned(r"C:\src\openresearch-cli\target\debug"));
+    }
+
+    #[test]
+    fn a_portable_exe_must_carry_the_name_the_zip_ships() {
+        // Forward slashes, so the parent splits the same way off Windows.
+        assert_eq!(
+            portable_dir(Path::new("Downloads/orx.exe")),
+            Some(PathBuf::from("Downloads"))
+        );
+        assert_eq!(portable_dir(Path::new("Downloads/orx-0.2.exe")), None);
+        assert_eq!(portable_dir(Path::new("Downloads/ORX.EXE")), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_the_orx_inside_the_mount_is_the_appimage() {
+        use super::appimage_file;
+        use std::ffi::OsStr;
+        let (appdir, appimage) = (
+            Some(OsStr::new("/tmp/.mount_OpenReAbc")),
+            Some(OsStr::new("/home/me/Applications/OpenResearch.AppImage")),
+        );
+        assert_eq!(
+            appimage_file(
+                Path::new("/tmp/.mount_OpenReAbc/usr/bin/orx"),
+                appdir,
+                appimage
+            ),
+            Some(PathBuf::from("/home/me/Applications/OpenResearch.AppImage"))
+        );
+        // An agent inherits APPDIR, but runs some other orx.
+        assert_eq!(
+            appimage_file(Path::new("/home/me/.cargo/bin/orx"), appdir, appimage),
+            None
+        );
+        assert_eq!(
+            appimage_file(
+                Path::new("/tmp/.mount_OpenReAbc/usr/bin/orx"),
+                None,
+                appimage
+            ),
+            None
+        );
+        for appdir in ["", "/"] {
+            assert_eq!(
+                appimage_file(
+                    Path::new("/home/me/.cargo/bin/orx"),
+                    Some(OsStr::new(appdir)),
+                    appimage
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_desktop_apps_orx_updates_itself_beside_a_cli_install() {
+        // Forward slashes, so the parent splits the same way off Windows.
+        let prefix = Path::new("C:/Users/me/.cargo");
+        let app = Path::new("C:/Users/me/AppData/Local/Programs/OpenResearch/orx.exe");
+        assert_eq!(
+            portable_outside_prefix(app, prefix),
+            Some(PathBuf::from(
+                "C:/Users/me/AppData/Local/Programs/OpenResearch"
+            ))
+        );
+        let cli = Path::new("C:/Users/me/.cargo/bin/orx.exe");
+        assert_eq!(portable_outside_prefix(cli, prefix), None);
+    }
+
+    #[test]
+    fn retired_paths_sit_beside_the_exe_and_never_collide() {
+        let exe = Path::new(r"C:\Users\me\.cargo\bin\orx.exe");
+        let (a, b) = (retired_path(exe), retired_path(exe));
+        for retired in [&a, &b] {
+            let retired = retired.to_string_lossy();
+            assert!(retired.starts_with(r"C:\Users\me\.cargo\bin\orx.exe."));
+            assert!(retired.ends_with(".old"));
+        }
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rewriting_the_receipt_version_keeps_every_other_field() {
+        let dir = std::env::temp_dir().join(format!("orx-receipt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("receipt.json");
+        std::fs::write(
+            &path,
+            r#"{"install_prefix":"C:\\Users\\me\\.cargo","modify_path":false,"version":"0.1.0"}"#,
+        )
+        .unwrap();
+        super::rewrite_receipt_version(&path, "0.2.0").unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(receipt["version"], "0.2.0");
+        assert_eq!(receipt["install_prefix"], r"C:\Users\me\.cargo");
+        assert_eq!(receipt["modify_path"], false);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn relaunch_args_add_no_browser_once() {
+        let args = |list: &[&str]| relaunch_args(list.iter().map(OsString::from));
+        assert_eq!(
+            args(&["up", "--port", "1"]),
+            ["up", "--port", "1", "--no-browser"]
+        );
+        assert_eq!(args(&["up", "--no-browser"]), ["up", "--no-browser"]);
+    }
+
+    #[test]
+    fn parses_dist_manifest() {
+        let body = r#"{
+            "dist_version": "0.32.0",
+            "announcement_tag": "v0.1.15",
+            "announcement_is_prerelease": false,
+            "releases": [{
+                "app_name": "openresearch-cli",
+                "app_version": "0.1.15",
+                "artifacts": ["openresearch-cli-installer.sh"]
+            }]
+        }"#;
+        let latest = parse_manifest(body).unwrap();
+        assert_eq!(latest.tag, "v0.1.15");
+        assert_eq!(latest.version, Version::new(0, 1, 15));
+    }
+
+    #[test]
+    fn manifest_without_our_app_is_an_error() {
+        let body = r#"{"announcement_tag": "v1.0.0", "releases": [{"app_name": "other", "app_version": "1.0.0"}]}"#;
+        assert!(parse_manifest(body).is_err());
+    }
+
+    #[test]
+    fn semver_ordering_not_lexicographic() {
+        // The case string comparison gets wrong.
+        assert!(Version::parse("0.1.15").unwrap() > Version::parse("0.1.9").unwrap());
+    }
+
+    #[test]
+    fn exe_prefix_matching() {
+        let cases = [
+            // cargo-home layout: receipt prefix is the root, binary in bin/.
+            ("/home/u/.cargo/bin/orx", "/home/u/.cargo", true),
+            // flat layout: binary directly in the prefix.
+            ("/opt/orx/orx", "/opt/orx", true),
+            // foreign binary elsewhere on PATH.
+            ("/usr/local/bin/orx", "/home/u/.cargo", false),
+        ];
+        for (exe, prefix, want) in cases {
+            assert_eq!(
+                exe_matches_prefix(Path::new(exe), Path::new(prefix)),
+                want,
+                "exe={} prefix={}",
+                exe,
+                prefix
+            );
+        }
+    }
+}

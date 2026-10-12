@@ -1,0 +1,57 @@
+import { m } from "../paraglide/messages.js";
+import { useState } from "react";
+import { Button } from "./ui";
+
+/** Paste a secret with a link to where it comes from — an Overleaf Git token
+ * by default, or whatever `createLabel` names. */
+export function TokenForm<T>({
+  save,
+  onSaved,
+  placeholder,
+  createHref,
+  createLabel,
+}: {
+  save: (token: string) => Promise<T>;
+  onSaved: (result: T) => void;
+  placeholder: string;
+  createHref: string;
+  createLabel?: string;
+}) {
+  const [token, setToken] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (saving || !token.trim()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      onSaved(await save(token.trim()));
+      setToken("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form className="onb-token-form flex items-center flex-wrap gap-2 mt-2 [&_input]:flex-1 [&_input]:min-w-55 [&_input]:text-sm [&_a]:text-sm [&_a]:text-subtext [&_a]:whitespace-nowrap [&_.error]:basis-full [&_.error]:text-accent-red [&_.error]:text-sm [&_.error]:whitespace-pre-wrap" onSubmit={submit}>
+      <input
+        type="password"
+        value={token}
+        onChange={(e) => setToken(e.target.value)}
+        placeholder={placeholder}
+        autoComplete="off"
+     />
+      <Button type="submit" disabled={saving || !token.trim()}>
+        {saving ? m.common_saving() : m.common_save()}
+      </Button>
+      <a href={createHref} target="_blank" rel="noreferrer">
+        {createLabel ?? m.git_token_form_create_a_token()}
+      </a>
+      {error && <div className="error">{error}</div>}
+    </form>
+  );
+}

@@ -1,0 +1,732 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getHarnessesQuery } from "../queries/settings";
+import { m } from "../paraglide/messages.js";
+import { ltr } from "../i18n";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Lock, Plus, Settings, Zap } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import {
+  fmtNumber,
+  harnessModelLabel,
+  modelLabel,
+  reasoningFor,
+  reconcileReasoning,
+  reconcileServiceTier,
+  REASONING_DEFAULT_ID,
+  serviceTiersFor,
+  type Harness,
+  type HarnessId,
+  type OptionChoice,
+  type AgentSelection,
+  type Autonomy,
+  DEFAULT_AUTONOMY,
+} from "../api";
+import { renderNote } from "./agentNote";
+import { HarnessLogo } from "./HarnessLogo";
+
+import { IconButton, MenuItem } from "./ui";
+import { cn } from "./ui/cn";
+
+import { LocalModelSetup } from "./LocalModelSetup";
+
+const MODEL_GROUP_CLASS_NAME = [
+  "model-group flex items-center justify-between gap-2",
+  "text-sm font-medium text-text pt-2.5 px-2 pb-1.5",
+].join(" ");
+
+const MODEL_MORE_CLASS_NAME = [
+  "model-more [&_code]:font-mono [&_code]:text-xs",
+  "[&_code]:bg-panel [&_code]:border [&_code]:border-border-variant",
+  "[&_code]:rounded-xs [&_code]:py-px [&_code]:px-[5px] [&_code]:whitespace-nowrap",
+  "pt-1 px-2 pb-2 text-sm text-muted",
+].join(" ");
+
+export type ModelSelection = AgentSelection;
+
+export const HARNESS_LABELS: Record<HarnessId, string> = {
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  opencode: "OpenCode",
+  cursor: "Cursor",
+  antigravity: "Google Antigravity",
+};
+
+/** First harness that can actually run — the fallback when nothing is picked.
+ * Seeds mode/reasoning from that harness's advertised defaults. */
+export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
+  const ready = harnesses.find((h) => h.agentReady);
+  if (!ready) return null;
+  // Seed the catalog's first model — the catalogs are CLI-discovered now, so
+  // it's a real, current id. Custom providers advertise no models; they seed
+  // null (= send no `--model`, the CLI uses whatever it is configured with).
+  const model = ready.models[0]?.id ?? null;
+  return {
+    harness: ready.id,
+    model,
+    serviceTier: reconcileServiceTier(ready, model, null),
+    permissionMode: ready.options?.defaultPermissionMode ?? null,
+    reasoningLevel: reasoningFor(ready, model).defaultId,
+  };
+}
+
+/** Close-on-outside-click + open state shared by the composer dropdowns (and
+ * the session-rail menus). */
+export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (e.target instanceof Node && !ref.current?.contains(e.target) && !triggerRef?.current?.contains(e.target)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      // Escape closes the picker and must NOT bubble to other document-level
+      // Escape handlers (e.g. ChatPanel's stop-streaming listener) — closing an
+      // open picker shouldn't also interrupt an in-flight turn. Capture phase +
+      // stopPropagation makes this order-independent: relying on registration
+      // order and defaultPrevented among bubble-phase document listeners is
+      // fragile, since whichever registered first runs first.
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(false);
+        triggerRef?.current?.focus();
+      }
+    };
+    document.addEventListener("mousedown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+  }, [open, triggerRef]);
+  return { open, setOpen, ref };
+}
+
+/** Composer selector: pick the harness + model new sessions (and same-harness
+ * turns) run on. Groups mirror the Harnesses settings tab. */
+export function ModelPicker({
+  value,
+  onSelect,
+  onOpenSettings,
+  permissionChoices = [],
+  defaultPermissionId,
+  onSelectPermission,
+  reasoningChoices = [],
+  defaultReasoningId,
+  onSelectReasoning,
+  autonomy,
+  onSelectAutonomy,
+  lockHarness = false,
+  showServiceTier = true,
+  disabled = false,
+  openRequest = 0,
+  className,
+  compact = false,
+  modelHeading,
+  effortHeading,
+  helpText,
+}: {
+  value: ModelSelection | null;
+  onSelect: (value: ModelSelection) => void;
+  onOpenSettings?: () => void;
+  permissionChoices?: OptionChoice[];
+  defaultPermissionId?: string | null;
+  onSelectPermission?: (id: string) => void;
+  reasoningChoices?: OptionChoice[];
+  defaultReasoningId?: string | null;
+  onSelectReasoning?: (id: string) => void;
+  autonomy?: Autonomy;
+  onSelectAutonomy?: (autonomy: Autonomy) => void;
+  /** Hide service-speed choices when the workspace only exposes model and effort. */
+  showServiceTier?: boolean;
+  disabled?: boolean;
+  /** When set (a session is open), only the current harness is offered — its
+   * harness is fixed for its lifetime, so you can still switch models within it
+   * but not switch to a different harness. */
+  lockHarness?: boolean;
+  /** Bumped to open the picker from elsewhere (the composer's `/model`). */
+  openRequest?: number;
+  className?: string;
+  /** Icon-only trigger for a collapsed workspace sidebar. */
+  compact?: boolean;
+  modelHeading?: string;
+  effortHeading?: string;
+  helpText?: string;
+}) {
+  const { data: harnesses = EMPTY_HARNESSES } = useQuery(getHarnessesQuery());
+  const queryClient = useQueryClient();
+  const [addingLocalModel, setAddingLocalModel] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const submenuHeaderRef = useRef<HTMLButtonElement>(null);
+  const { open, setOpen, ref: rootRef } = usePopover(triggerRef);
+  const [filter, setFilter] = useState("");
+  const [page, setPage] = useState<"root" | "models" | "reasoning" | "speed" | "permissions" | "autonomy">("root");
+
+  const close = () => {
+    setOpen(false);
+    setPage("root");
+    setFilter("");
+  };
+
+  // Seeded with the mount value so a remount doesn't replay an old request.
+  const handledOpenRequest = useRef(openRequest);
+  useEffect(() => {
+    if (openRequest === handledOpenRequest.current) return;
+    handledOpenRequest.current = openRequest;
+    setPage("models");
+    setFilter("");
+    setOpen(true);
+  }, [openRequest, setOpen]);
+
+  useEffect(() => {
+    if (open && (page === "reasoning" || page === "speed" || page === "permissions")) {
+      submenuHeaderRef.current?.focus();
+    }
+  }, [open, page]);
+
+  const groups = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    // Locked to the open session's harness: only offer that one.
+    const shown =
+      lockHarness && value ? harnesses.filter((h) => h.id === value.harness) : harnesses;
+    return shown.map((h) => {
+      let models = h.models;
+      if (q) models = models.filter((m) => `${m.id} ${harnessModelLabel(m)}`.toLowerCase().includes(q));
+      // Large catalogs stay behind the filter box.
+      else if (h.id === "opencode" || h.id === "cursor" || h.id === "antigravity") models = models.slice(0, 5);
+      return { harness: h, models, hidden: q ? 0 : h.models.length - models.length };
+    });
+  }, [harnesses, filter, lockHarness, value]);
+
+  /** Switch harness → reseed mode defaults for that harness.
+   *
+   * Reasoning is reconciled against the *newly selected model* in both cases:
+   * choices are per-model now, so an effort the previous model allowed may not
+   * exist on this one (`ultra` on Sol → 5.5). Keeping it would send a value the
+   * model rejects, so it falls back to that model's default. */
+  const pick = (harness: Harness, model: string | null) => {
+    const sameHarness = value?.harness === harness.id;
+    onSelect({
+      harness: harness.id,
+      model,
+      serviceTier: reconcileServiceTier(
+        harness,
+        model,
+        sameHarness ? value?.serviceTier : null,
+      ),
+      permissionMode: sameHarness
+        ? value!.permissionMode
+        : harness.options?.defaultPermissionMode ?? null,
+      reasoningLevel: reconcileReasoning(
+        harness,
+        model,
+        sameHarness && harness.models.some((entry) => entry.id === model)
+          ? value!.reasoningLevel
+          : null,
+      ),
+    });
+    close();
+  };
+
+  // Pill label: prefer the catalog's own name for the selected model (the
+  // Claude aliases like `opus[1m]` are meaningless prettified).
+  const selected =
+    value?.model != null
+      ? harnesses
+        .find((h) => h.id === value.harness)
+        ?.models.find((m) => m.id === value.model)
+      : undefined;
+  const label = value
+    ? value.model
+      ? selected
+        ? harnessModelLabel(selected)
+        : `${modelLabel(value.model)} · ${m.model_picker_unverified()}`
+      : m.model_picker_default_model()
+    : m.model_picker_model();
+  const effectiveReasoningId = value?.reasoningLevel ?? defaultReasoningId ?? reasoningChoices[0]?.id;
+  const reasoningLabel = reasoningChoices.find((choice) => choice.id === effectiveReasoningId)?.label;
+  const effectivePermissionId = value?.permissionMode ?? defaultPermissionId ?? permissionChoices[0]?.id;
+  const permissionLabel = permissionChoices.find((choice) => choice.id === effectivePermissionId)?.label;
+  const reasoningAxisLabel = effortHeading ?? (value?.harness === "opencode" ? m.model_picker_variant() : m.model_picker_effort());
+  const selectedHarness = harnesses.find((harness) => harness.id === value?.harness);
+  const speedChoices = showServiceTier ? serviceTiersFor(selectedHarness, value?.model) : [];
+  const effectiveServiceTier = reconcileServiceTier(
+    selectedHarness,
+    value?.model,
+    value?.serviceTier,
+  );
+  const speedLabel = speedChoices.find((choice) => choice.id === effectiveServiceTier)?.label;
+
+  const chooseReasoning = (id: string) => {
+    onSelectReasoning?.(id);
+    close();
+  };
+
+  const choosePermission = (id: string) => {
+    onSelectPermission?.(id);
+    close();
+  };
+
+  const autonomyChoices: (OptionChoice & { id: Autonomy })[] = [
+    {
+      id: "agentic",
+      label: m.model_picker_autonomy_agentic(),
+      description: m.model_picker_autonomy_agentic_description(),
+    },
+    {
+      id: "copilot",
+      label: m.model_picker_autonomy_copilot(),
+      description: m.model_picker_autonomy_copilot_description(),
+    },
+  ];
+  const autonomyLabel = autonomyChoices.find((choice) => choice.id === autonomy)?.label;
+
+  const chooseAutonomy = (id: string) => {
+    const choice = autonomyChoices.find((candidate) => candidate.id === id);
+    if (choice) onSelectAutonomy?.(choice.id);
+    close();
+  };
+
+  const chooseSpeed = (id: string) => {
+    if (value) onSelect({ ...value, serviceTier: id });
+    close();
+  };
+
+  const menuRow = (
+    title: string,
+    detail: string | undefined,
+    next: typeof page,
+  ) => (
+    <button
+      type="button"
+      className="model-root-row flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-start text-sm text-text hover:bg-surface"
+      aria-haspopup="menu"
+      onClick={() => setPage(next)}
+    >
+      <span className="flex-1">{title}</span>
+      {detail && <span className="max-w-36 truncate text-sm text-muted">{detail}</span>}
+      <ChevronRight size={14} className="shrink-0 text-muted" />
+    </button>
+  );
+
+  const submenuHeader = (title: string) => (
+    <div className="flex shrink-0 items-center border-b border-border-variant px-1 py-1">
+      <IconButton
+        ref={submenuHeaderRef}
+        type="button"
+        size="small"
+        className="model-submenu-header"
+        aria-label={m.plan_strip_back()}
+        onClick={() => {
+          setPage("root");
+          setFilter("");
+        }}
+      >
+        <ChevronLeft size={15} />
+      </IconButton>
+      <span className="min-w-0 flex-1 text-sm font-medium text-text">{title}</span>
+      {page === "models" && onOpenSettings && (
+        <IconButton
+          type="button"
+          size="small"
+          aria-label={m.settings_page_harnesses()}
+          onClick={() => { close(); onOpenSettings(); }}
+        >
+          <Settings size={15} aria-hidden="true" />
+        </IconButton>
+      )}
+    </div>
+  );
+
+  const choiceList = (
+    choices: OptionChoice[],
+    effectiveId: string | undefined,
+    defaultId: string | null | undefined,
+    choose: (id: string) => void,
+  ) => (
+    <div className="model-menu-list overflow-y-auto p-1.5">
+      {choices.map((choice) => (
+        <MenuItem key={choice.id} active={choice.id === effectiveId} aria-pressed={choice.id === effectiveId} onClick={() => choose(choice.id)}>
+          <span className="flex min-w-0 flex-col items-start gap-0.5">
+            <span>
+              {choice.label}
+              {choice.id === defaultId && (
+                <span className="font-normal text-muted"> {m.model_picker_default()}</span>
+              )}
+            </span>
+            {choice.description && (
+              <span className="max-w-72 text-sm font-normal leading-snug text-muted">
+                {choice.description}
+              </span>
+            )}
+          </span>
+          {choice.id === effectiveId && <Check size={13} />}
+        </MenuItem>
+      ))}
+    </div>
+  );
+
+  return (
+    <div className="model-picker relative inline-flex min-w-0" data-onboarding="model-picker" ref={rootRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        disabled={disabled}
+        className={cn(
+          "composer-pill inline-flex h-8 min-w-0 max-w-full items-center gap-[5px] rounded-md px-2 text-sm text-text whitespace-nowrap transition-[background,color] duration-150 ease-standard hover:bg-surface",
+          compact && "model-picker-compact w-9 justify-center p-0",
+          className,
+        )}
+        title={m.a11y_chat_model({ label: `${label}${reasoningLabel ? ` · ${reasoningLabel}` : ""}${speedLabel ? ` · ${speedLabel}` : ""}` })}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => {
+          if (open) close();
+          else {
+            setPage("root");
+            setOpen(true);
+          }
+        }}
+      >
+        {effectiveServiceTier === "priority" ? (
+          <Zap size={14} fill="currentColor" aria-hidden="true" />
+        ) : value?.harness ? (
+          <HarnessLogo harness={value.harness} size={compact ? 18 : 14} />
+        ) : null}
+        {effectiveServiceTier === "priority" && <span className="sr-only">{m.model_picker_fast_speed()} </span>}
+        <span className={cn("model-picker-label min-w-0 overflow-hidden text-ellipsis whitespace-nowrap", compact && "sr-only")}>
+          {label}
+          {reasoningLabel && <span className="model-picker-reasoning ms-1 text-muted">{reasoningLabel}</span>}
+        </span>
+        {!compact && <ChevronDown size={14} className="shrink-0 text-muted" />}
+      </button>
+      {open && (
+        <div className={`model-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-100 flex flex-col bg-background border border-border rounded-md shadow-dropdown z-50 overflow-hidden w-72 [&.align-right]:start-auto [&.align-right]:end-0 [&_input]:rounded-none [&_input]:border-0 [&_input]:border-b [&_input]:border-b-border-variant [&_input]:bg-none [&_input]:bg-transparent [&_input]:py-2 [&_input]:px-2.5 [&_input]:text-sm [&_input]:outline-none ${compact ? "" : "align-right"}`}>
+          {page === "root" && (
+            <div className="model-root-menu p-1">
+              {helpText && <p className="model-menu-help m-0 border-b border-border-variant px-2 py-2 text-xs text-subtext">{helpText}</p>}
+              {menuRow(modelHeading ?? m.model_picker_model(), label, "models")}
+              {reasoningChoices.length > 0 && menuRow(reasoningAxisLabel, reasoningLabel, "reasoning")}
+              {speedChoices.length > 0 && menuRow(m.model_picker_speed(), speedLabel, "speed")}
+              {permissionChoices.length > 0 && menuRow(m.model_picker_mode(), permissionLabel, "permissions")}
+              {onSelectAutonomy && menuRow(m.model_picker_autonomy(), autonomyLabel, "autonomy")}
+            </div>
+          )}
+          {page === "models" && (
+            <>
+              {submenuHeader(modelHeading ?? m.model_picker_model())}
+              <input
+                autoFocus
+                type="text"
+                placeholder={m.model_picker_search_or_enter_id()}
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+              />
+              <div className="model-menu-list overflow-y-auto p-1.5">
+                {groups.map(({ harness, models, hidden }) => (
+                  <div key={harness.id} className="[&_.model-item]:ps-6">
+                    <div className={MODEL_GROUP_CLASS_NAME}>
+                      <span className="inline-flex items-center gap-1.5">
+                        <HarnessLogo harness={harness.id} size={14} />
+                        {harness.name}
+                      </span>
+                      {!harness.agentReady && (
+                        <span className="model-group-status inline-flex items-center gap-1 text-accent-amber font-normal">
+                          {harness.catalogPending ? m.onboarding_checking() : <><Lock size={10} /> {m.model_picker_unavailable()}</>}
+                        </span>
+                      )}
+                    </div>
+                    {!harness.agentReady ? (
+                      <div className="model-more [&_code]:font-mono [&_code]:text-xs [&_code]:bg-panel [&_code]:border [&_code]:border-border-variant [&_code]:rounded-xs [&_code]:py-px [&_code]:px-[5px] [&_code]:whitespace-nowrap pt-1 px-2 pb-2 text-sm text-muted model-unavailable leading-normal border-b border-b-border-variant">
+                        {harness.catalogPending ? m.onboarding_checking() : harness.agentNote ? renderNote(harness.agentNote) : m.model_picker_not_available()}
+                      </div>
+                    ) : (
+                      <>
+                        {!filter.trim() && (
+                          <MenuItem onClick={() => pick(harness, null)}>
+                            <span>{m.model_picker_default_model()}</span>
+                            {value?.harness === harness.id && value?.model === null && (
+                              <Check size={13} />
+                            )}
+                          </MenuItem>
+                        )}
+                        {harness.models.length === 0 && harness.agentNote && (
+                          <div className={MODEL_MORE_CLASS_NAME}>{renderNote(harness.agentNote)}</div>
+                        )}
+                        {models.map((m) => (
+                          <MenuItem
+                            key={m.id}
+
+                            title={m.id}
+                            onClick={() => pick(harness, m.id)}
+                          >
+                            <span>{harnessModelLabel(m)}</span>
+                            {value?.harness === harness.id && value?.model === m.id && (
+                              <Check size={13} />
+                            )}
+                          </MenuItem>
+                        ))}
+                        {/* An explicit ID is passed to the CLI without claiming availability. */}
+                        {filter.trim().length > 0 &&
+                          !harness.models.some((m) => m.id === filter.trim()) && (
+                            <MenuItem
+                              onClick={() => pick(harness, filter.trim())}
+                            >
+                              <span>
+                                {m.model_picker_use_id({ id: ltr(filter.trim()) })} · {m.model_picker_unverified()}
+                              </span>
+                            </MenuItem>
+                          )}
+                      </>
+                    )}
+                    {harness.id === "opencode" && (
+                      <MenuItem type="button" className="font-medium" aria-haspopup="dialog" onClick={() => {
+                        close();
+                        triggerRef.current?.focus();
+                        setAddingLocalModel(true);
+                      }}>
+                        <span className="inline-flex items-center gap-1.5">
+                          {m.model_picker_add_local_model()}<Plus size={14} aria-hidden="true" />
+                        </span>
+                      </MenuItem>
+                    )}
+                    {harness.agentReady && hidden > 0 && (
+                      <div className={MODEL_MORE_CLASS_NAME}>{m.model_picker_more({ count: fmtNumber(hidden) })}</div>
+                    )}
+                  </div>
+                ))}
+                {harnesses.length === 0 && <div className={MODEL_MORE_CLASS_NAME}>{m.model_picker_detecting_harnesses()}</div>}
+              </div>
+              {lockHarness && value && harnesses.length > 1 && (
+                <div className="model-locked-note py-[7px] px-3 text-sm text-muted border-t border-t-border-variant">
+                  <Lock size={11} className="inline-block align-baseline me-1" aria-hidden="true" />
+                  {m.model_picker_sessions_keep_their_harness_new_chat_to_switch()}
+                </div>
+              )}
+            </>
+          )}
+          {page === "reasoning" && (
+            <>
+              {submenuHeader(reasoningAxisLabel)}
+              {choiceList(reasoningChoices, effectiveReasoningId, defaultReasoningId, chooseReasoning)}
+            </>
+          )}
+          {page === "permissions" && (
+            <>
+              {submenuHeader(m.model_picker_mode())}
+              {choiceList(permissionChoices, effectivePermissionId, defaultPermissionId, choosePermission)}
+            </>
+          )}
+          {page === "autonomy" && (
+            <>
+              {submenuHeader(m.model_picker_autonomy())}
+              {choiceList(autonomyChoices, autonomy, DEFAULT_AUTONOMY, chooseAutonomy)}
+            </>
+          )}
+          {page === "speed" && (
+            <>
+              {submenuHeader(m.model_picker_speed())}
+              {choiceList(speedChoices, effectiveServiceTier ?? undefined, "default", chooseSpeed)}
+            </>
+          )}
+        </div>
+      )}
+      {addingLocalModel && (
+          <LocalModelSetup dialogOnly installed={harnesses.find((harness) => harness.id === "opencode")?.installed ?? false}
+            onClose={() => setAddingLocalModel(false)}
+            onConnected={(model) => {
+              const harness = queryClient.getQueryData(getHarnessesQuery().queryKey)?.find((harness) => harness.id === "opencode");
+              if (harness && (!lockHarness || value?.harness === "opencode")) pick(harness, model);
+            }} />
+      )}
+    </div>
+  );
+}
+
+/** A compact single-axis dropdown (permission mode or reasoning level). Renders
+ * nothing when the harness advertises no choices for this axis. Mirrors the
+ * Claude Code composer menu: a header, the current-default row pinned at top
+ * with a "· Default" note, then the full numbered list. */
+export function OptionPicker({
+  choices,
+  value,
+  defaultId,
+  header,
+  align = "left",
+  dropDown = false,
+  disabled = false,
+  variant = "pill",
+  title,
+  numbered = false,
+  searchPlaceholder,
+  renderIcon,
+  renderLabel,
+  floating = false,
+  onSelect,
+  className,
+}: {
+  choices: OptionChoice[];
+  value: string | null;
+  /** The harness's default id — pinned at top of the menu and used when
+   * `value` is null. */
+  defaultId?: string | null;
+  /** Group header (e.g. "Mode"). */
+  header?: string;
+  align?: "left" | "right";
+  dropDown?: boolean;
+  disabled?: boolean;
+  /** `pill` = compact composer control; `bare` = text-only; `field` = settings input. */
+  variant?: "pill" | "bare" | "field";
+  title?: string;
+  /** Show 1-based number hints on the right (like the mode menu). */
+  numbered?: boolean;
+  searchPlaceholder?: string;
+  renderIcon?: (choice: OptionChoice) => ReactNode;
+  renderLabel?: (choice: OptionChoice) => ReactNode;
+  floating?: boolean;
+  onSelect: (id: string) => void;
+  className?: string;
+}) {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const { open, setOpen, ref } = usePopover(buttonRef);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [filter, setFilter] = useState("");
+  useLayoutEffect(() => {
+    const menu = menuRef.current;
+    const anchor = ref.current;
+    if (!open || !floating || !menu || !anchor) return;
+    if (!menu.matches(":popover-open")) {
+      menu.showPopover();
+      menu.querySelector("input")?.focus();
+    }
+    const position = () => {
+      const bounds = anchor.getBoundingClientRect();
+      const below = window.innerHeight - bounds.bottom - 12;
+      const above = bounds.top - 12;
+      const needed = Math.min(380, menu.scrollHeight);
+      const downward = dropDown ? below >= needed || below >= above : above < needed && below > above;
+      menu.style.width = `${bounds.width}px`;
+      menu.style.minWidth = "0";
+      menu.style.maxHeight = `${Math.max(0, Math.min(380, downward ? below : above))}px`;
+      menu.style.left = `${bounds.left}px`;
+      menu.style.top = `${downward ? bounds.bottom + 4 : bounds.top - menu.getBoundingClientRect().height - 4}px`;
+    };
+    position();
+    window.addEventListener("resize", position);
+    window.addEventListener("scroll", position, true);
+    return () => {
+      window.removeEventListener("resize", position);
+      window.removeEventListener("scroll", position, true);
+    };
+  }, [open, floating, dropDown, filter, choices.length, ref]);
+  if (choices.length === 0) return null;
+
+  const effectiveId = value ?? defaultId ?? choices[0]?.id ?? null;
+  const current = choices.find((c) => c.id === effectiveId);
+  const defaultChoice = choices.find((c) => c.id === defaultId);
+  // Only the `default` sentinel gets pinned above a separator — it isn't a
+  // point on the tier ramp, it's a different kind of choice (Claude's Adaptive,
+  // opencode's "let the model decide"). A *concrete* default (codex's resolved
+  // tier, a permission mode) stays inline in its natural position with just
+  // the "· Default" marker, so the ramp reads in order.
+  const pinned =
+    variant === "bare" && defaultChoice?.id === REASONING_DEFAULT_ID
+      ? defaultChoice
+      : undefined;
+  const rest = pinned ? choices.filter((c) => c.id !== pinned.id) : choices;
+  const visible = rest.filter((c) => `${c.label} ${c.id}`.toLowerCase().includes(filter.toLowerCase()));
+  const label = current?.label ?? choices[0]?.label ?? "";
+
+  const choose = (id: string) => {
+    onSelect(id);
+    setOpen(false);
+    buttonRef.current?.focus();
+  };
+
+  return (
+    <div className={`option-picker relative inline-flex${variant === "field" ? " w-full" : ""}`} ref={ref}>
+      <button
+        ref={buttonRef}
+        type="button"
+        className={cn(
+          variant === "field"
+            ? "inline-flex h-9 w-full items-center justify-between gap-2 rounded-md border border-border bg-background px-3 text-sm font-normal text-text transition-colors duration-120 ease-standard hover:bg-surface disabled:opacity-45"
+            : `inline-flex h-8 items-center rounded-md transition-[background,color] duration-150 ease-standard hover:bg-surface ${variant === "pill" ? "composer-pill gap-[5px] px-2 text-sm text-text whitespace-nowrap" : "composer-bare gap-[3px] px-1 text-sm text-text"}`,
+          className,
+        )}
+        title={title}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => { setFilter(""); setOpen((v) => !v); }}
+      >
+        <span className="inline-flex min-w-0 items-center gap-2">
+          {current && renderIcon?.(current)}
+          <span className="truncate">{current ? renderLabel?.(current) ?? label : label}</span>
+        </span>
+        <ChevronDown size={12} />
+      </button>
+      {open && (
+        <div ref={menuRef} popover={floating ? "manual" : undefined}
+          style={floating ? { position: "fixed", inset: "auto", margin: 0 } : undefined}
+          className={`option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 ${choices.some((choice) => choice.description) ? "min-w-80" : ""} ${variant === "field" ? "min-w-full text-text" : ""} ${align === "right" ? "align-right" : ""} ${dropDown ? "drop-down" : ""}`}>
+          {header && <div className={MODEL_GROUP_CLASS_NAME}>{header}</div>}
+          {searchPlaceholder && <input autoFocus aria-label={searchPlaceholder} placeholder={searchPlaceholder} value={filter} onChange={(e) => setFilter(e.target.value)} className="shrink-0 border-b border-border bg-background px-2 py-2 text-sm outline-none" />}
+          <div className="min-h-0 overflow-y-auto">
+          {pinned && (
+            <>
+              <MenuItem type="button" onClick={() => choose(pinned.id)}>
+                <span className="inline-flex items-center gap-2">
+                  {renderIcon?.(pinned)}
+                  <span>
+                    {renderLabel?.(pinned) ?? pinned.label}
+                    {/* An unnamed sentinel's label already IS "Default", so the
+                        usual marker would read "Default · Default" — say where
+                        the behavior comes from instead. A named one ("Adaptive")
+                        gets the standard marker. */}
+                    <span className="option-default text-muted font-normal">
+                      {m.model_picker_cli_configuration()}
+                    </span>
+                  </span>
+                </span>
+                {effectiveId === pinned.id && <Check size={13} />}
+              </MenuItem>
+              <div className="option-sep h-px my-[5px] mx-1 bg-border-variant" />
+            </>
+          )}
+          {visible.map((c, i) => (
+            <MenuItem type="button" key={c.id} onClick={() => choose(c.id)}>
+              <span className="flex min-w-0 items-center gap-2">
+                {renderIcon?.(c)}
+                <span className="flex min-w-0 flex-col items-start gap-0.5">
+                  <span>
+                    {renderLabel?.(c) ?? c.label}
+                    {/* A concrete default renders inline, in ramp order, with just
+                        the marker — it's one of the tiers, not a separate kind of
+                        choice like the pinned sentinel above. */}
+                    {!pinned && c.id === defaultId && (
+                      <span className="option-default text-muted font-normal"> {m.model_picker_default()}</span>
+                    )}
+                  </span>
+                  {c.description && (
+                    <span className="max-w-68 text-sm font-normal leading-snug text-muted">
+                      {c.description}
+                    </span>
+                  )}
+                </span>
+              </span>
+              {effectiveId === c.id ? (
+                <Check size={13} />
+              ) : (
+                numbered && <span className="option-num text-muted text-xs tabular-nums">{i + 1}</span>
+              )}
+            </MenuItem>
+          ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const EMPTY_HARNESSES: Harness[] = [];

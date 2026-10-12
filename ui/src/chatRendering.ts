@@ -1,0 +1,173 @@
+import type { ChatMessage, ChatPart, ChatSession } from "./api";
+
+export function pendingQuestionId(
+  messages: ChatMessage[],
+  harness: ChatSession["harness"] | undefined,
+  busy: boolean,
+): string | null {
+  if (harness !== "claude-code" && harness !== "codex" && harness !== "opencode") return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    for (const part of messages[i].parts) {
+      if (part.type !== "prompt" || part.prompt?.resolved || part.prompt?.kind !== "question") continue;
+      if (part.prompt.nativeId && !busy) return null;
+      return part.id;
+    }
+  }
+  return null;
+}
+
+/** Whether a part paints anything in the transcript. */
+export function partIsVisible(part: ChatPart, activePermissionId?: string | null): boolean {
+  // The persisted marker still delimits stopped turns for history consumers.
+  if (part.type === "tool" && part.tool?.toLowerCase() === "interrupted") return false;
+  if (part.type === "prompt") {
+    if (!part.prompt) return false;
+    if (part.prompt.kind === "permission") {
+      if (part.prompt.resolved) return false;
+      // Without a selected prompt, keep unresolved permissions visible as tail boundaries.
+      if (activePermissionId !== undefined) return part.id === activePermissionId;
+    }
+    return true;
+  }
+  // Hidden reasoning must not displace a visible tool tail during brief thinking bursts.
+  if (part.type === "reasoning") return false;
+  if (part.type === "text") return Boolean(part.text);
+  return true;
+}
+
+export function isTurnStatusPart(part: ChatPart): boolean {
+  return part.id === "turn-retry" || part.id === "turn-recovery";
+}
+
+export function withoutDuplicateTurnError(parts: ChatPart[], turnStatus: ChatPart | undefined): ChatPart[] {
+  const last = parts.at(-1);
+  return turnStatus?.id === "turn-recovery" && last?.type === "tool" && last.tool === "error"
+    && last.state?.error && last.state.error === turnStatus.state?.error ? parts.slice(0, -1) : parts;
+}
+
+/** The last visible part, when it is a non-errored tool. */
+export function partsTailToolId(parts: ChatPart[]): string | null {
+  for (let index = parts.length - 1; index >= 0; index--) {
+    const part = parts[index];
+    if (part.type === "steer" || isTurnStatusPart(part) || !partIsVisible(part)) continue;
+    if (part.type !== "tool" || part.state?.status === "error") return null;
+    return part.id;
+  }
+  return null;
+}
+
+export function streamTailTool(messages: ChatMessage[]): { messageId: string; toolId: string } | null {
+  const message = messages.at(-1);
+  if (message?.role !== "assistant") return null;
+  const toolId = partsTailToolId(message.parts);
+  return toolId ? { messageId: message.id, toolId } : null;
+}
+
+export function streamTailIsText(messages: ChatMessage[]): boolean {
+  const message = messages.at(-1);
+  if (message?.role !== "assistant") return false;
+  for (let index = message.parts.length - 1; index >= 0; index--) {
+    const part = message.parts[index];
+    if (part.type === "steer" || isTurnStatusPart(part)) continue;
+    // Hidden reasoning ends a text tail so Thinking can show while generation pauses.
+    return part.type === "text" && Boolean(part.text);
+  }
+  return false;
+}
+
+export function unreadAfterBusyChange(
+  current: ReadonlySet<string>, previousBusy: ReadonlySet<string>, busy: ReadonlySet<string>,
+  sessions: ChatSession[], visibleSessionId: string | null,
+): ReadonlySet<string> {
+  const finished = [...previousBusy].filter((id) => !busy.has(id)
+    && sessions.some((session) => session.id === id) && id !== visibleSessionId);
+  if (finished.length === 0 && !(visibleSessionId && current.has(visibleSessionId))) return current;
+  const next = new Set(current);
+  for (const id of finished) next.add(id);
+  if (visibleSessionId) next.delete(visibleSessionId);
+  return next;
+}
+
+export function splitTurnParts(parts: ChatPart[], streaming: boolean): { work: ChatPart[]; answer: ChatPart[] } {
+  // Keep unanswered prompts in the visible conversation.
+  if (parts.some((part) => part.type === "prompt" && !part.prompt?.resolved)) {
+    return { work: [], answer: parts };
+  }
+  let finalIndex = parts.findIndex((part) => part.type === "text" && part.phase === "final_answer");
+  if (finalIndex < 0 && !streaming && !parts.some((part) => part.phase)) {
+    // Older transcripts have no phase: only the trailing text can be the answer.
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index];
+      if (part.type === "reasoning") continue;
+      if (part.type !== "text") break;
+      if (part.text) finalIndex = index;
+    }
+  }
+  return finalIndex < 0 || (!streaming && !parts.slice(finalIndex).some((part) => partIsVisible(part))) || !parts.slice(0, finalIndex).some((part) => partIsVisible(part))
+    ? { work: [], answer: parts }
+    : { work: parts.slice(0, finalIndex), answer: parts.slice(finalIndex) };
+}
+
+function textPartsText(parts: ChatPart[]): string {
+  return parts
+    .flatMap((part) => {
+      const text = part.type === "text" ? part.text?.trim() : undefined;
+      return text ? [text] : [];
+    })
+    .join("\n\n");
+}
+
+/** The answer an assistant turn gave, without its commentary or tool work. */
+export function responseText(message: ChatMessage): string {
+  return textPartsText(splitTurnParts(message.parts, false).answer);
+}
+
+export function lastResponseText(messages: ChatMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role !== "assistant") continue;
+    const text = responseText(messages[index]);
+    if (text) return text;
+  }
+  return "";
+}
+
+/** `null` when the chat has no text to export yet. */
+export function transcriptMarkdown(
+  title: string,
+  messages: ChatMessage[],
+  labels: { user: string; assistant: string },
+): string | null {
+  const sections = messages.flatMap((message) => {
+    const text = textPartsText(message.parts);
+    if (!text) return [];
+    return [`## ${message.role === "user" ? labels.user : labels.assistant}\n\n${text}`];
+  });
+  if (sections.length === 0) return null;
+  return [`# ${title}`, ...sections].join("\n\n") + "\n";
+}
+
+export function transcriptFileName(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .slice(0, 80)
+    .replace(/^-+|-+$/g, "");
+  return `${slug || "chat"}.md`;
+}
+
+export function isModelAccessLimitPart(part: ChatPart): boolean {
+  return part.type === "tool" && part.tool === "error"
+    && /^(?:ActionRequiredError:\s*)?Named models unavailable\b/i.test(part.state?.error?.trim() ?? "");
+}
+
+export function isUsageLimitPart(part: ChatPart): boolean {
+  if (isModelAccessLimitPart(part)) return true;
+  if (part.state?.input?.errorKind === "claude_usage_limit") return true;
+  const text = part.type === "text" ? part.text : part.tool === "error" ? part.state?.error : null;
+  if (part.type === "tool" && part.tool === "error" && text
+    && /usageLimitExceeded|rateLimitExceeded|insufficient_quota|(?:usage|rate|session) limit|(?:exceeded|exhausted) (?:your |the |current )*quota|insufficient (?:credits|balance)|(?:credit|quota)[ _-](?:exhausted|exceeded)/i.test(text)) return true;
+  // Older Claude transcripts stored the synthetic quota notice as text and errors.
+  return Boolean(text && ((/^(?:claude: )?you(?:'ve| have) reached your .+ limit\./i.test(text.trim())
+    && text.includes("claude.ai/settings/usage"))
+    || /^(?:claude: )?you(?:'ve| have) hit your session limit · resets /i.test(text.trim())));
+}

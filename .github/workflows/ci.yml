@@ -1,0 +1,283 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Run the suite against a branch before it has a PR — the Windows job below
+  # is the only Windows machine most changes will meet.
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      # Unused, but part of cargo-dist's calling convention: release.yml's
+      # generated `custom-ci` job always passes it.
+      plan:
+        required: true
+        type: string
+
+# Cancel superseded PR/push checks without cancelling independent releases.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Localization catalogs
+        run: node ui/scripts/check-i18n.mjs
+
+      - name: Style tokens
+        run: node ui/scripts/check-styles.mjs
+
+      - name: Dev-slot helper tests
+        run: node --test scripts/dev-slot.test.mjs
+
+      - name: Release notes composition
+        run: python3 scripts/test_release_notes.py
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate localized messages
+        working-directory: ui
+        run: pnpm exec paraglide-js compile --silent --emit-ts-declarations
+
+      - name: UI typecheck
+        working-directory: ui
+        run: pnpm typecheck
+
+      - name: UI unit tests
+        run: node --test --experimental-strip-types ui/tests/*.test.mjs
+
+      - name: Committed UI bundle matches source
+        working-directory: ui
+        run: |
+          pnpm exec vite build
+          stale=$(git status --porcelain -- dist)
+          if [ -n "$stale" ]; then
+            echo "$stale"
+            echo "::error::ui/dist is stale; run pnpm build in ui/ and commit the result."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path windows/launcher/Cargo.toml --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Source builds cannot enable production telemetry
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(target/debug/orx --no-telemetry version --build-channel)" = "development"
+          cargo build --release --locked
+          test "$(target/release/orx --no-telemetry version --build-channel)" = "development"
+
+      - name: Test
+        run: cargo test --locked
+
+  # The Linux desktop app: a glibc build with the `desktop` feature, packaged as
+  # an AppImage on the oldest Ubuntu it supports and launched under a virtual
+  # display. The checks above cover the default, GTK-free build.
+  linux-app:
+    name: linux app (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WebKitGTK and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev file patchelf xvfb xdotool
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked --features desktop -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --features desktop
+
+      - name: Build release
+        if: ${{ !inputs.plan }}
+        run: cargo build --release --locked --features desktop
+
+      - name: Package the AppImage
+        if: ${{ !inputs.plan }}
+        run: scripts/build-linux-appimage.sh target/release/orx app-dist
+
+      # Otherwise the host's WebKit would stand in for a broken bundled one.
+      - name: Remove WebKitGTK from the runner
+        if: ${{ !inputs.plan }}
+        run: sudo apt-get remove -y libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0
+
+      - name: Smoke-test the AppImage
+        if: ${{ !inputs.plan }}
+        run: scripts/smoke-test-linux-appimage.sh app-dist/VERA-${{ matrix.arch }}.AppImage
+
+      - name: Upload the AppImage
+        if: ${{ !inputs.plan }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: openresearch-linux-${{ matrix.arch }}-appimage
+          path: app-dist/VERA-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+
+  # Only what differs by platform: the checks above are platform-independent,
+  # and ui/dist is committed, so no Node here.
+  windows:
+    name: windows build, test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (app launcher)
+        run: cargo clippy --manifest-path windows/launcher/Cargo.toml --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      # A debug orx.exe is slow enough to colour a tester's impression of the
+      # dashboard, so the artifact is the build they would actually be given.
+      - name: Build release
+        if: ${{ !inputs.plan }}
+        run: cargo build --release --locked
+
+      - name: Upload orx.exe
+        if: ${{ !inputs.plan }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: orx-windows-x86_64
+          path: target/release/orx.exe
+          if-no-files-found: error
+
+      # The same installer a release attaches, around this run's orx.exe.
+      - name: Build the desktop app installer
+        if: ${{ !inputs.plan }}
+        shell: pwsh
+        run: |
+          cargo build --release --locked --manifest-path windows/launcher/Cargo.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force app-staging | Out-Null
+          Copy-Item windows/launcher/target/release/VERA.exe, target/release/orx.exe app-staging
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceDir=$PWD\app-staging" "/DOutputDir=$PWD\app-installer" windows\VERA.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Upload the desktop app installer
+        if: ${{ !inputs.plan }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: openresearch-windows-installer
+          path: app-installer/VERA-Setup.exe
+          if-no-files-found: error
+
+  # Guards the version-bump release flow (release-on-bump.yml): the version in
+  # Cargo.toml may only move forward, may not reuse an already-released tag,
+  # and a bump must come with a regenerated Cargo.lock. Catching these here
+  # means a malformed bump can't reach main, where merging it would be the
+  # release trigger.
+  version-guard:
+    name: version sanity
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version must move forward (with a fresh lockfile)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          pkg_version() { grep -m1 '^version = ' "$1" | sed -E 's/version = "(.*)"/\1/'; }
+
+          git show "${BASE_SHA}:Cargo.toml" > /tmp/base-Cargo.toml
+          base=$(pkg_version /tmp/base-Cargo.toml)
+          head=$(pkg_version Cargo.toml)
+          echo "base: ${base}  pr: ${head}"
+
+          if [ "${head}" = "${base}" ]; then
+            echo "No version change — OK (merging this PR will not release)."
+            exit 0
+          fi
+
+          # Reject a version that sorts at or below the base (semver-aware sort).
+          if [ "$(printf '%s\n%s\n' "${base}" "${head}" | sort -V | head -1)" = "${head}" ]; then
+            echo "::error::Version went backwards: ${base} -> ${head}."
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v${head}" >/dev/null 2>&1; then
+            echo "::error::v${head} is already a released tag; bump past it."
+            exit 1
+          fi
+
+          # A bump must carry a regenerated lockfile, or release builds
+          # (--locked) would fail.
+          if ! grep -A1 '^name = "openresearch-cli"$' Cargo.lock | grep -q "version = \"${head}\""; then
+            echo "::error::Cargo.toml says ${head} but Cargo.lock was not regenerated (run cargo build and commit the lockfile)."
+            exit 1
+          fi
+
+          echo "Version bump ${base} -> ${head} looks good. Merging this PR WILL cut release v${head}."

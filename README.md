@@ -1,1 +1,60 @@
 # VERA
+
+VERA (Veritas Evidence & Research Agent) is a local-first workspace for literature research, coding-agent workflows, and reproducible experiments. Its Rust command-line tool is `orx`; the dashboard and research data run on your machine.
+
+## Features
+
+- Local research projects, experiment trees, runs, logs, and artifacts backed by SQLite.
+- Coding-agent integrations and configurable execution backends, including local execution, Hugging Face Jobs, Modal, Kubernetes, SSH, Slurm, Ray, and Tinker.
+- Academic discovery and paper metadata from alphaXiv, OpenAlex, bioRxiv, and PubMed.
+- Local environment settings for provider credentials, research tools, and future integrations.
+- A dashboard for chats, projects, experiments, files, settings, and evidence review.
+
+Academic sources and execution backends are configured independently. VERA does not require a product-account sign-in, organization account, or managed VERA compute. Research projects, logs, and artifacts stay local unless you configure an external provider or academic source.
+
+## Run locally
+
+Requirements for the Rust application: the stable Rust toolchain and Cargo.
+
+On Windows, run `Jalankan-VERA-Localhost.cmd` to start an isolated development workspace. It uses `scripts/dev-slot.mjs` to keep development ports, processes, and data separate.
+
+To build the CLI and start the local dashboard from the repository root:
+
+```sh
+cargo build --locked
+cargo run -- up
+```
+
+The dashboard binds to a loopback address and is intended for local use. Press `Ctrl+C` in the terminal to stop it.
+
+## Develop
+
+The dashboard requires Node.js 22 and pnpm 10. Install its dependencies and build the bundle from `ui/`:
+
+```sh
+cd ui
+pnpm install --frozen-lockfile
+pnpm build
+```
+
+`ui/dist/` is committed and embedded in the Rust server, so rebuild it after changing the dashboard. To run the dashboard checks, use `pnpm test` and `pnpm lint:styles` from `ui/`.
+
+Main source locations:
+
+- `src/` — Rust application, CLI, local API, storage, and integrations.
+- `ui/src/` — React dashboard.
+- `agent-skills/` — bundled agent guidance.
+- `scripts/`, `windows/`, `linux/`, and `macos/` — development and packaging tools.
+- `docs/` — platform and workflow documentation.
+
+Use `scripts/dev-slot.mjs` for isolated local app instances. See [AGENTS.md](AGENTS.md) for repository conventions and [.github/workflows/ci.yml](.github/workflows/ci.yml) for the full CI checks.
+
+## Local data and compatibility
+
+To preserve existing installations, VERA continues to read historical OpenResearch-named configuration and data locations, including `~/.openresearch/env` and the existing XDG data directory. These are compatibility paths; VERA does not delete or migrate their contents during startup.
+
+Provider credentials and local environment values are stored on the user's machine. Configure external services only when you choose to use them.
+
+## License
+
+VERA is distributed under the MIT License. See [LICENSE](LICENSE).

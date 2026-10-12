@@ -1,0 +1,32 @@
+{
+  "title": "Close tour through the middle of an open book",
+  "provider": "Mixkit",
+  "contributor": "Mixkit (as listed on the asset page)",
+  "source_url": "https://mixkit.co/free-stock-video/close-tour-through-the-middle-of-an-open-book-42926/",
+  "license_name": "Mixkit Stock Video Free License",
+  "license_url": "https://mixkit.co/license/#videoFree",
+  "license_checked": "2026-10-09",
+  "attribution_required": false,
+  "source_sha256": "77a5b51143440f52bee23d8c82e729ab7a202cb78fb4e512989cad642aa89e7d",
+  "source_bytes": 17909927,
+  "changes": [
+    "Trim to 0.3-5.3 seconds",
+    "Slow camera pan to two-thirds speed",
+    "Forward and reverse camera path",
+    "Neutral color adjustment",
+    "1280x720 H.264 conversion",
+    "No audio",
+    "Extract static poster"
+  ],
+  "video": {
+    "file": "vera-book-loop.mp4",
+    "bytes": 1811389,
+    "sha256": "e41b3fafb3db2c3a4a32164870936cb9f51b47b14956991babeb9728d71d4a04"
+  },
+  "poster": {
+    "file": "vera-book-poster.webp",
+    "bytes": 12082,
+    "sha256": "f0fe5335d43a5863411ad4320fb11eec1a4784d5eb6c39454fbd2ea3cb369f63"
+  },
+  "note": "Licensed stock footage; not CC0, not a generated video. Media license is separate from the repository software license."
+}
