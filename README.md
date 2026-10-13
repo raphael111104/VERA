@@ -16,7 +16,7 @@ Academic sources and execution backends are configured independently. VERA does 
 
 Requirements for the Rust application: the stable Rust toolchain and Cargo.
 
-On Windows, run `Jalankan-VERA-Localhost.cmd` to start the local dashboard. The launcher builds the Rust backend from source when needed, starts the Vite dashboard, and keeps its development data under `%LOCALAPPDATA%\VERA\dev-slots` so cleaning the Cargo `target/` directory does not remove it. It requires Node.js and pnpm for the dashboard; if Vite is missing, the launcher installs the locked UI dependencies.
+On Windows, run `Jalankan-VERA-Localhost.cmd` to start the local dashboard at <http://127.0.0.1:5201/>. The launcher builds the Rust backend from source when needed, starts the Vite dashboard, and keeps its development data under `%LOCALAPPDATA%\VERA\dev-slots` so cleaning the Cargo `target/` directory does not remove it. It requires Node.js and pnpm for the dashboard. Rust builds need either the MSVC linker (`link.exe`) or the GNU Windows Rust toolchain together with MinGW-w64 GCC; the launcher selects the available linker profile and reports missing prerequisites. If Vite is missing, it installs the locked UI dependencies.
 
 To build the CLI and start the local dashboard from the repository root:
 

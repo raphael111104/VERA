@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=VERA_OFFICIAL_RELEASE_BUILD");
     println!("cargo:rerun-if-env-changed=VERA_RELEASE_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=VERA_SKIP_WINDOWS_ICON");
     println!("cargo:rerun-if-env-changed=GITHUB_ACTIONS");
     println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
 
@@ -34,6 +35,12 @@ fn main() {
 fn embed_windows_icon() {
     println!("cargo:rerun-if-changed=windows/VERA.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    // The source-based localhost server does not display the executable icon.
+    // Skipping this resource step keeps its development build working from
+    // workspace paths with spaces when only the GNU Windows toolchain exists.
+    if std::env::var("VERA_SKIP_WINDOWS_ICON").as_deref() == Ok("1") {
         return;
     }
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
