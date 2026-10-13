@@ -16,7 +16,7 @@ Academic sources and execution backends are configured independently. VERA does 
 
 Requirements for the Rust application: the stable Rust toolchain and Cargo.
 
-On Windows, run `Jalankan-VERA-Localhost.cmd` to start an isolated development workspace. It uses `scripts/dev-slot.mjs` to keep development ports, processes, and data separate.
+On Windows, run `Jalankan-VERA-Localhost.cmd` to start the local dashboard. The launcher builds the Rust backend from source when needed, starts the Vite dashboard, and keeps its development data under `%LOCALAPPDATA%\VERA\dev-slots` so cleaning the Cargo `target/` directory does not remove it. It requires Node.js and pnpm for the dashboard; if Vite is missing, the launcher installs the locked UI dependencies.
 
 To build the CLI and start the local dashboard from the repository root:
 
@@ -47,7 +47,7 @@ Main source locations:
 - `scripts/`, `windows/`, `linux/`, and `macos/` — development and packaging tools.
 - `docs/` — platform and workflow documentation.
 
-Use `scripts/dev-slot.mjs` for isolated local app instances. See [AGENTS.md](AGENTS.md) for repository conventions and [.github/workflows/ci.yml](.github/workflows/ci.yml) for the full CI checks.
+Use `scripts/dev-slot.mjs` for isolated local app instances on macOS and Linux. On Windows, use `Jalankan-VERA-Localhost.cmd`. See [AGENTS.md](AGENTS.md) for repository conventions and [.github/workflows/ci.yml](.github/workflows/ci.yml) for the full CI checks.
 
 ## Local data and compatibility
 

@@ -18,8 +18,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $LauncherPath
 $uiDirectory = Join-Path $root 'ui'
-$devDirectory = Join-Path $root 'target\vera-ui-dev'
-$backendPath = Join-Path $devDirectory 'bin\orx.exe'
+$localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+if ([string]::IsNullOrWhiteSpace($localAppData)) {
+    throw 'Folder LocalAppData Windows tidak tersedia.'
+}
+$hasher = [Security.Cryptography.SHA256]::Create()
+try { $workspaceKey = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant())))).Replace('-', '').Substring(0, 16) }
+finally { $hasher.Dispose() }
+$devDirectory = Join-Path (Join-Path $localAppData 'VERA\dev-slots') $workspaceKey
+$backendPath = Join-Path $root 'target\debug\orx.exe'
 $vitePath = Join-Path $uiDirectory 'node_modules\vite\bin\vite.js'
 $backendUrl = 'http://127.0.0.1:4901'
 $uiUrl = 'http://127.0.0.1:5201'
@@ -61,13 +68,18 @@ function Start-ServerTerminal([string]$ServerMode) {
 if ($Mode -eq 'backend') {
     $Host.UI.RawUI.WindowTitle = 'VERA - Backend localhost - 4901'
     Set-Location -LiteralPath $root
+    foreach ($directory in @($devDirectory, (Join-Path $devDirectory 'data'), (Join-Path $devDirectory 'cache'), (Join-Path $devDirectory 'config'))) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
     $env:ORX_DATA_DIR = Join-Path $devDirectory 'data'
     $env:ORX_CACHE_DIR = Join-Path $devDirectory 'cache'
     $env:XDG_CONFIG_HOME = Join-Path $devDirectory 'config'
     $env:ORX_UI_DEV_ORIGIN = $uiUrl
+    $env:CARGO_TARGET_DIR = Join-Path $root 'target'
     Write-Host 'Backend VERA: http://127.0.0.1:4901' -ForegroundColor Cyan
     Write-Host 'Biarkan terminal ini terbuka. Tekan Ctrl+C untuk mematikan backend.'
-    & $backendPath up --port 4901 --no-browser --no-telemetry
+    & cargo.exe run --locked --manifest-path (Join-Path $root 'Cargo.toml') -- up --port 4901 --no-browser --no-telemetry
+    if ($LASTEXITCODE -ne 0) { throw ('Backend VERA berhenti dengan kode ' + $LASTEXITCODE + '.') }
     return
 }
 
@@ -87,7 +99,7 @@ try {
     $Host.UI.RawUI.WindowTitle = 'VERA - Menjalankan localhost'
     Set-Location -LiteralPath $root
     Write-Host 'Menyiapkan localhost VERA...' -ForegroundColor Cyan
-    foreach ($requiredPath in @($backendPath, $vitePath, (Join-Path $uiDirectory 'src\paraglide\runtime.js'))) {
+    foreach ($requiredPath in @((Join-Path $root 'Cargo.toml'), (Join-Path $uiDirectory 'src\paraglide\runtime.js'))) {
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
             throw ('File yang diperlukan tidak ditemukan: ' + $requiredPath)
         }
@@ -95,11 +107,27 @@ try {
     if (-not (Get-Command 'node.exe' -ErrorAction SilentlyContinue)) {
         throw 'Node.js belum tersedia di PATH. Pasang Node.js, lalu buka launcher kembali.'
     }
+    if (-not (Get-Command 'cargo.exe' -ErrorAction SilentlyContinue)) {
+        throw 'Cargo belum tersedia di PATH. Pasang Rust stable, lalu buka launcher kembali.'
+    }
+    if (-not (Test-Path -LiteralPath $vitePath -PathType Leaf)) {
+        if (-not (Get-Command 'pnpm' -ErrorAction SilentlyContinue)) {
+            throw 'Dependensi dashboard belum tersedia dan pnpm tidak ditemukan. Pasang pnpm, lalu jalankan pnpm install --frozen-lockfile dari folder ui.'
+        }
+        Write-Host 'Memasang dependensi dashboard...' -ForegroundColor Cyan
+        Push-Location -LiteralPath $uiDirectory
+        try {
+            & pnpm install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { throw ('pnpm install gagal dengan kode ' + $LASTEXITCODE + '.') }
+        } finally {
+            Pop-Location
+        }
+        if (-not (Test-Path -LiteralPath $vitePath -PathType Leaf)) {
+            throw 'Dependensi dashboard selesai dipasang, tetapi Vite tidak ditemukan.'
+        }
+    }
 
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try { $key = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant())))).Replace('-', '').Substring(0, 16) }
-    finally { $hasher.Dispose() }
-    $mutex = New-Object Threading.Mutex($false, ('Local\VERA-Localhost-' + $key))
+    $mutex = New-Object Threading.Mutex($false, ('Local\VERA-Localhost-' + $workspaceKey))
     try { $ownsMutex = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $ownsMutex = $true }
     if (-not $ownsMutex) {
         Write-Host 'Launcher VERA lainnya sedang menyiapkan server. Tunggu sampai browser terbuka.'
@@ -117,13 +145,16 @@ try {
 
     $backendTerminal = $null
     $uiTerminal = $null
+    foreach ($directory in @($devDirectory, (Join-Path $devDirectory 'data'), (Join-Path $devDirectory 'cache'), (Join-Path $devDirectory 'config'))) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
     if (-not $backend) { $backendTerminal = Start-ServerTerminal 'backend' }
     else { Write-Host 'Backend sudah berjalan; memakai server yang ada.' }
     if (-not $ui) { $uiTerminal = Start-ServerTerminal 'ui' }
     else { Write-Host 'Web sudah berjalan; memakai server yang ada.' }
 
     Write-Host 'Menunggu backend dan web siap...'
-    $deadline = [DateTime]::UtcNow.AddSeconds(90)
+    $deadline = [DateTime]::UtcNow.AddMinutes(10)
     $ready = $false
     while ([DateTime]::UtcNow -lt $deadline) {
         $health = Get-WebJson ($backendUrl + '/api/health')
@@ -133,7 +164,7 @@ try {
         }
         Start-Sleep -Milliseconds 750
     }
-    if (-not $ready) { throw 'Server belum siap setelah 90 detik. Periksa pesan pada terminal Backend dan Web.' }
+    if (-not $ready) { throw 'Server belum siap setelah 10 menit. Periksa pesan pada terminal Backend dan Web.' }
 
     $data = Get-WebJson ($backendUrl + '/api/settings/data-dir')
     $expectedData = [IO.Path]::GetFullPath((Join-Path $devDirectory 'data')).TrimEnd('\')
