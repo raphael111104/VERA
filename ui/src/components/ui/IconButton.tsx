@@ -4,7 +4,7 @@ import { cn } from "./cn";
 const BASE = [
   "icon-btn relative inline-flex shrink-0 items-center justify-center",
   "transition-[background,color] duration-120 ease-standard",
-  "focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-text focus-visible:outline-offset-2",
+  "focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-accent-red focus-visible:outline-offset-2",
   "disabled:cursor-default disabled:opacity-45",
 ].join(" ");
 
@@ -18,8 +18,8 @@ const VARIANTS: Record<IconButtonVariant, string> = {
 };
 
 const SIZES: Record<IconButtonSize, string> = {
-  default: "h-8 w-8 rounded-md",
-  small: "h-7 w-7 rounded-sm",
+  default: "h-9 w-9 rounded-md",
+  small: "h-8 w-8 rounded-md",
 };
 
 function classes(variant: IconButtonVariant, size: IconButtonSize, active: boolean, shape: "rounded" | "circle", className?: string) {

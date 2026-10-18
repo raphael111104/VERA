@@ -53,18 +53,18 @@ introduces research progress or evidence quality indicators.
 
 ## Reviewable prototype
 
-Interactive preview: `http://127.0.0.1:5201/design-previews/header-options.html`.
-Source: `ui/design-previews/header-options.html`.
-The stage uses a screenshot of the current demo workspace as context:
-`ui/design-previews/header-reference.png`. Only the header is overlaid.
+The historical prototype now lives in [previews/header-options.html](previews/header-options.html)
+and can be opened as a local HTML file. Its stylesheet references the checkout's
+`ui/src/theme.css`. The stage uses [the original screenshot](previews/header-reference.png)
+as context. Only the header is overlaid.
 
 The A/B/C controls change the visual variant and its explanation. Header
 actions display implementation notes inside the prototype; they are not
 connected to the application's state or navigation. The application header
 source is not edited by this exploration.
 
-The preview lives outside `src` and `public`, and is not a configured Vite
-production entry. It is a design artifact, not a released feature.
+The preview is archived under `docs/design-history/previews/`; it is not part
+of the dashboard bundle. Earlier sessions served it from `ui/design-previews/`.
 
 All three variants were visually inspected in the running preview. Captures
 show the proposed header together with the existing workspace toolbar:

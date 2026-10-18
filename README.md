@@ -1,6 +1,6 @@
 # VERA
 
-VERA (Veritas Evidence & Research Agent) is a local-first workspace for literature research, coding-agent workflows, and reproducible experiments. Its Rust command-line tool is `orx`; the dashboard and research data run on your machine.
+VERA (Veritas Evidence & Research Agent) is a local-first workspace for literature research, coding-agent workflows, and reproducible experiments. The VERA command-line interface operates the local workspace and starts its dashboard; research data stays on your machine.
 
 ## Features
 
@@ -46,6 +46,11 @@ Main source locations:
 - `agent-skills/` — bundled agent guidance.
 - `scripts/`, `windows/`, `linux/`, and `macos/` — development and packaging tools.
 - `docs/` — platform and workflow documentation.
+
+See the [documentation index](docs/README.md) for the repository layout and
+[research workflow specifications and implementation notes](docs/research-workflow/README.md).
+Build caches and local Windows packages have separate locations; follow the
+[workspace cleanup guide](docs/maintenance.md) to remove generated files safely.
 
 Use `scripts/dev-slot.mjs` for isolated local app instances on macOS and Linux. On Windows, use `Jalankan-VERA-Localhost.cmd`. See [AGENTS.md](AGENTS.md) for repository conventions and [.github/workflows/ci.yml](.github/workflows/ci.yml) for the full CI checks.
 

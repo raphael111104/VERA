@@ -50,6 +50,7 @@ use crate::{browser, UpArgs};
 
 pub(crate) mod compute_settings;
 mod harness_setup;
+mod research_workflow;
 use compute_settings::*;
 
 pub async fn run(args: UpArgs) -> Result<()> {
@@ -541,6 +542,42 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/projects/{id}/runs", get(list_project_runs))
         .route("/api/papers/search", get(search_papers_api))
         .route("/api/research/jobs", post(start_research_job))
+        .route(
+            "/api/research/projects",
+            get(research_workflow::list).post(research_workflow::create),
+        )
+        .route(
+            "/api/research/projects/{id}",
+            get(research_workflow::read).post(research_workflow::mutate),
+        )
+        .route(
+            "/api/research/projects/{id}/import-preview",
+            post(research_workflow::preview),
+        )
+        .route(
+            "/api/research/projects/{id}/sidechat",
+            post(research_workflow::sidechat),
+        )
+        .route(
+            "/api/research/projects/{id}/assistance/{job}",
+            post(research_workflow::assistance_tick),
+        )
+        .route(
+            "/api/research/projects/{id}/exports/{file}",
+            get(research_workflow::export_download),
+        )
+        .route(
+            "/api/research/projects/{id}/exports/{file}/{member}",
+            get(research_workflow::export_member),
+        )
+        .route(
+            "/api/research/projects/{id}/learning-trace",
+            get(research_workflow::learning_trace),
+        )
+        .route(
+            "/api/research/projects/{id}/artifacts/{file}",
+            get(research_workflow::artifact),
+        )
         .route(
             "/api/research/folders",
             get(get_research_folders).post(save_research_folder),

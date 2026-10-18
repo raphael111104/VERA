@@ -37,6 +37,7 @@ pub mod portable_git;
 pub mod projects;
 pub mod ray;
 pub mod research;
+pub mod research_workflow;
 pub mod resolve;
 pub mod shell_env;
 pub mod skills;

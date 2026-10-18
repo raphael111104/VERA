@@ -451,7 +451,7 @@ export function RuntimeRoot() {
     return (
       <main className="app flex h-full items-center justify-center gap-3 bg-background text-base text-text">
         {error
-          ? <><span>{error}</span><Button onClick={() => location.reload()}>{m.app_retry()}</Button></>
+          ? <><span role="alert">{location.pathname.startsWith("/research")?"Server localhost belum dapat dihubungi. Data kajian tersimpan tetap tersedia setelah server kembali siap.":error}</span><Button onClick={() => location.reload()}>{location.pathname.startsWith("/research")?"Coba lagi":m.app_retry()}</Button></>
           : <Spinner />}
       </main>
     );

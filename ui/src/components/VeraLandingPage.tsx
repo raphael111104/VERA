@@ -1,4 +1,4 @@
-import { ArrowDownRight, ArrowRight, BookMarked, BookOpenText, FilePenLine, Quote } from "lucide-react";
+import { ArrowRight, BookMarked, BookOpenText, FilePenLine, Quote } from "lucide-react";
 import { m } from "../paraglide/messages.js";
 import { BrandMark, VeraLogo } from "./Wordmark";
 import { Button } from "./ui";
@@ -42,10 +42,10 @@ export function VeraLandingPage({ onEnter, exiting = false }: { onEnter: () => v
               </h1>
               <p className="vera-landing-description text-pretty text-lg leading-relaxed text-subtext">{m.vera_landing_description()}</p>
               <div className="vera-landing-actions flex flex-wrap items-center gap-x-6 gap-y-4">
-                <Button variant="primary" size="large" className="vera-landing-enter" onClick={onEnter} disabled={exiting} autoFocus>
+                <Button variant="primary" size="large" onClick={() => { window.location.assign('/research'); }} disabled={exiting}>Mulai kajian baru <ArrowRight size={19} aria-hidden="true" /></Button>
+                <Button variant="default" size="large" className="vera-landing-enter" onClick={onEnter} disabled={exiting} autoFocus>
                   {m.vera_landing_enter()} <ArrowRight size={19} aria-hidden="true" />
                 </Button>
-                <a className="vera-landing-link inline-flex items-center gap-2 text-sm text-text" href="#vera-research-flow">{m.vera_landing_flow()} <ArrowDownRight size={17} aria-hidden="true" /></a>
               </div>
               <p className="vera-landing-local flex items-start gap-2 text-xs leading-relaxed text-subtext"><BookMarked size={15} className="mt-0.5 shrink-0" aria-hidden="true" />{m.vera_landing_source_note()}</p>
             </div>

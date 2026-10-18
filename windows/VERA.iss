@@ -1,7 +1,7 @@
 ; VERA-Setup.exe: a per-user install of the Windows desktop app
-; (VERA.exe plus the orx.exe it starts) with a Start menu entry.
+; with a Start menu entry, private tools and an offline WebView2 prerequisite.
 ;
-;   iscc /DAppVersion=<version> /DSourceDir=<dir with both exes> /DOutputDir=<dir> windows\VERA.iss
+;   powershell -File windows/build-installer.ps1 -ApplicationPath <VERA.exe>
 ;
 ; See docs/windows.md.
 
@@ -14,6 +14,12 @@
 #ifndef OutputDir
   #define OutputDir "."
 #endif
+#if !FileExists(SourceDir + "\prerequisites\MicrosoftEdgeWebView2RuntimeInstallerX64.exe")
+  #error Build with windows/build-installer.ps1: the offline WebView2 installer is required.
+#endif
+#if !FileExists(SourceDir + "\runtime\git\cmd\git.exe") || !FileExists(SourceDir + "\runtime\opencode\opencode.exe")
+  #error The installer must contain its private Git and OpenCode runtimes.
+#endif
 
 ; Must match set_taskbar_identity in src/commands/app.rs.
 #define AppUserModelID "alphaXiv.OpenResearch"
@@ -25,9 +31,10 @@ AppName=VERA
 AppVersion={#AppVersion}
 AppPublisher=VERA
 ; Per-user and writable, so orx.exe can update itself in place without admin.
-; Keep the previous install folder so updates replace existing VERA installations.
-DefaultDirName={localappdata}\Programs\OpenResearch
-DisableDirPage=yes
+; Existing installs keep their folder through the stable AppId and UsePreviousAppDir.
+DefaultDirName={localappdata}\Programs\VERA
+UsePreviousAppDir=yes
+DisableDirPage=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
@@ -43,6 +50,7 @@ UninstallDisplayName=VERA
 AppMutex=Local\OpenResearchApp
 Compression=lzma2
 SolidCompression=yes
+CompressionThreads=2
 WizardStyle=modern
 
 [Tasks]
@@ -50,7 +58,15 @@ Name: desktopicon; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm
 
 [Files]
 Source: "{#SourceDir}\VERA.exe"; DestDir: "{app}"; Flags: ignoreversion
+#if FileExists(SourceDir + "\orx.exe")
 Source: "{#SourceDir}\orx.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\WebView2Loader.dll"; DestDir: "{app}"; Flags: ignoreversion
+#endif
+Source: "{#SourceDir}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\package-manifest.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\MULAI-DI-SINI.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\prerequisites\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\VERA"; Filename: "{app}\VERA.exe"; AppUserModelID: "{#AppUserModelID}"
@@ -68,7 +84,6 @@ Type: filesandordirs; Name: "{app}\.orx-update-*"
 [Code]
 const
   WebView2ClientKey = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
-  WebView2Bootstrapper = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703';
 
 function HasWebView2Version(RootKey: Integer; SubKey: String): Boolean;
 var
@@ -85,38 +100,25 @@ begin
     or HasWebView2Version(HKCU, 'Software\' + WebView2ClientKey);
 end;
 
-procedure ReportMissingWebView2;
-begin
-  SuppressibleMsgBox('VERA needs the Microsoft Edge WebView2 Runtime, which could not be ' +
-    'installed. Install it from https://developer.microsoft.com/microsoft-edge/webview2/ ' +
-    'and then start VERA.', mbError, MB_OK, IDOK);
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
-  if (CurStep <> ssPostInstall) or WebView2Installed then
+  Result := '';
+  if WebView2Installed then
     Exit;
-  // The bootstrapper runs hidden and can take minutes.
-  WizardForm.StatusLabel.Caption := 'Installing the Microsoft Edge WebView2 Runtime...';
+  // The complete, Microsoft-signed installer is inside this package. No network
+  // download and no separate dependency installation is required by the user.
+  WizardForm.StatusLabel.Caption := 'Menyiapkan komponen tampilan VERA...';
   try
-    DownloadTemporaryFile(WebView2Bootstrapper, 'MicrosoftEdgeWebview2Setup.exe', '', nil);
-    if not Exec(ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe'), '/silent /install', '',
-      SW_HIDE, ewWaitUntilTerminated, ResultCode) or not WebView2Installed then
-      ReportMissingWebView2;
+    ExtractTemporaryFile('MicrosoftEdgeWebView2RuntimeInstallerX64.exe');
+    if not Exec(ExpandConstant('{tmp}\MicrosoftEdgeWebView2RuntimeInstallerX64.exe'),
+      '/silent /install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      Result := 'Komponen tampilan tidak dapat dijalankan. Tutup aplikasi lain lalu ulangi pemasangan.'
+    else if not WebView2Installed then
+      Result := 'Komponen tampilan belum siap (kode ' + IntToStr(ResultCode) +
+        '). Mulai ulang Windows lalu jalankan installer VERA kembali.';
   except
-    ReportMissingWebView2;
-  end;
-end;
-
-// Without the runtime the app can't open its window, so don't offer to start it.
-procedure CurPageChanged(CurPageID: Integer);
-begin
-  if (CurPageID = wpFinished) and not WebView2Installed
-    and (WizardForm.RunList.Items.Count > 0) then
-  begin
-    WizardForm.RunList.Checked[0] := False;
-    WizardForm.RunList.Visible := False;
+    Result := 'Komponen tampilan tidak dapat disiapkan. Jalankan kembali installer VERA.';
   end;
 end;

@@ -1,0 +1,25 @@
+VERA - Veritas Evidence & Research Agent
+
+1. Jalankan VERA-Setup.exe, ikuti petunjuk, lalu buka VERA dari menu Start.
+2. Buka Ruang kajian. Demo simulasi disiapkan dan disimpan otomatis pada profil
+   lokal pertama kali halaman ini dibuka. Pilih Buka demo tersimpan untuk
+   melihat contoh dari arah kajian sampai DOCX/CSV, audit, dan refleksi belajar.
+   Seluruh sumber dan hasil contoh diberi label SIMULASI.
+   Pilih Mulai kajian baru untuk mengerjakan penelitian Anda sendiri.
+3. Gunakan ikon sidebar untuk berpindah tahap. Panel kanan menampilkan dokumen,
+   tabel CSV, berkas, browser, dan percakapan pendamping.
+4. Untuk bantuan AI, sambungkan penyedia model menggunakan akun/kunci API Anda.
+   Akses database akademik tertentu juga memerlukan kredensial dari penyedia.
+
+Installer sudah membawa mesin VERA, Git/Bash, agen OpenCode, dan installer
+WebView2 offline. Tidak perlu memasang Node.js, Python, Rust, Git, atau Microsoft
+Word untuk menjalankan workspace dan membuat/meninjau keluaran DOCX/CSV.
+Internet diperlukan untuk pencarian akademik, layanan AI, dan situs jurnal.
+Alat tambahan untuk eksperimen khusus dikonfigurasi sesuai kebutuhan eksperimen.
+
+Data kajian disimpan di komputer pengguna. Paket membawa bahan demo sintetis
+yang dapat dipakai tanpa internet; paket tidak membawa akun, kunci API,
+riwayat pribadi, atau kredensial pembuat aplikasi.
+Mencopot aplikasi tidak menghapus data kajian pengguna.
+Windows 10/11 64-bit. VERA.exe yang disalin sendirian tidak membawa folder
+runtime pendamping atau installer WebView2; bagikan VERA-Setup.exe kepada pengguna baru.

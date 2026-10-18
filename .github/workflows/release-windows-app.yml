@@ -123,7 +123,7 @@ jobs:
 
       - name: Build the installer
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$($env:TAG.TrimStart('v'))" "/DSourceDir=$PWD\app-staging" "/DOutputDir=$PWD\app-installer" windows\VERA.iss
+          ./windows/build-installer.ps1 -ApplicationPath app-staging/VERA.exe -ServerPath app-staging/orx.exe -OutputDirectory app-installer
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Sign the installer

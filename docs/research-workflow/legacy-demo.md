@@ -1,5 +1,8 @@
 # Alur riset mahasiswa VERA
 
+Catatan ini menjelaskan workflow demo awal. Untuk implementasi ruang kajian
+yang lebih baru, gunakan [status implementasi workflow](README.md).
+
 Demo riset memakai harness AI yang sudah dikonfigurasi di aplikasi. Model membaca bidang dan fokus mahasiswa untuk menentukan dua pertanyaan lanjutan, kemudian memakai konteks dan alasan mahasiswa untuk membuat dua query akademik. OpenAlex selalu dicari; agent dapat menambahkan PubMed, bioRxiv (melalui indeks OpenAlex), atau alphaXiv sesuai disiplin. Pencarian sumber dan query berjalan paralel.
 
 Koordinator memakai sesi utama. Sub-agent bukti per sumber dan sub-agent penalaran bekerja paralel di sesi anak; koordinator menyintesis hasilnya, kemudian sub-agent pemeriksa bukti menilai dukungan setiap klaim. Pemeriksaan aplikasi membuang klaim dengan referensi yang tidak ada di korpus. Semua respons agent dan jejak pencarian disimpan dalam job lokal. Sesi penelitian diarsipkan agar tidak memenuhi daftar chat utama.

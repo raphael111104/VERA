@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{
@@ -627,8 +627,10 @@ async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
             // Nor skills: the plugin catalog alone injected ~6k prompt tokens
             // (24.3k → 18k input measured) into a request that ignores it.
             .args(["-c", "features.plugins=false"])
-            .arg(&message)
-            .stdin(Stdio::null())
+            // npm's Windows .cmd launcher cannot accept multiline argv.
+            // The CLI's stdin mode also keeps source text out of shell quoting.
+            .arg("-")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -644,6 +646,13 @@ async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
         // would otherwise write escape codes straight into the reply.
         cmd.env("NO_COLOR", "1");
         let mut child = cmd.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(error) = stdin.write_all(message.as_bytes()).await {
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(error.into());
+                }
+            }
+        }
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let mut lines = BufReader::new(stdout).lines();
         // Keep the last agent message: a chatty run may narrate before it

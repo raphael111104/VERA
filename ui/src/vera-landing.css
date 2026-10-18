@@ -5,9 +5,9 @@
 .vera-landing-header { position: relative; min-height: clamp(56px, 8.5dvh, 80px); padding-block: max(12px, env(safe-area-inset-top)) 12px; }
 .vera-landing-header::after { position: absolute; inset-inline-start: 0; bottom: -1px; width: 48px; height: 2px; background: var(--primary); content: ""; }
 .vera-landing-header-enter.btn { padding: 10px 16px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-bright); }
-.vera-landing-nav, .vera-landing-link { text-decoration: none; }
+.vera-landing-nav { text-decoration: none; }
 .vera-landing-nav:hover { color: var(--text); }
-.vera-landing-nav:focus-visible, .vera-landing-link:focus-visible { outline: 2px solid var(--text); outline-offset: 6px; border-radius: var(--radius-xs); }
+.vera-landing-nav:focus-visible { outline: 2px solid var(--text); outline-offset: 6px; border-radius: var(--radius-xs); }
 .vera-landing-main { grid-template-rows: minmax(0, 1.65fr) minmax(0, 1fr); gap: clamp(12px, 2.2dvh, 24px); padding-block: clamp(12px, 2.2dvh, 24px); }
 .vera-landing-hero { position: relative; isolation: isolate; min-height: 0; overflow: hidden; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 40px; margin-inline: -32px; padding: clamp(16px, 2.4dvh, 28px) 32px; border: 1px solid var(--border); border-radius: 24px; background: var(--surface); }
 .vera-hero-backdrop { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
@@ -21,9 +21,8 @@
 .vera-landing-description { max-width: 540px; margin: 0; font-size: clamp(1rem, 2dvh, 1.125rem); }
 .vera-landing-actions { margin-top: clamp(16px, 2.4dvh, 24px); }
 .vera-landing-enter.btn { gap: 16px; border-radius: var(--radius-md); padding-inline: 24px; }
-.vera-landing-enter svg, .vera-landing-link svg, .vera-landing-header-enter svg { transition: transform 160ms ease-out; }
+.vera-landing-enter svg, .vera-landing-header-enter svg { transition: transform 160ms ease-out; }
 .vera-landing-enter:hover svg, .vera-landing-header-enter:hover svg { transform: translateX(3px); }
-.vera-landing-link:hover svg { transform: translate(2px, 2px); }
 .vera-landing-local { max-width: 440px; margin: clamp(10px, 1.6dvh, 16px) 0 0; }
 .vera-landing-identity { align-self: center; justify-self: center; width: min(100%, 36dvh, 360px); aspect-ratio: 1; padding: clamp(20px, 3dvh, 32px); border: 1px solid var(--hero-glass-border); border-radius: 24px; background: var(--hero-glass-fill); box-shadow: var(--hero-glass-shadow); -webkit-backdrop-filter: blur(18px) saturate(115%); backdrop-filter: blur(18px) saturate(115%); }
 .vera-landing-logo { display: block; width: min(100%, 280px); max-width: 100%; aspect-ratio: 1; object-fit: contain; }

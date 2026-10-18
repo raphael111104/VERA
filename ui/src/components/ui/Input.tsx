@@ -4,7 +4,7 @@ import { cn } from "./cn";
 type InputVariant = "default" | "inline";
 
 const VARIANTS: Record<InputVariant, string> = {
-  default: "h-10 rounded-lg border border-border-strong bg-background px-2.5 py-1.5 focus:border-text",
+  default: "h-10 rounded-md border border-border-strong bg-background px-2.5 py-1.5 focus:border-text",
   inline: "h-8 rounded-none border-x-0 border-t-0 border-b border-transparent bg-transparent px-0 py-0 focus:border-text",
 };
 

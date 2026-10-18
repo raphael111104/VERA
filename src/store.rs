@@ -9,6 +9,7 @@
 //! `~/.local/share/openresearch`.
 
 mod research_folders;
+mod research_workflow;
 mod telemetry;
 pub use research_folders::ResearchFolder;
 pub(crate) use telemetry::{InvocationIdentity, TokenUsage};
@@ -917,10 +918,12 @@ impl Store {
         // to do it safely exists: `reconcileReasoning` in `ui/src/api.ts` drops
         // one the selected model doesn't offer, and each harness's mapper drops
         // it again before it can reach a CLI.
-        Ok(Self {
+        let store = Self {
             conn,
             data_dir_move_lock_path,
-        })
+        };
+        store.workflow_schema()?;
+        Ok(store)
     }
 
     /// Short write transaction over this connection; rolls back when dropped

@@ -11,6 +11,12 @@
 /app-staging/
 *.tsbuildinfo
 ui/package-lock.json
+/ui/.tanstack/
+/ui/.vite/
+/ui/.vite-temp/
+/ui/coverage/
+/ui/playwright-report/
+/ui/test-results/
 
 # Local environment and credentials
 .env
@@ -34,6 +40,8 @@ ui/package-lock.json
 *.sqlite
 *.sqlite3
 *.log
+*.tmp
+*.bak
 __pycache__/
 *.py[cod]
 .pytest_cache/

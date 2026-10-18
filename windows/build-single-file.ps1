@@ -1,6 +1,8 @@
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
-    [string]$OutputPath = ""
+    [string]$OutputPath = "",
+    [string]$Toolchain = "",
+    [switch]$SkipUiBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +20,7 @@ $workspaceAlias = $driveLetter + ":\"
 $previousTargetDir = $env:CARGO_TARGET_DIR
 $previousOrxPath = $env:ORX_BINARY_PATH
 $previousLoaderPath = $env:WEBVIEW2_LOADER_PATH
+$previousToolchain = $env:RUSTUP_TOOLCHAIN
 $mapped = $false
 
 try {
@@ -29,9 +32,18 @@ try {
 
     Push-Location $workspaceAlias
     try {
-        npx --yes pnpm@10.34.6 --dir ui build
-        if ($LASTEXITCODE -ne 0) {
-            throw "The VERA UI build failed."
+        if ($Toolchain) {
+            $env:RUSTUP_TOOLCHAIN = $Toolchain
+        } elseif ($Target -eq "x86_64-pc-windows-gnu") {
+            $env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
+        }
+        if (-not $SkipUiBuild) {
+            pnpm --dir ui build
+            if ($LASTEXITCODE -ne 0) {
+                throw "The VERA UI build failed."
+            }
+        } elseif (-not (Test-Path -LiteralPath "ui\dist\index.html")) {
+            throw "SkipUiBuild requires an existing, validated ui/dist."
         }
 
         $env:CARGO_TARGET_DIR = Join-Path $workspaceAlias "target"
@@ -53,6 +65,7 @@ try {
             Select-Object -First 1
         if ($loader) {
             $env:WEBVIEW2_LOADER_PATH = $loader.FullName
+            Copy-Item -LiteralPath $loader.FullName -Destination (Join-Path $releaseDir 'WebView2Loader.dll') -Force
         } else {
             Remove-Item Env:WEBVIEW2_LOADER_PATH -ErrorAction SilentlyContinue
         }
@@ -80,6 +93,11 @@ try {
         Pop-Location
     }
 } finally {
+    if ($null -eq $previousToolchain) {
+        Remove-Item Env:RUSTUP_TOOLCHAIN -ErrorAction SilentlyContinue
+    } else {
+        $env:RUSTUP_TOOLCHAIN = $previousToolchain
+    }
     if ($mapped) {
         subst $substDrive /d
     }

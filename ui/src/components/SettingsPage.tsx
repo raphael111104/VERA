@@ -2733,7 +2733,7 @@ function InstallCliRow({
     <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
       <div>
         <div className="project-default-title text-base font-medium">
-          {m.settings_install_cli_title({ command: ltr("orx") })}
+          {m.settings_install_cli_title()}
         </div>
         {result ? (
           <p>
@@ -2744,7 +2744,7 @@ function InstallCliRow({
           </p>
         ) : (
           <p>
-            {m.settings_install_cli_description({ command: ltr("orx") })}
+            {m.settings_install_cli_description()}
           </p>
         )}
       </div>

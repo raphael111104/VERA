@@ -1342,7 +1342,7 @@ fn parse_pubmed_book_article(node: roxmltree::Node<'_, '_>) -> Option<PubmedArti
     })
 }
 
-fn parse_pubmed_articles(xml: &str) -> Result<Vec<PubmedArticle>> {
+pub(crate) fn parse_pubmed_articles(xml: &str) -> Result<Vec<PubmedArticle>> {
     let options = roxmltree::ParsingOptions {
         allow_dtd: true,
         ..Default::default()

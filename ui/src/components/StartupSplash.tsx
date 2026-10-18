@@ -13,8 +13,9 @@ export function showLandingPage() {
 /** Every document and native reopen shows splash → landing → workspace.
  * Keep a started workspace mounted across reopens, including unsaved input. */
 export function StartupSplash({ children }: { children: ReactNode }) {
-  const [phase, setPhase] = useState<"intro" | "splash-leaving" | "landing" | "landing-leaving" | "done">("intro");
-  const [started, setStarted] = useState(false);
+  const researchEntry = useRef(window.location.pathname.startsWith('/research'));
+  const [phase, setPhase] = useState<"intro" | "splash-leaving" | "landing" | "landing-leaving" | "done">(researchEntry.current ? "done" : "intro");
+  const [started, setStarted] = useState(researchEntry.current);
   const [launch, setLaunch] = useState(0);
   const workspace = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
@@ -39,6 +40,7 @@ export function StartupSplash({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    if (researchEntry.current && launch === 0) return;
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const hold = window.setTimeout(() => setPhase("splash-leaving"), reducedMotion ? 450 : 2100);
     const finish = window.setTimeout(() => setPhase("landing"), reducedMotion ? 450 : 2340);
@@ -64,6 +66,10 @@ export function StartupSplash({ children }: { children: ReactNode }) {
 
   const enterWorkspace = () => {
     if (phase !== "landing") return;
+    if (!window.location.pathname.startsWith("/research")) {
+      window.location.assign("/research");
+      return;
+    }
     setStarted(true);
     setPhase("landing-leaving");
   };

@@ -176,6 +176,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Workspace cleanup safety
+        shell: pwsh
+        run: ./scripts/clean-workspace.test.ps1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -216,10 +220,7 @@ jobs:
         run: |
           cargo build --release --locked --manifest-path windows/launcher/Cargo.toml
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          New-Item -ItemType Directory -Force app-staging | Out-Null
-          Copy-Item windows/launcher/target/release/VERA.exe, target/release/orx.exe app-staging
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceDir=$PWD\app-staging" "/DOutputDir=$PWD\app-installer" windows\VERA.iss
+          ./windows/build-installer.ps1 -ApplicationPath windows/launcher/target/release/VERA.exe -ServerPath target/release/orx.exe -OutputDirectory app-installer
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Upload the desktop app installer

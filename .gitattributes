@@ -10,3 +10,7 @@
 # be treated as text and normalized.
 *.pt binary
 *.pkl binary
+
+# Keep generated third-party strings (including PDF cross-reference padding)
+# byte-for-byte; whitespace checks apply to the source that generates this.
+ui/dist/** linguist-generated=true -whitespace

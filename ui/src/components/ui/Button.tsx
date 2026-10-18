@@ -7,7 +7,7 @@ type ButtonSize = "default" | "small" | "large";
 const BASE = [
   "btn inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap border font-medium",
   "transition-[background,border-color,color] duration-120 ease-standard",
-  "focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-text focus-visible:outline-offset-2",
+  "focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-accent-red focus-visible:outline-offset-2",
   "disabled:cursor-default disabled:opacity-45",
 ].join(" ");
 
@@ -20,9 +20,9 @@ const VARIANTS: Record<ButtonVariant, string> = {
 };
 
 const SIZES: Record<ButtonSize, string> = {
-  default: "h-9 rounded-lg px-4 text-sm",
-  small: "h-7 rounded-md px-2.5 text-sm",
-  large: "h-12 rounded-lg px-6 text-base",
+  default: "h-10 rounded-md px-4 text-sm",
+  small: "h-8 rounded-md px-2.5 text-sm",
+  large: "h-12 rounded-md px-6 text-base",
 };
 
 function classes(variant: ButtonVariant, size: ButtonSize, active: boolean, className?: string) {

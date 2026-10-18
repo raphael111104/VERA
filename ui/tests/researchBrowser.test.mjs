@@ -14,6 +14,12 @@ test("publisher metadata renders JATS and nested entities as readable plain text
   assert.equal(researchMetadataText("&#99999999; &#0;"), "&#99999999; &#0;");
 });
 
+test("journal navigation accepts bare domains and DOI input without weakening URL validation", () => {
+  assert.equal(researchBrowserUrl("pubmed.ncbi.nlm.nih.gov/1234/"), "https://pubmed.ncbi.nlm.nih.gov/1234/");
+  assert.equal(researchBrowserUrl("doi: 10.1234/paper"), "https://doi.org/10.1234/paper");
+  assert.equal(researchBrowserUrl("10.1234/paper"), "https://doi.org/10.1234/paper");
+});
+
 test("source browser rejects executable, local-file, relative and credential URLs", () => {
   for (const url of ["javascript:alert(1)", "data:text/html,example", "file:///C:/private.txt", "/api/settings", "not a URL", "https://user:secret@example.org"]) {
     assert.equal(researchBrowserUrl(url), null, url);

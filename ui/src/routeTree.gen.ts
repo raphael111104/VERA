@@ -12,8 +12,11 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as RemoteLaunchRouteImport } from './routes/remote-launch'
+import { Route as ResearchRouteImport } from './routes/research'
 import { Route as ProjectsIndexRouteImport } from './routes/projects.index'
 import { Route as ProjectsProjectIdRouteImport } from './routes/projects.$projectId'
+import { Route as ResearchIndexRouteImport } from './routes/research.index'
+import { Route as ResearchResearchProjectIdRouteImport } from './routes/research.$researchProjectId'
 import { Route as ProjectsProjectIdIndexRouteImport } from './routes/projects.$projectId.index'
 import { Route as ProjectsProjectIdSkillsRouteImport } from './routes/projects.$projectId.skills'
 import { Route as ProjectsProjectIdSettingsTabRouteImport } from './routes/projects.$projectId.settings.$tab'
@@ -35,6 +38,11 @@ const RemoteLaunchRoute = RemoteLaunchRouteImport.update({
   path: '/remote-launch',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ResearchRoute = ResearchRouteImport.update({
+  id: '/research',
+  path: '/research',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ProjectsIndexRoute = ProjectsIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -45,6 +53,17 @@ const ProjectsProjectIdRoute = ProjectsProjectIdRouteImport.update({
   path: '/$projectId',
   getParentRoute: () => ProjectsRoute,
 } as any)
+const ResearchIndexRoute = ResearchIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => ResearchRoute,
+} as any)
+const ResearchResearchProjectIdRoute =
+  ResearchResearchProjectIdRouteImport.update({
+    id: '/$researchProjectId',
+    path: '/$researchProjectId',
+    getParentRoute: () => ResearchRoute,
+  } as any)
 const ProjectsProjectIdIndexRoute = ProjectsProjectIdIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -78,8 +97,11 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/projects': typeof ProjectsRouteWithChildren
   '/remote-launch': typeof RemoteLaunchRoute
+  '/research': typeof ResearchRouteWithChildren
   '/projects/$projectId': typeof ProjectsProjectIdRouteWithChildren
+  '/research/$researchProjectId': typeof ResearchResearchProjectIdRoute
   '/projects/': typeof ProjectsIndexRoute
+  '/research/': typeof ResearchIndexRoute
   '/projects/$projectId/skills': typeof ProjectsProjectIdSkillsRoute
   '/projects/$projectId/': typeof ProjectsProjectIdIndexRoute
   '/projects/$projectId/settings/$tab': typeof ProjectsProjectIdSettingsTabRoute
@@ -89,7 +111,9 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/remote-launch': typeof RemoteLaunchRoute
+  '/research/$researchProjectId': typeof ResearchResearchProjectIdRoute
   '/projects': typeof ProjectsIndexRoute
+  '/research': typeof ResearchIndexRoute
   '/projects/$projectId/skills': typeof ProjectsProjectIdSkillsRoute
   '/projects/$projectId': typeof ProjectsProjectIdIndexRoute
   '/projects/$projectId/settings/$tab': typeof ProjectsProjectIdSettingsTabRoute
@@ -101,8 +125,11 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/projects': typeof ProjectsRouteWithChildren
   '/remote-launch': typeof RemoteLaunchRoute
+  '/research': typeof ResearchRouteWithChildren
   '/projects/$projectId': typeof ProjectsProjectIdRouteWithChildren
+  '/research/$researchProjectId': typeof ResearchResearchProjectIdRoute
   '/projects/': typeof ProjectsIndexRoute
+  '/research/': typeof ResearchIndexRoute
   '/projects/$projectId/skills': typeof ProjectsProjectIdSkillsRoute
   '/projects/$projectId/': typeof ProjectsProjectIdIndexRoute
   '/projects/$projectId/settings/$tab': typeof ProjectsProjectIdSettingsTabRoute
@@ -115,8 +142,11 @@ export interface FileRouteTypes {
     | '/'
     | '/projects'
     | '/remote-launch'
+    | '/research'
     | '/projects/$projectId'
+    | '/research/$researchProjectId'
     | '/projects/'
+    | '/research/'
     | '/projects/$projectId/skills'
     | '/projects/$projectId/'
     | '/projects/$projectId/settings/$tab'
@@ -126,7 +156,9 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/remote-launch'
+    | '/research/$researchProjectId'
     | '/projects'
+    | '/research'
     | '/projects/$projectId/skills'
     | '/projects/$projectId'
     | '/projects/$projectId/settings/$tab'
@@ -137,8 +169,11 @@ export interface FileRouteTypes {
     | '/'
     | '/projects'
     | '/remote-launch'
+    | '/research'
     | '/projects/$projectId'
+    | '/research/$researchProjectId'
     | '/projects/'
+    | '/research/'
     | '/projects/$projectId/skills'
     | '/projects/$projectId/'
     | '/projects/$projectId/settings/$tab'
@@ -150,6 +185,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ProjectsRoute: typeof ProjectsRouteWithChildren
   RemoteLaunchRoute: typeof RemoteLaunchRoute
+  ResearchRoute: typeof ResearchRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
@@ -175,6 +211,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RemoteLaunchRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/research': {
+      id: '/research'
+      path: '/research'
+      fullPath: '/research'
+      preLoaderRoute: typeof ResearchRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/projects/': {
       id: '/projects/'
       path: '/'
@@ -188,6 +231,20 @@ declare module '@tanstack/react-router' {
       fullPath: '/projects/$projectId'
       preLoaderRoute: typeof ProjectsProjectIdRouteImport
       parentRoute: typeof ProjectsRoute
+    }
+    '/research/': {
+      id: '/research/'
+      path: '/'
+      fullPath: '/research/'
+      preLoaderRoute: typeof ResearchIndexRouteImport
+      parentRoute: typeof ResearchRoute
+    }
+    '/research/$researchProjectId': {
+      id: '/research/$researchProjectId'
+      path: '/$researchProjectId'
+      fullPath: '/research/$researchProjectId'
+      preLoaderRoute: typeof ResearchResearchProjectIdRouteImport
+      parentRoute: typeof ResearchRoute
     }
     '/projects/$projectId/': {
       id: '/projects/$projectId/'
@@ -260,10 +317,25 @@ const ProjectsRouteWithChildren = ProjectsRoute._addFileChildren(
   ProjectsRouteChildren,
 )
 
+interface ResearchRouteChildren {
+  ResearchResearchProjectIdRoute: typeof ResearchResearchProjectIdRoute
+  ResearchIndexRoute: typeof ResearchIndexRoute
+}
+
+const ResearchRouteChildren: ResearchRouteChildren = {
+  ResearchResearchProjectIdRoute: ResearchResearchProjectIdRoute,
+  ResearchIndexRoute: ResearchIndexRoute,
+}
+
+const ResearchRouteWithChildren = ResearchRoute._addFileChildren(
+  ResearchRouteChildren,
+)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ProjectsRoute: ProjectsRouteWithChildren,
   RemoteLaunchRoute: RemoteLaunchRoute,
+  ResearchRoute: ResearchRouteWithChildren,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

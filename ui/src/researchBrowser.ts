@@ -1,7 +1,10 @@
 /** Navigation stays in the preview; executable/local URLs and URL credentials are rejected. */
 export function researchBrowserUrl(input: string): string | null {
   try {
-    const url = new URL(input.trim());
+    let value = input.trim();
+    if (/^(?:doi:\s*)?10\.\d{4,9}\/\S+$/i.test(value)) value = `https://doi.org/${value.replace(/^doi:\s*/i, "")}`;
+    else if (/^(?:[a-z\d-]+\.)+[a-z]{2,}(?:[/:?#]|$)/i.test(value)) value = `https://${value}`;
+    const url = new URL(value);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
     return url.href;
   } catch { return null; }

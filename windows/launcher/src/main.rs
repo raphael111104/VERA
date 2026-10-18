@@ -33,6 +33,14 @@ fn start_orx() -> std::io::Result<std::process::Child> {
     let executable = std::env::current_exe()?.with_file_name("orx.exe");
 
     let mut command = std::process::Command::new(executable);
+    // Tools shipped by the installer are private to this app. Do not alter the
+    // system PATH or require a Node/Python/Rust installation on the user's PC.
+    let runtime = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the launcher has no parent directory"))?
+        .join("runtime");
+    let bundled_path = tool_path(&runtime, std::env::var_os("PATH"))?;
+    command.env("PATH", bundled_path);
     if std::env::var_os("VERA_APP_HOME").is_none_or(|path| path.is_empty()) {
         let app_data = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is not set")
@@ -47,6 +55,52 @@ fn start_orx() -> std::io::Result<std::process::Child> {
         .arg("app")
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
+}
+
+#[cfg(windows)]
+fn tool_path(
+    runtime: &std::path::Path,
+    inherited: Option<std::ffi::OsString>,
+) -> std::io::Result<std::ffi::OsString> {
+    let mut paths = Vec::new();
+    for (directory, binary) in [
+        ("git/cmd", "git.exe"),
+        ("opencode", "opencode.exe"),
+        // New Git for Windows releases put curl/OpenSSL in ucrt64.
+        ("git/ucrt64/bin", "curl.exe"),
+    ] {
+        let directory = runtime.join(directory);
+        if directory.join(binary).is_file() {
+            paths.push(directory);
+        }
+    }
+    if let Some(inherited) = inherited {
+        paths.extend(std::env::split_paths(&inherited));
+    }
+    std::env::join_paths(paths).map_err(std::io::Error::other)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::tool_path;
+
+    #[test]
+    fn bundled_tools_are_discovered_without_global_tools() {
+        let root = std::env::temp_dir().join(format!("vera-launcher-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("git/cmd")).unwrap();
+        std::fs::create_dir_all(root.join("opencode")).unwrap();
+        std::fs::create_dir_all(root.join("git/ucrt64/bin")).unwrap();
+        std::fs::write(root.join("git/cmd/git.exe"), []).unwrap();
+        std::fs::write(root.join("opencode/opencode.exe"), []).unwrap();
+        std::fs::write(root.join("git/ucrt64/bin/curl.exe"), []).unwrap();
+        let path = tool_path(&root, Some(r"C:\Windows\System32".into())).unwrap();
+        let paths: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(paths[0], root.join("git/cmd"));
+        assert_eq!(paths[1], root.join("opencode"));
+        assert_eq!(paths[2], root.join("git/ucrt64/bin"));
+        assert_eq!(paths[3], std::path::Path::new(r"C:\Windows\System32"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(all(windows, embedded_orx))]

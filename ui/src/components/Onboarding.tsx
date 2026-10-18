@@ -1,3 +1,4 @@
+import { Select } from './ui/Select';
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Terminal as Xterm } from "@xterm/xterm";
 import {
@@ -448,14 +449,14 @@ export function Onboarding({
             </p>}
             {selectedHarness && <div lang="id" className="mt-5 rounded-lg border border-border bg-background p-4">
               <label htmlFor="onb-model" className="mb-2 block text-base font-medium">Model AI · {selectedHarness.name}</label>
-              {selectedHarness.models.length > 0 ? <select id="onb-model" className="w-full rounded-md border border-border bg-background p-3 text-base text-text" value={selectedModel ?? ""} onChange={(event) => setPreferredModel(event.target.value)}>
+              {selectedHarness.models.length > 0 ? <Select id="onb-model" className="w-full rounded-md border border-border bg-background p-3 text-base text-text" value={selectedModel ?? ""} onChange={(event) => setPreferredModel(event.target.value)}>
                 {selectedHarness.models.map((model) => <option key={model.id} value={model.id}>{harnessModelLabel(model)}</option>)}
-              </select> : <p className="m-0 text-sm leading-relaxed text-subtext">Layanan ini tidak menyediakan daftar model. VERA akan menggunakan model bawaan yang telah Anda konfigurasi pada layanan tersebut.</p>}
+              </Select> : <p className="m-0 text-sm leading-relaxed text-subtext">Layanan ini tidak menyediakan daftar model. VERA akan menggunakan model bawaan yang telah Anda konfigurasi pada layanan tersebut.</p>}
               {reasoning.choices.length > 0 && <div className="mt-4">
                 <label htmlFor="onb-reasoning" className="mb-2 block text-base font-medium">Tingkat usaha AI</label>
-                <select id="onb-reasoning" className="w-full rounded-md border border-border bg-background p-3 text-base text-text" value={selectedReasoning ?? ""} onChange={event => setPreferredReasoning(event.target.value)}>
+                <Select id="onb-reasoning" className="w-full rounded-md border border-border bg-background p-3 text-base text-text" value={selectedReasoning ?? ""} onChange={event => setPreferredReasoning(event.target.value)}>
                   {reasoning.choices.map(choice => <option key={choice.id} value={choice.id}>{choice.label}</option>)}
-                </select>
+                </Select>
                 <p className="mb-0 text-sm text-subtext">Tingkat usaha mengikuti kemampuan model. Pilihan ini diteruskan ke workspace.</p>
               </div>}
             </div>}

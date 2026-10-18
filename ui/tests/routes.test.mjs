@@ -32,6 +32,8 @@ function loadModule(filename, api = {}, remembered = null) {
       if (id === "./api") return { isDemoProjectId: () => false, ...api };
       if (id === "./workspaceTabs") return load(new URL("./workspaceTabs.ts", url));
       if (id === "../App") return { default: () => null };
+      if (id === "../features/research-workflow/ResearchProjectsPage") return { ResearchProjectsPage: () => null };
+      if (id === "../features/research-workflow/ResearchWorkspace") return { ResearchWorkspace: () => null };
       if (id === "../RemoteRuntime") return { RuntimeRoot: () => null, useRuntime: () => ({ kind: "local" }) };
       if (id === "../routePages") return { ResumeGlobal: () => null, ResumeProject: () => null, ProjectsPage: () => null };
       if (id.startsWith("./routes/")) return load(new URL(`${id}.tsx`, url));
@@ -59,6 +61,8 @@ test("real file routes distinguish task/new, task IDs, project index, and settin
     ["/projects/p/skills", "/projects/$projectId/skills"],
     ["/projects/p/settings/git", "/projects/$projectId/settings/$tab"],
     ["/remote-launch", "/remote-launch"],
+    ["/research", "/research/"],
+    ["/research/00000000-0000-4000-8000-000000000001", "/research/$researchProjectId"],
   ]) {
     const router = await match(path);
     assert.equal(router.state.matches.at(-1).routeId, routeId, path);
