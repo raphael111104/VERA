@@ -1,0 +1,17 @@
+{
+  "diagram_type": "architecture",
+  "artifact": "index.html",
+  "artifact_sha256": "eac8026b292d2dd0ecf73d78b70a1fd982100049da42270b9e20d0a73559ec5c",
+  "artifact_bytes": 816837,
+  "specification_sha256": "27abc187b7786ebefe99a0f955f426a326c160a29776d17a81a873e74a30a416",
+  "validation": "9/9 showcase, 0 errors, 0 warnings",
+  "browser_evidence": "passed",
+  "browser_receipt": "index.visual-check.json",
+  "visual_review": "passed",
+  "review_method": "Image-capable review of four screenshots from the final artifact-bound visual-check run",
+  "correction_rounds": 2,
+  "viewports_measured": [[1440,900],[1600,1000],[1920,1080],[2048,1320]],
+  "screenshots_reviewed": ["index.visual-check.1440x900.light.png","index.visual-check.1440x900.dark.png","index.visual-check.2048x1320.light.png","index.visual-check.2048x1320.dark.png"],
+  "observations": ["All diagram nodes and legend fit inside the initial desktop viewport.","Primary path, secondary branches, labels and node boundaries are distinguishable in both themes.","No unrelated node crossings or obscured relationship labels were observed.","The largest desktop composition uses the vertical space without a conspicuous empty lower band."],
+  "limits": ["No interactive end-to-end test of search, focus, presentation or export formats.","No runtime VERA workflows exercised by this documentation task."]
+}

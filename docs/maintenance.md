@@ -4,13 +4,16 @@
 
 | Folder | Purpose | Cleanup policy |
 |---|---|---|
-| `src/`, `tests/` | Rust application and integration tests | Source; retain |
-| `ui/src/`, `ui/tests/`, `ui/messages/`, `ui/public/` | Dashboard source, tests, catalogs, and static assets | Source; retain |
+| `src/`, `tests/` | Rust application, embedded scripts (`folder_picker.ps1`, `install_opencode.ps1`, `render_workflow_docx.ps1`), and integration tests | Source; retain |
+| `ui/src/`, `ui/tests/`, `ui/messages/`, `ui/public/`, `ui/scripts/` | Dashboard source, tests, catalogs, static assets, and style/i18n lint scripts | Source; retain |
 | `ui/dist/` | Generated dashboard embedded in the server | Committed; regenerate with `pnpm build`, never treat as a disposable cache |
 | `ui/node_modules/` | Installed development dependencies | Retain dependencies; delete only disposable tool caches |
-| `scripts/` | Reusable development, test, and maintenance commands | Source; retain |
-| `windows/`, `linux/`, `macos/` | Platform packaging tools and assets | Source; retain |
-| `docs/research-workflow/` | Workflow implementation reports and `specification/` | Retain specifications and dated evidence summaries |
+| `agent-skills/`, `demo/`, `release-notes/` | Bundled agent skills, demo project fixtures, and release note highlights | Source; retain |
+| `scripts/` | Reusable development, test, release, and maintenance commands ([index](../scripts/README.md)) | Source; retain |
+| `windows/`, `linux/`, `macos/` | Platform packaging tools, launcher crate, and native assets | Source; retain |
+| `docs/architecture/` | Interactive system architecture diagram, specification, and verification receipts | Documentation; retain |
+| `docs/research-workflow/` | Workflow implementation reports, ADRs, and `specification/` | Retain specifications and dated evidence summaries |
+| `docs/design-history/`, `docs/audits/` | Historical UI design notes and dated verification/cleanup audits | Retain historical evidence |
 | `target/`, `windows/launcher/target/` | Rust build outputs and isolated test/package fixtures | Rebuildable; remove when no build or candidate test is running |
 | `dist/` | Current local Windows distribution | Retain `VERA.exe`, `VERA-Setup.exe`, manifest, instructions, and checksums; excluded from Git |
 | `dist/backups/` | Superseded local distribution copies | Remove only after validating the current package |

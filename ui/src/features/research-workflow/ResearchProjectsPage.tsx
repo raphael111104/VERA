@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { ArrowRight, BookOpen, FolderOpen, Plus } from "lucide-react";
+import { ArrowRight, BookOpen, FolderOpen, Home, Plus } from "lucide-react";
 import { BrandMark } from "../../components/Wordmark";
 import { Button } from "../../components/ui";
+import { showLandingPage } from "../../components/StartupSplash";
 import { createProject, listProjects, ownerKey, restoreOwnerKey } from "./api";
 import { Notice } from "./shared";
 import { TermHelp } from "./TermHelp";
@@ -60,7 +61,7 @@ export function ResearchProjectsPage() {
   }, [projects.data, projects.error, projects.refetch, savedDemo]);
   return (
     <div className="h-full overflow-y-auto bg-canvas text-text">
-      <header className="flex items-center justify-between gap-4 border-b border-border bg-background px-6 py-4">
+      <header className="flex items-center justify-between gap-4 border-b border-border bg-background px-6 py-4 mac-titlebar:ps-20 win-titlebar:pe-36">
         <span className="flex items-center gap-3 font-semibold">
           <span className="size-8">
             <BrandMark />
@@ -68,6 +69,10 @@ export function ResearchProjectsPage() {
           VERA{" "}
           <span className="text-sm font-normal text-subtext">Ruang kajian</span>
         </span>
+        <Button variant="ghost" size="small" onClick={showLandingPage}>
+          <Home size={15} aria-hidden="true" />
+          Halaman awal
+        </Button>
       </header>
       <main className="mx-auto max-w-5xl px-6 py-10">
         <p className="text-sm font-medium text-primary">

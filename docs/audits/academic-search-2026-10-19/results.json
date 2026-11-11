@@ -1,0 +1,545 @@
+{
+  "startedAt": "2026-10-19T10:18:58.634112+07:00",
+  "sourceCommit": "1fec991dc4ed577c87c8bf872b491ea74c56eef8",
+  "binarySource": "manifest-verified backend embedded in dist/VERA.exe",
+  "fingerprints": {
+    "orx.exe": "bdc6c317bbaafe8861b7c5fa0f787f94f5a5d05eb8eae0eaf7e93c13470150f2",
+    "WebView2Loader.dll": "86545b66cdb0603bc26b626fb9ad610cb6e71f28d468f5ea66df23b03dda96d5"
+  },
+  "credentials": {
+    "SCOPUS_API_KEY": {
+      "configured": true,
+      "source": "VERA saved environment"
+    },
+    "SCOPUS_INST_TOKEN": {
+      "configured": false,
+      "source": null
+    },
+    "OPENALEX_API_KEY": {
+      "configured": false,
+      "source": null
+    },
+    "NCBI_API_KEY": {
+      "configured": false,
+      "source": null
+    },
+    "NCBI_EMAIL": {
+      "configured": false,
+      "source": null
+    }
+  },
+  "capabilities": [
+    {
+      "configured": true,
+      "detail": "Metadata deposit penerbit; cursor 25 record. Abstrak tidak selalu tersedia.",
+      "id": "crossref",
+      "label": "Crossref"
+    },
+    {
+      "configured": true,
+      "detail": "E-utilities NLM, 25 record per halaman; batas 10.000 ID per query. Metadata/abstrak, bukan fulltext.",
+      "id": "pubmed",
+      "label": "PubMed"
+    },
+    {
+      "configured": true,
+      "detail": "Konektor discovery alphaXiv lama; snapshot terbatas, total dan pagination tidak tersedia. Bukan pencarian menyeluruh arXiv.",
+      "id": "alphaxiv",
+      "label": "alphaXiv / arXiv"
+    },
+    {
+      "configured": true,
+      "detail": "OpenAlex dengan filter sumber bioRxiv yang tercatat. Metadata preprint, belum tentu peer-reviewed.",
+      "id": "biorxiv",
+      "label": "bioRxiv via OpenAlex"
+    },
+    {
+      "configured": false,
+      "detail": "Metadata/abstrak bila tersedia; halaman 25 record. Akses mengikuti kebijakan provider.",
+      "id": "openalex",
+      "label": "OpenAlex"
+    },
+    {
+      "configured": true,
+      "detail": "STANDARD metadata, halaman 25 record. API key dan entitlement diperlukan; fulltext tidak dijamin.",
+      "id": "scopus",
+      "label": "Scopus"
+    }
+  ],
+  "tests": [
+    {
+      "provider": "scopus",
+      "case": "baseline",
+      "query": "TITLE-ABS-KEY(\"machine learning\")",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 1196465,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 0,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 1.954,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "scopus",
+      "case": "pagination",
+      "query": "TITLE-ABS-KEY(\"machine learning\")",
+      "status": "partial",
+      "retrieved": 50,
+      "reportedTotal": 1196465,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 2,
+      "emptyTitles": 0,
+      "withDoi": 50,
+      "withAbstract": 0,
+      "uniqueProviderIds": 50,
+      "pass": true,
+      "seconds": 2.234,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "scopus",
+      "case": "topic",
+      "query": "TITLE-ABS-KEY((chatgpt OR \"generative artificial intelligence\") AND (student* OR universit*) AND (research OR \"literature review\"))",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 7330,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 24,
+      "withAbstract": 0,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 1.266,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "scopus",
+      "case": "empty_result",
+      "query": "TITLE-ABS-KEY(verasearchnonexistentqzxj20261019)",
+      "status": "complete",
+      "retrieved": 0,
+      "reportedTotal": 0,
+      "newRecords": 0,
+      "hasCheckpoint": false,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 0,
+      "withAbstract": 0,
+      "uniqueProviderIds": 0,
+      "pass": true,
+      "seconds": 1.0,
+      "providerPageRecords": 0,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "pubmed",
+      "case": "baseline",
+      "query": "\"machine learning\"[Title/Abstract]",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 215319,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 10,
+      "uniqueProviderIds": 25,
+      "queryTranslation": "\"machine learning\"[Title/Abstract]",
+      "providerWarnings": null,
+      "pass": true,
+      "seconds": 2.625,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "pubmed",
+      "case": "pagination",
+      "query": "\"machine learning\"[Title/Abstract]",
+      "status": "partial",
+      "retrieved": 46,
+      "reportedTotal": 215319,
+      "newRecords": 21,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 2,
+      "emptyTitles": 0,
+      "withDoi": 45,
+      "withAbstract": 15,
+      "uniqueProviderIds": 46,
+      "queryTranslation": "\"machine learning\"[Title/Abstract]",
+      "providerWarnings": null,
+      "pass": false,
+      "seconds": 8.766,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": [
+        "31711732",
+        "31734203",
+        "35106604",
+        "39209700"
+      ]
+    },
+    {
+      "provider": "pubmed",
+      "case": "topic",
+      "query": "(\"ChatGPT\"[Title/Abstract] OR \"generative artificial intelligence\"[Title/Abstract]) AND (student*[Title/Abstract] OR universit*[Title/Abstract]) AND (research[Title/Abstract] OR \"literature review\"[Title/Abstract])",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 756,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 25,
+      "uniqueProviderIds": 25,
+      "queryTranslation": "(\"ChatGPT\"[Title/Abstract] OR \"generative artificial intelligence\"[Title/Abstract]) AND (\"student*\"[Title/Abstract] OR \"universit*\"[Title/Abstract]) AND (\"research\"[Title/Abstract] OR \"literature review\"[Title/Abstract])",
+      "providerWarnings": null,
+      "pass": true,
+      "seconds": 5.75,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "pubmed",
+      "case": "empty_result",
+      "query": "verasearchnonexistentqzxj20261019[Title/Abstract]",
+      "status": "failed",
+      "retrieved": 0,
+      "reportedTotal": null,
+      "newRecords": 0,
+      "hasCheckpoint": false,
+      "warnings": [
+        "Query PubMed ditolak. Periksa sintaks."
+      ],
+      "pages": 0,
+      "emptyTitles": 0,
+      "withDoi": 0,
+      "withAbstract": 0,
+      "uniqueProviderIds": 0,
+      "pass": false,
+      "seconds": 1.61
+    },
+    {
+      "provider": "openalex",
+      "case": "baseline",
+      "query": "\"machine learning\"",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 3690219,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 23,
+      "withAbstract": 13,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 3.828,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "openalex",
+      "case": "pagination",
+      "query": "\"machine learning\"",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 3690219,
+      "newRecords": 0,
+      "hasCheckpoint": true,
+      "warnings": [
+        "Provider mengembalikan HTTP 401. Periksa credential/entitlement atau batas request; tidak ada hasil pengganti."
+      ],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 23,
+      "withAbstract": 13,
+      "uniqueProviderIds": 25,
+      "pass": false,
+      "seconds": 0.406,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "openalex",
+      "case": "topic",
+      "query": "(ChatGPT OR \"generative artificial intelligence\") AND (students OR university) AND (research OR \"literature review\")",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 278496,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 25,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 3.734,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "openalex",
+      "case": "empty_result",
+      "query": "verasearchnonexistentqzxj20261019",
+      "status": "complete",
+      "retrieved": 0,
+      "reportedTotal": 0,
+      "newRecords": 0,
+      "hasCheckpoint": false,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 0,
+      "withAbstract": 0,
+      "uniqueProviderIds": 0,
+      "pass": true,
+      "seconds": 1.813,
+      "providerPageRecords": 0,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "crossref",
+      "case": "baseline",
+      "query": "\"machine learning\"",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 3056122,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 2,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 2.062,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "crossref",
+      "case": "pagination",
+      "query": "\"machine learning\"",
+      "status": "partial",
+      "retrieved": 50,
+      "reportedTotal": 3056122,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 2,
+      "emptyTitles": 0,
+      "withDoi": 50,
+      "withAbstract": 3,
+      "uniqueProviderIds": 50,
+      "pass": true,
+      "seconds": 2.578,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "crossref",
+      "case": "topic",
+      "query": "ChatGPT generative artificial intelligence students university research literature review",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 27468316,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 14,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 17.109,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "biorxiv",
+      "case": "baseline",
+      "query": "\"machine learning\"",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 20059,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 25,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 2.969,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "biorxiv",
+      "case": "pagination",
+      "query": "\"machine learning\"",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 20059,
+      "newRecords": 0,
+      "hasCheckpoint": true,
+      "warnings": [
+        "Provider mengembalikan HTTP 401. Periksa credential/entitlement atau batas request; tidak ada hasil pengganti."
+      ],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 25,
+      "uniqueProviderIds": 25,
+      "pass": false,
+      "seconds": 0.547,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "biorxiv",
+      "case": "topic",
+      "query": "\"machine learning\" AND genomics",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": 9160,
+      "newRecords": 25,
+      "hasCheckpoint": true,
+      "warnings": [],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 25,
+      "withAbstract": 25,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 2.547,
+      "providerPageRecords": 25,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "alphaxiv",
+      "case": "baseline",
+      "query": "\"machine learning\"",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": null,
+      "newRecords": 25,
+      "hasCheckpoint": false,
+      "warnings": [
+        "Pagination belum membuktikan seluruh hasil diterima. Periksa checkpoint dan cakupan."
+      ],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 0,
+      "withAbstract": 25,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 1.219,
+      "providerPageRecords": 0,
+      "overlapWithEarlierPages": []
+    },
+    {
+      "provider": "alphaxiv",
+      "case": "topic",
+      "query": "large language models education",
+      "status": "partial",
+      "retrieved": 25,
+      "reportedTotal": null,
+      "newRecords": 25,
+      "hasCheckpoint": false,
+      "warnings": [
+        "Pagination belum membuktikan seluruh hasil diterima. Periksa checkpoint dan cakupan."
+      ],
+      "pages": 1,
+      "emptyTitles": 0,
+      "withDoi": 0,
+      "withAbstract": 25,
+      "uniqueProviderIds": 25,
+      "pass": true,
+      "seconds": 0.812,
+      "providerPageRecords": 0,
+      "overlapWithEarlierPages": []
+    }
+  ],
+  "diagnostics": [
+    {
+      "name": "pubmed_empty_control",
+      "httpStatus": 200,
+      "evidence": {
+        "count": "0",
+        "idlist": [],
+        "errorlist": {
+          "phrasesnotfound": [
+            "verasearchnonexistentqzxj20261019"
+          ],
+          "fieldsnotfound": []
+        },
+        "warninglist": {
+          "phrasesignored": [],
+          "quotedphrasesnotfound": [],
+          "outputmessages": [
+            "No items found."
+          ]
+        },
+        "querytranslation": "verasearchnonexistentqzxj20261019[Title/Abstract]"
+      }
+    },
+    {
+      "name": "openalex_cursor_control_without_key",
+      "httpStatus": 401,
+      "evidence": {
+        "error": "API key required for cursor paging",
+        "code": null,
+        "message": "Paging past the first page with cursor= needs a free API key. Get one in a minute at https://openalex.org/settings/api"
+      }
+    },
+    {
+      "name": "biorxiv_cursor_control_without_key",
+      "httpStatus": 401,
+      "evidence": {
+        "error": "API key required for cursor paging",
+        "code": null,
+        "message": "Paging past the first page with cursor= needs a free API key. Get one in a minute at https://openalex.org/settings/api"
+      }
+    }
+  ],
+  "limits": [
+    "Live metadata search only; no full-text retrieval or screening.",
+    "At most two pages of 25 records per baseline query.",
+    "Provider-reported totals are not counts of content-assessed articles.",
+    "Crossref query is ranked free text, not a Boolean filtering guarantee.",
+    "bioRxiv uses the OpenAlex source filter; alphaXiv is a bounded discovery snapshot."
+  ],
+  "finishedAt": "2026-10-19T10:20:09.270314+07:00",
+  "summary": {
+    "total": 20,
+    "passed": 16,
+    "strictPaginationReviewApplied": true
+  }
+}

@@ -1,0 +1,393 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Arsitektur Sistem VERA",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1390,
+      790
+    ],
+    "repository": {
+      "url": "https://github.com/raphael111104/VERA.git",
+      "revision": "1fec991dc4ed577c87c8bf872b491ea74c56eef8"
+    }
+  },
+  "components": [
+    {
+      "id": "desktop-vera",
+      "type": "frontend",
+      "label": "Aplikasi desktop",
+      "sublabel": "tao / wry · WebView2",
+      "pos": [
+        100,
+        50
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/commands/app.rs",
+          "label": "Jendela desktop"
+        }
+      ]
+    },
+    {
+      "id": "dashboard-vera",
+      "type": "frontend",
+      "label": "Dashboard React",
+      "sublabel": "React 19 · TanStack · Vite",
+      "pos": [
+        100,
+        250
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "ui/package.json",
+          "label": "Dependensi dashboard"
+        },
+        {
+          "path": "ui/src/api.ts",
+          "label": "Klien API"
+        },
+        {
+          "path": "ui/src/events.ts",
+          "label": "EventSource bersama"
+        }
+      ]
+    },
+    {
+      "id": "api-local",
+      "type": "backend",
+      "label": "orx · API lokal",
+      "sublabel": "Rust / Axum · 127.0.0.1",
+      "pos": [
+        610,
+        250
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/commands/up.rs",
+          "line": 1,
+          "end_line": 13,
+          "label": "HTTP, SSE, SPA"
+        },
+        {
+          "path": "src/main.rs",
+          "label": "Perintah CLI"
+        }
+      ]
+    },
+    {
+      "id": "sqlite-store",
+      "type": "database",
+      "label": "SQLite · orx.db",
+      "sublabel": "Proyek, sesi, run, alur riset",
+      "pos": [
+        1120,
+        250
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/store.rs",
+          "line": 1,
+          "end_line": 39,
+          "label": "Penyimpanan lokal"
+        },
+        {
+          "path": "src/store/research_workflow.rs",
+          "label": "Revisi alur riset"
+        }
+      ]
+    },
+    {
+      "id": "chat-runtime",
+      "type": "backend",
+      "label": "Orkestrasi percakapan",
+      "sublabel": "ChatHost · giliran · pemulihan",
+      "pos": [
+        610,
+        50
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/local/chat/mod.rs",
+          "label": "Host percakapan"
+        },
+        {
+          "path": "src/local/agent_lifecycle.rs",
+          "label": "Siklus hidup agent"
+        }
+      ]
+    },
+    {
+      "id": "harness-registry",
+      "type": "backend",
+      "label": "Integrasi coding agent",
+      "sublabel": "Codex · Claude · OpenCode",
+      "tag": "Kapabilitas berbeda tiap harness",
+      "pos": [
+        1120,
+        50
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/local/harness/mod.rs",
+          "line": 1,
+          "end_line": 22,
+          "label": "Trait dan registry Harness"
+        },
+        {
+          "path": "src/local/local_models.rs",
+          "label": "Model lokal opsional"
+        }
+      ]
+    },
+    {
+      "id": "research-domain",
+      "type": "backend",
+      "label": "Alur kerja riset",
+      "sublabel": "Protokol · seleksi · bukti · keluaran",
+      "pos": [
+        610,
+        450
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/commands/up/research_workflow.rs",
+          "label": "API alur riset"
+        },
+        {
+          "path": "src/local/research_workflow/mod.rs",
+          "line": 1,
+          "end_line": 14,
+          "label": "Modul riset berversi"
+        },
+        {
+          "path": "src/local/research.rs",
+          "label": "Job pencarian literatur"
+        }
+      ]
+    },
+    {
+      "id": "academic-sources",
+      "type": "external",
+      "label": "Sumber akademik",
+      "sublabel": "Crossref · PubMed · OpenAlex",
+      "tag": "Scopus* · alphaXiv · bioRxiv",
+      "pos": [
+        1120,
+        450
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/local/research_workflow/search.rs",
+          "line": 60,
+          "end_line": 68,
+          "label": "Konektor dan status konfigurasi"
+        },
+        {
+          "path": "src/client.rs",
+          "label": "Klien akademik"
+        }
+      ]
+    },
+    {
+      "id": "compute-runtime",
+      "type": "backend",
+      "label": "Eksperimen & eksekusi",
+      "sublabel": "Snapshot Git · supervisi run",
+      "pos": [
+        100,
+        450
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/compute.rs",
+          "line": 1,
+          "end_line": 6,
+          "label": "Siklus compute dan snapshot"
+        },
+        {
+          "path": "src/commands/supervise.rs",
+          "label": "Supervisor run"
+        },
+        {
+          "path": "src/local/experiments.rs",
+          "label": "Eksperimen lokal"
+        }
+      ]
+    },
+    {
+      "id": "execution-targets",
+      "type": "external",
+      "label": "Target eksekusi pilihan",
+      "sublabel": "local · SSH · Slurm · Ray",
+      "tag": "HF Jobs · Modal · K8s · Tinker",
+      "pos": [
+        100,
+        650
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/local/mod.rs",
+          "line": 88,
+          "end_line": 94,
+          "label": "Daftar backend"
+        },
+        {
+          "path": "src/compute.rs",
+          "label": "Adapter eksekusi"
+        }
+      ]
+    },
+    {
+      "id": "workspace-files",
+      "type": "database",
+      "label": "Berkas ruang kerja",
+      "sublabel": "Artefak · dokumen · bukti riset",
+      "pos": [
+        610,
+        650
+      ],
+      "size": [
+        240,
+        80
+      ],
+      "sources": [
+        {
+          "path": "src/local/research_workflow/outputs.rs",
+          "label": "Keluaran riset"
+        },
+        {
+          "path": "src/local/files.rs",
+          "label": "Akses berkas proyek"
+        },
+        {
+          "path": "src/local/git.rs",
+          "label": "Riwayat Git"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "desktop-dashboard",
+      "from": "desktop-vera",
+      "to": "dashboard-vera",
+      "label": "WebView lokal",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 73
+    },
+    {
+      "id": "dashboard-api",
+      "from": "dashboard-vera",
+      "to": "api-local",
+      "label": "HTTP · SSE · WebSocket",
+      "variant": "emphasis"
+    },
+    {
+      "id": "api-store",
+      "from": "api-local",
+      "to": "sqlite-store",
+      "label": "baca / tulis SQL",
+      "variant": "emphasis"
+    },
+    {
+      "id": "api-chat",
+      "from": "api-local",
+      "to": "chat-runtime",
+      "label": "kelola giliran",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "chat-harness",
+      "from": "chat-runtime",
+      "to": "harness-registry",
+      "label": "jalankan CLI agent"
+    },
+    {
+      "id": "api-research",
+      "from": "api-local",
+      "to": "research-domain",
+      "label": "revisi & validasi",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 73
+    },
+    {
+      "id": "research-academic",
+      "from": "research-domain",
+      "to": "academic-sources",
+      "label": "HTTPS · metadata",
+      "variant": "dashed"
+    },
+    {
+      "id": "api-compute",
+      "from": "api-local",
+      "to": "compute-runtime",
+      "label": "submit / pantau",
+      "fromSide": "left",
+      "toSide": "right"
+    },
+    {
+      "id": "compute-target",
+      "from": "compute-runtime",
+      "to": "execution-targets",
+      "label": "adapter backend",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 73
+    },
+    {
+      "id": "research-files",
+      "from": "research-domain",
+      "to": "workspace-files",
+      "label": "tulis keluaran",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 73
+    }
+  ]
+}

@@ -52,7 +52,7 @@ Rollback yang dianjurkan memakai flag pada binary ini. Binary lama yang menolak 
 - src/store/research_workflow.rs: paket immutable, amendment history, replay dan transaksi writer.
 - src/commands/up/research_workflow.rs serta up.rs: mutasi dan unduhan yang diotorisasi.
 - ui/src/features/research-workflow/audit dan learning: aktivitas baru.
-- scripts/render_workflow_docx.ps1: renderer Word lokal.
+- src/local/research_workflow/render_workflow_docx.ps1 (sebelumnya scripts/render_workflow_docx.ps1): renderer Word lokal.
 - scripts/test_research_workflow.py: acceptance HTTP dari proyek kosong, revisi, akses, ekspor dan belajar.
 
 ## Hasil pemeriksaan

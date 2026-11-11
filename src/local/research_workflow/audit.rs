@@ -705,11 +705,7 @@ pub async fn render(bytes: Vec<u8>, locators: Value) -> Option<(Vec<u8>, Value)>
                     serde_json::to_vec(&locators).ok()?,
                 )
                 .ok()?;
-                std::fs::write(
-                    &script,
-                    include_str!("../../../scripts/render_workflow_docx.ps1"),
-                )
-                .ok()?;
+                std::fs::write(&script, include_str!("render_workflow_docx.ps1")).ok()?;
                 let mut child = Command::new("powershell.exe")
                     .args([
                         "-NoLogo",

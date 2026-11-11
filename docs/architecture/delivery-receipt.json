@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Project 2026\\VERA\\arsitektur-sistem\\vera.architecture.json",
+  "output": "C:\\Project 2026\\VERA\\arsitektur-sistem\\index.html",
+  "specification": {
+    "sha256": "27abc187b7786ebefe99a0f955f426a326c160a29776d17a81a873e74a30a416",
+    "bytes": 8804
+  },
+  "artifact": {
+    "sha256": "eac8026b292d2dd0ecf73d78b70a1fd982100049da42270b9e20d0a73559ec5c",
+    "bytes": 816837
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  },
+  "evidence": {
+    "verified": true,
+    "repository": "https://github.com/raphael111104/VERA",
+    "revision": "1fec991dc4ed577c87c8bf872b491ea74c56eef8",
+    "references": 25
+  }
+}

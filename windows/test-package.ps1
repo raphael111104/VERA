@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$InstallDirectory,
     [int]$Port = 4793,
     [switch]$VerifyInstalledFiles,
-    [switch]$KeepRunning
+    [switch]$KeepRunning,
+    [switch]$KeepProfile
 )
 $ErrorActionPreference = 'Stop'
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -118,5 +119,15 @@ try {
     $report | ConvertTo-Json -Depth 5
 } finally {
     $client.Dispose()
-    if (-not $KeepRunning -and $backendId) { Stop-Process -Id $backendId -ErrorAction SilentlyContinue }
+    if (-not $KeepRunning) {
+        if ($backendId) { Stop-Process -Id $backendId -Force -ErrorAction SilentlyContinue }
+        if ($started -and -not $started.HasExited) { Stop-Process -Id $started.Id -Force -ErrorAction SilentlyContinue }
+        if (-not $KeepProfile -and (Test-Path -LiteralPath $profile)) {
+            Start-Sleep -Milliseconds 500
+            Get-ChildItem -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } |
+                ForEach-Object { cmd /c rmdir "$($_.FullName)" 2>$null | Out-Null }
+            Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }

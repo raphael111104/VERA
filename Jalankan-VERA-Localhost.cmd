@@ -142,10 +142,14 @@ try {
     $Host.UI.RawUI.WindowTitle = 'VERA - Menjalankan localhost'
     Set-Location -LiteralPath $root
     Write-Host 'Menyiapkan localhost VERA...' -ForegroundColor Cyan
-    foreach ($requiredPath in @((Join-Path $root 'Cargo.toml'), (Join-Path $uiDirectory 'src\paraglide\runtime.js'))) {
+    foreach ($requiredPath in @((Join-Path $root 'Cargo.toml'), (Join-Path $uiDirectory 'project.inlang\settings.json'))) {
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
             throw ('File yang diperlukan tidak ditemukan: ' + $requiredPath)
         }
+    }
+    $pnpmUserDir = Join-Path $localAppData 'pnpm'
+    if ((Test-Path -LiteralPath $pnpmUserDir -PathType Container) -and ($env:PATH -notlike "*$pnpmUserDir*")) {
+        $env:PATH = "$pnpmUserDir;$env:PATH"
     }
     if (-not (Get-Command 'node.exe' -ErrorAction SilentlyContinue)) {
         throw 'Node.js belum tersedia di PATH. Pasang Node.js, lalu buka launcher kembali.'
@@ -169,6 +173,21 @@ try {
         }
         if (-not (Test-Path -LiteralPath $vitePath -PathType Leaf)) {
             throw 'Dependensi dashboard selesai dipasang, tetapi Vite tidak ditemukan.'
+        }
+    }
+    $paraglideRuntime = Join-Path $uiDirectory 'src\paraglide\runtime.js'
+    if (-not (Test-Path -LiteralPath $paraglideRuntime -PathType Leaf)) {
+        $paraglideBin = Join-Path $uiDirectory 'node_modules\.bin\paraglide-js.cmd'
+        if (-not (Test-Path -LiteralPath $paraglideBin -PathType Leaf)) {
+            throw ('File yang diperlukan tidak ditemukan: ' + $paraglideRuntime)
+        }
+        Write-Host 'Menyiapkan modul lokalisasi Paraglide...' -ForegroundColor Cyan
+        Push-Location -LiteralPath $uiDirectory
+        try {
+            & $paraglideBin compile --silent --emit-ts-declarations
+            if ($LASTEXITCODE -ne 0) { throw ('Kompilasi Paraglide gagal dengan kode ' + $LASTEXITCODE + '.') }
+        } finally {
+            Pop-Location
         }
     }
 

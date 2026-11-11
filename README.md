@@ -47,8 +47,10 @@ Main source locations:
 - `scripts/`, `windows/`, `linux/`, and `macos/` — development and packaging tools.
 - `docs/` — platform and workflow documentation.
 
-See the [documentation index](docs/README.md) for the repository layout and
-[research workflow specifications and implementation notes](docs/research-workflow/README.md).
+See the [documentation index](docs/README.md) for the repository layout,
+[system architecture diagrams](docs/architecture/README.md),
+[research workflow specifications and implementation notes](docs/research-workflow/README.md),
+and [utility scripts reference](scripts/README.md).
 Build caches and local Windows packages have separate locations; follow the
 [workspace cleanup guide](docs/maintenance.md) to remove generated files safely.
 

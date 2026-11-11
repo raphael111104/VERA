@@ -1,14 +1,29 @@
-# Rust build outputs
+# =============================================================================
+# VERA (.gitignore) — https://github.com/raphael111104/VERA.git
+# =============================================================================
+
+# 1. Rust & Windows launcher build outputs
 /target/
 /windows/launcher/target/
 **/target/
 
-# JavaScript dependencies and generated output
-**/node_modules/
+# 2. Local desktop packaging, installers & release staging
+#    Note: /ui/dist/ is intentionally tracked and embedded into the binary.
 /dist/
+!/ui/dist/
 /app-dist/
 /app-installer/
 /app-staging/
+/release-archive/
+/release-unpacked/
+/signing-workflow/
+*.AppImage
+*.dmg
+*.msi
+*.msix
+
+# 3. JavaScript / UI dependencies, caches & generated localization
+**/node_modules/
 *.tsbuildinfo
 ui/package-lock.json
 /ui/.tanstack/
@@ -17,8 +32,11 @@ ui/package-lock.json
 /ui/coverage/
 /ui/playwright-report/
 /ui/test-results/
+/ui/src/paraglide/
+/ui/project.inlang/*
+!/ui/project.inlang/settings.json
 
-# Local environment and credentials
+# 4. Local environment, credentials & signing certificates
 .env
 .env.*
 **/.env
@@ -32,39 +50,62 @@ ui/package-lock.json
 *.p8
 *.p12
 *.pfx
+*.cer
+*.crt
 
-# Local data, logs, and caches
+# 5. Local SQLite stores, WebView2 profiles, logs & temporary files
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
+/orx.db
+/orx.db-wal
+/orx.db-shm
+*.WebView2/
 *.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 *.tmp
+*.temp
 *.bak
+*.swp
+*.swo
+*~
+
+# 6. Python caches & virtual environments
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .venv/
 venv/
-Claude.local.md
 
-# OS and editor state
+# 7. OS, IDE & local agent state
 .DS_Store
+.AppleDouble
+.LSOverride
 Thumbs.db
+ehthumbs.db
 desktop.ini
 /.idea/
 /.vscode/
-
-# Local git worktrees and private skills
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+Claude.local.md
+CLAUDE.local.md
 .claude/worktrees/
 .claude/skills/
-.agents/skills/
-.cursor/skills/
-
-# Stray SQLite store if the binary is run from the repository root
-/orx.db
-/orx.db-wal
-/orx.db-shm
+.claude/launch.json
+.claude/settings.local.json
+.agents/
+.cursor/
+.windsurf/
+.opencode/
+.gemini/

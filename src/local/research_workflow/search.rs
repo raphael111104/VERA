@@ -307,6 +307,32 @@ fn crossref_page(raw: Value, run: &str) -> Result<Page> {
         raw,
     })
 }
+fn pubmed_search_rejected(search: &Value) -> bool {
+    if search.get("error").is_some() {
+        return true;
+    }
+    let root = &search["esearchresult"];
+    let Some(errors) = root.get("errorlist") else {
+        return false;
+    };
+    let fields_not_found = errors["fieldsnotfound"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty());
+    if fields_not_found {
+        return true;
+    }
+    let no_items_found = root["count"].as_str() == Some("0")
+        && root["idlist"].as_array().is_some_and(Vec::is_empty)
+        && root["warninglist"]["outputmessages"]
+            .as_array()
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|msg| msg.as_str() == Some("No items found."))
+            });
+    !no_items_found
+}
+
 async fn pubmed_page(query: &str, cursor: Option<&str>, run: &str) -> Result<Page> {
     let offset = cursor
         .unwrap_or("0")
@@ -319,17 +345,22 @@ async fn pubmed_page(query: &str, cursor: Option<&str>, run: &str) -> Result<Pag
         .timeout(Duration::from_secs(35))
         .build()?;
     let base = crate::config::pubmed_api_url();
-    let search: Value = client
-        .get(format!("{base}/esearch.fcgi"))
-        .query(&[
-            ("db", "pubmed"),
-            ("term", query),
-            ("retmode", "json"),
-            ("retmax", "25"),
-            ("retstart", &offset.to_string()),
-            ("sort", "relevance"),
-            ("tool", "vera"),
-        ])
+    let mut esearch = client.get(format!("{base}/esearch.fcgi")).query(&[
+        ("db", "pubmed"),
+        ("term", query),
+        ("retmode", "json"),
+        ("retmax", "25"),
+        ("retstart", &offset.to_string()),
+        ("sort", "pub_date"),
+        ("tool", "vera"),
+    ]);
+    if let Some(email) = credential("NCBI_EMAIL") {
+        esearch = esearch.query(&[("email", email)]);
+    }
+    if let Some(key) = credential("NCBI_API_KEY") {
+        esearch = esearch.query(&[("api_key", key)]);
+    }
+    let search: Value = esearch
         .send()
         .await
         .map_err(|_| anyhow!("PubMed tidak dapat dihubungi."))?
@@ -339,7 +370,7 @@ async fn pubmed_page(query: &str, cursor: Option<&str>, run: &str) -> Result<Pag
         .await
         .map_err(|_| anyhow!("Respons PubMed tidak valid."))?;
     let root = &search["esearchresult"];
-    if root.get("errorlist").is_some() || search.get("error").is_some() {
+    if pubmed_search_rejected(&search) {
         return Err(anyhow!("Query PubMed ditolak. Periksa sintaks."));
     }
     let ids = root["idlist"]
@@ -352,14 +383,19 @@ async fn pubmed_page(query: &str, cursor: Option<&str>, run: &str) -> Result<Pag
     let xml = if ids.is_empty() {
         "<PubmedArticleSet/>".into()
     } else {
-        client
-            .get(format!("{base}/efetch.fcgi"))
-            .query(&[
-                ("db", "pubmed"),
-                ("id", &ids.join(",")),
-                ("retmode", "xml"),
-                ("tool", "vera"),
-            ])
+        let mut efetch = client.get(format!("{base}/efetch.fcgi")).query(&[
+            ("db", "pubmed"),
+            ("id", &ids.join(",")),
+            ("retmode", "xml"),
+            ("tool", "vera"),
+        ]);
+        if let Some(email) = credential("NCBI_EMAIL") {
+            efetch = efetch.query(&[("email", email)]);
+        }
+        if let Some(key) = credential("NCBI_API_KEY") {
+            efetch = efetch.query(&[("api_key", key)]);
+        }
+        efetch
             .send()
             .await
             .map_err(|_| anyhow!("PubMed EFetch tidak dapat dihubungi."))?
@@ -545,5 +581,47 @@ mod tests {
         apply_page(&mut run, &mut records, Ok(make())).unwrap();
         assert_eq!(records.len(), 100);
         assert_eq!(run.raw_pages.len(), 2);
+    }
+    #[test]
+    fn pubmed_zero_result_response_is_accepted_while_invalid_fields_are_rejected() {
+        let zero = json!({
+            "esearchresult": {
+                "count": "0",
+                "idlist": [],
+                "errorlist": {
+                    "phrasesnotfound": ["verasearchnonexistentqzxj20261019"],
+                    "fieldsnotfound": []
+                },
+                "warninglist": {
+                    "outputmessages": ["No items found."]
+                }
+            }
+        });
+        assert!(!pubmed_search_rejected(&zero));
+        let invalid_field = json!({
+            "esearchresult": {
+                "count": "0",
+                "idlist": [],
+                "errorlist": {
+                    "phrasesnotfound": [],
+                    "fieldsnotfound": ["BadField"]
+                },
+                "warninglist": {
+                    "outputmessages": ["No items found."]
+                }
+            }
+        });
+        assert!(pubmed_search_rejected(&invalid_field));
+        let partial_phrase_error = json!({
+            "esearchresult": {
+                "count": "12",
+                "idlist": ["1"],
+                "errorlist": {
+                    "phrasesnotfound": ["unknownterm"],
+                    "fieldsnotfound": []
+                }
+            }
+        });
+        assert!(pubmed_search_rejected(&partial_phrase_error));
     }
 }

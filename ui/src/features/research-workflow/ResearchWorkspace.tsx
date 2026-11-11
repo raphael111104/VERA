@@ -307,7 +307,7 @@ function WorkspaceContent({ initial }: { initial: Workspace }) {
   };
   return (
     <div className="flex h-full min-h-0 flex-col bg-canvas text-text">
-      <header className="flex shrink-0 items-center justify-between gap-4 border-b border-border bg-background px-5 py-3">
+      <header className="flex shrink-0 items-center justify-between gap-4 border-b border-border bg-background px-5 py-3 mac-titlebar:ps-20 win-titlebar:pe-36">
         <Link to="/research" className="flex items-center gap-3 text-text">
           <span className="size-8">
             <BrandMark />
